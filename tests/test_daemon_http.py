@@ -88,3 +88,49 @@ def test_post_with_token_dispatcher_not_ready(tmp_path):
         assert body["error"] == "dispatcher not ready"
     finally:
         srv.shutdown()
+
+
+def test_snapshot_returns_agents_events_usage(tmp_path):
+    srv = _make_server(tmp_path)
+    try:
+        aid = srv.db.insert_agent(parent_id=None, session_id="snap1", task_name="t",
+                                  cli="claude", model="m", cwd=str(tmp_path))
+        srv.db.set_status(aid, "terminated", stop_reason="end_turn", pid=1)
+        srv.db.insert_event(agent_id=aid, type="agent.message",
+                            payload={"text": "hi"}, session_id="snap1")
+        srv.db.upsert_usage(agent_id=aid, model="aggregate", input_tokens=10,
+                            output_tokens=5, cache_creation=0, cache_read=2,
+                            cost_usd=0.1)
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot?session_id=snap1")
+        body = json.loads(resp.read())
+        assert [a["id"] for a in body["agents"]] == [aid]
+        assert body["agents"][0]["status"] == "terminated"
+        assert body["agents"][0]["stop_reason"] == "end_turn"
+        assert body["events"][-1]["type"] == "agent.message"
+        assert body["events"][-1]["payload"]["text"] == "hi"
+        assert body["usage"]["totals"]["input_tokens"] == 10
+        assert body["usage"]["per_agent"][0]["output_tokens"] == 5
+        assert body["last_seq"] == body["events"][-1]["seq"]
+    finally:
+        srv.shutdown()
+
+
+def test_snapshot_no_token_and_session_filter(tmp_path):
+    srv = _make_server(tmp_path)
+    try:
+        srv.db.insert_agent(parent_id=None, session_id="only", task_name="a",
+                            cli="claude", model=None, cwd=str(tmp_path))
+        # 无 token 可访问（GET 只读）
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot")
+        body = json.loads(resp.read())
+        assert [a["task_name"] for a in body["agents"]] == ["a"]
+        # 指定不存在的 session → 400
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot?session_id=nope")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req)
+        assert exc.value.code == 400
+    finally:
+        srv.shutdown()

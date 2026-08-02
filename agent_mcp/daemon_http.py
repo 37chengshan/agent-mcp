@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/health":
             self._send_json(200, {"ok": True, "version": 1})
+        elif path == "/api/snapshot":
+            self._send_snapshot()
         elif path == "/events":
             self._stream_events()
         elif path == "/" or path == "/index.html":
@@ -143,6 +146,37 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(exc)})
             return
         self._send_json(200, result)
+
+    def _send_snapshot(self):
+        """只读历史快照（网页刷新重建导图用）：无 token，Host 校验照旧。"""
+        query = (urllib.parse.parse_qs(self.path.split("?", 1)[1])
+                 if "?" in self.path else {})
+        session_id = query.get("session_id", [None])[0]
+        db = self.server.db
+        if db is None:
+            self._send_json(503, {"error": "db not ready"})
+            return
+        agents = db.agents_by_session(session_id)
+        if session_id is not None and not agents:
+            self._send_json(400, {"error": f"session {session_id} not found"})
+            return
+        events = db.events_since(0, session_id=session_id, limit=500)
+        keep = ("id", "parent_id", "task_name", "cli", "model",
+                "status", "stop_reason", "updated_at")
+        totals = {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0,
+                  "cache_read": 0, "cost_usd": 0.0}
+        per_agent = []
+        for a in agents:
+            u = db.usage_total(a["id"])
+            per_agent.append({"agent_id": a["id"], **u})
+            for k in totals:
+                totals[k] = totals.get(k, 0) + u.get(k, 0)
+        self._send_json(200, {
+            "agents": [{k: a[k] for k in keep} for a in agents],
+            "events": events,
+            "usage": {"totals": totals, "per_agent": per_agent},
+            "last_seq": events[-1]["seq"] if events else 0,
+        })
 
     def _stream_events(self):
         client = self.server.broadcaster.connect()
