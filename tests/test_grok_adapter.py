@@ -80,6 +80,12 @@ def test_grok_system_init_session_extracted():
     a = get_adapter("grok")
     assert a.extract_session_id(GROK_SYSTEM) == "s-grok-1"
 
+def test_grok_parse_tolerates_malformed_lines():
+    a = get_adapter("grok")
+    lines = ["", "not-json{", '["a"]', "null", '{"type":"assistant","message":']
+    events, usage = a.parse_stream(lines)
+    assert events == [] and usage == {}
+
 def test_unknown_cli_rejected():
     with pytest.raises(ValueError):
         get_adapter("nonexistent")

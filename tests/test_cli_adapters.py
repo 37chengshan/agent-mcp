@@ -2,6 +2,8 @@ import json
 import pytest
 from agent_mcp.cli_adapters import get_adapter
 
+# fixture 来源：capability-matrix 记录的 claude 2.1.220 stream-json result 行结构
+# （嵌套在 result 字段内；claude 侧未实测过原始输出，T4 起沿用此结构）
 CLAUDE_RESULT = {
     "is_error": False, "stop_reason": "end_turn", "session_id": "s-abc",
     "total_cost_usd": 0.3,
@@ -43,6 +45,12 @@ def test_claude_parse_message_events():
     lines = [json.dumps({"type": "assistant", "message": {"id": "m1", "content": "hi"}})]
     events, _ = a.parse_stream(lines)
     assert any(e["type"] == "agent.message" for e in events)
+
+def test_claude_parse_tolerates_malformed_lines():
+    a = get_adapter("claude")
+    lines = ["", "not-json{", '["a"]', "null", '{"type":"assistant","message":']
+    events, usage = a.parse_stream(lines)
+    assert events == [] and usage == {}
 
 def test_unknown_cli_rejected():
     with pytest.raises(ValueError):

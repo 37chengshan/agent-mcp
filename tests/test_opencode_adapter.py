@@ -76,6 +76,12 @@ def test_opencode_session_extracted():
     a = get_adapter("opencode")
     assert a.extract_session_id(OPC_TEXT) == "ses_1"
 
+def test_opencode_parse_tolerates_malformed_lines():
+    a = get_adapter("opencode")
+    lines = ["", "not-json{", '["a"]', "null", '{"type":"text","part":']
+    events, usage = a.parse_stream(lines)
+    assert events == [] and usage == {}
+
 def test_unknown_cli_rejected():
     with pytest.raises(ValueError):
         get_adapter("nonexistent")

@@ -1,6 +1,8 @@
 import json
 import subprocess
+import time
 import pytest
+import psutil
 from agent_mcp import cli_adapters
 from agent_mcp.dispatch import (SlotScheduler, build_worker_command,
                                 terminate_process_tree, is_pid_running,
@@ -35,7 +37,6 @@ def test_worker_command_includes_state_paths(tmp_path):
 
 def test_process_tree_terminate_smoke():
     # psutil 进程树终止的轻量冒烟：spawn sleep 子进程再杀
-    import subprocess, time, psutil
     p = subprocess.Popen(["sh", "-c", "sleep 30 & sleep 30"])
     time.sleep(0.5)
     tree = psutil.Process(p.pid).children(recursive=True)
@@ -45,7 +46,6 @@ def test_process_tree_terminate_smoke():
     assert not alive  # 整棵树退出
 
 def test_is_pid_running_and_reaped():
-    import subprocess, time
     p = subprocess.Popen(["sleep", "30"])
     assert is_pid_running(p.pid)
     p.terminate()
