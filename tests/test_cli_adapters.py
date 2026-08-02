@@ -1,6 +1,7 @@
 import json
+import subprocess
 import pytest
-from agent_mcp.cli_adapters import get_adapter
+from agent_mcp.cli_adapters import get_adapter, ClaudeAdapter
 
 # fixture 来源：capability-matrix 记录的 claude 2.1.220 stream-json result 行结构
 # （嵌套在 result 字段内；claude 侧未实测过原始输出，T4 起沿用此结构）
@@ -19,6 +20,20 @@ def test_claude_adapter_builds_command():
                           permission_mode="plan", max_turns=5, resume=None)
     assert "--output-format" in cmd and "stream-json" in cmd
     assert "--permission-mode" in cmd and "plan" in cmd
+    # claude 2.1.220 不支持 --cwd（实测 unknown option），工作目录由 subprocess 层覆盖
+    assert "--cwd" not in cmd
+
+@pytest.mark.integration
+@pytest.mark.skipif(ClaudeAdapter().binary() is None, reason="claude CLI not installed")
+def test_claude_real_spawn_smoke():
+    """真实跑 claude -p 冒烟：命令可执行、stream-json 输出可解析（不断言 AI 内容）。"""
+    a = get_adapter("claude")
+    cmd = a.build_command(prompt="回复 OK", cwd="/tmp", model=None,
+                          permission_mode="plan", max_turns=1, resume=None)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr[-500:]
+    parsed = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
+    assert any(d.get("type") in ("assistant", "result") for d in parsed)
 
 def test_claude_parse_stream_extracts_usage():
     a = get_adapter("claude")

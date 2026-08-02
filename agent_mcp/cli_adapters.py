@@ -37,8 +37,11 @@ class ClaudeAdapter(BaseAdapter):
         return None
     def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
                       max_turns=8, resume=None) -> list[str]:
+        # claude 2.1.220 不支持 --cwd flag（实测 unknown option），工作目录
+        # 由 subprocess 层 cwd= 覆盖（dispatch_worker.py 的 subprocess.run 已有）；
+        # cwd 参数按接口保留但不进命令
         cmd = [self.binary(), "-p", "--output-format", "stream-json", "--verbose",
-               "--cwd", str(cwd), "--max-turns", str(max_turns)]
+               "--max-turns", str(max_turns)]
         cmd += self.PERMISSION_FLAGS.get(permission_mode, self.PERMISSION_FLAGS["plan"])
         if model:
             cmd += ["--model", model]
