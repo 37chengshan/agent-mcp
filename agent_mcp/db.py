@@ -46,7 +46,13 @@ class DB:
         self.retention_days = retention_days
         self.max_messages_per_agent = max_messages_per_agent
         if os.name != "nt":
-            os.chmod(self.path, 0o600)
+            # WAL/SHM 与主库同敏感度，一并收紧为 0600（WAL 模式下由 executescript 创建）
+            for p in (self.path, self.path.with_suffix(".db-wal"),
+                      self.path.with_suffix(".db-shm")):
+                try:
+                    os.chmod(p, 0o600)
+                except OSError:
+                    pass
 
     def _utc(self) -> str:
         return datetime.now(timezone.utc).isoformat()
