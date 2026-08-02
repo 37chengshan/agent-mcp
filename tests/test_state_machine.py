@@ -24,3 +24,18 @@ def test_signal_killed_is_cancelled():
 
 def test_daemon_restart_marker():
     assert stop_reason_for_exit(None, daemon_restart=True) == "daemon_restart"
+
+def test_classify_exit_zero_with_result_is_terminated():
+    assert classify_exit(0, has_result=True) == STATUS_TERMINATED
+
+def test_classify_exit_signal_is_cancelled():
+    assert classify_exit(-15) == STATUS_CANCELLED
+
+def test_classify_exit_timeout_is_incomplete():
+    assert classify_exit(0, timed_out=True) == STATUS_INCOMPLETE
+
+def test_classify_exit_daemon_restart_is_error():
+    assert classify_exit(None, daemon_restart=True) == STATUS_ERROR
+
+def test_classify_exit_nonzero_with_error_is_error():
+    assert classify_exit(1, has_error=True) == STATUS_ERROR
