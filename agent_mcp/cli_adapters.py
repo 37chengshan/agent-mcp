@@ -66,9 +66,11 @@ class ClaudeAdapter(BaseAdapter):
             typ = raw.get("type")
             if typ == "assistant" and isinstance(raw.get("message"), dict):
                 usage = _assistant_event(events, usage, seen_ids, raw["message"])
-            elif typ == "result" and isinstance(raw.get("result"), dict):
-                # result.usage 是会话最终权威值，直接覆盖（而非累加）
-                res = raw["result"]
+            elif typ == "result":
+                # result.usage 是会话最终权威值，直接覆盖（而非累加）。
+                # claude 2.1.220 实测 result 行是顶层结构（is_error/usage 与 type
+                # 平级，与 grok 同构）；兼容 T4 沿用的嵌套 result 假设
+                res = raw.get("result") if isinstance(raw.get("result"), dict) else raw
                 u = res.get("usage") or {}
                 usage = {
                     "input_tokens": _num(u.get("input_tokens")),

@@ -43,6 +43,24 @@ def test_claude_parse_stream_extracts_usage():
     assert usage["cost_usd"] == 0.3
     assert any(e["type"] == "agent.usage" for e in events)
 
+
+def test_claude_parse_top_level_result():
+    """claude 2.1.220 实测（T14 对账）：result 行是顶层结构——is_error/stop_reason/
+    usage/modelUsage 与 type 平级（与 grok 同构），而非 T4 fixture 的嵌套假设；
+    适配器须兼容两种结构（顶层时 output/cost 不再丢失）。"""
+    a = get_adapter("claude")
+    lines = [json.dumps({"type": "result", "is_error": False, "stop_reason": "end_turn",
+                         "session_id": "s-top", "total_cost_usd": 0.5,
+                         "usage": {"input_tokens": 200, "output_tokens": 10,
+                                   "cache_creation_input_tokens": 0,
+                                   "cache_read_input_tokens": 50}})]
+    events, usage = a.parse_stream(lines)
+    assert usage["input_tokens"] == 200
+    assert usage["output_tokens"] == 10
+    assert usage["cache_read"] == 50
+    assert usage["cost_usd"] == 0.5
+    assert any(e["type"] == "agent.usage" for e in events)
+
 def test_claude_parse_dedupe_by_message_id():
     a = get_adapter("claude")
     lines = [
