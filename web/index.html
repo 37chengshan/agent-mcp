@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent MCP · 实时监控</title>
+<style>
+:root{
+  --bg:#FAF9F5; --card:#FFFFFF; --ink:#3D3929; --ink-soft:#6B665A;
+  --accent:#C15F3C; --accent-soft:#F3E4DC; --line:#E8E4DC;
+  --green:#4A7A5A; --red:#B3483A; --amber:#B08A3E; --gray:#9A958A;
+  --claude:#8A4B2E; --grok:#B08A3E; --opencode:#4A7A5A; --omp:#5A54A3;
+  --radius:14px;
+  --shadow:0 1px 3px rgba(61,57,41,.06),0 4px 16px rgba(61,57,41,.05);
+  --mono:"SF Mono",Menlo,Consolas,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{display:flex;flex-direction:column;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  font-size:14px;line-height:1.6}
+header{padding:14px 22px 10px;border-bottom:1px solid var(--line);background:var(--card)}
+.topline{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.kicker{font-size:11px;letter-spacing:.12em;color:var(--accent);font-weight:600;text-transform:uppercase}
+h1{font-family:Georgia,"Songti SC","STSong",serif;font-size:24px;font-weight:600;letter-spacing:-.01em}
+.hint{color:var(--ink-soft);font-size:12px;margin-left:auto}
+select.sess{font:inherit;font-size:13px;padding:3px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
+.stats{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
+.stat{background:#FBFAF7;border:1px solid var(--line);border-radius:10px;padding:3px 12px;font-size:12.5px}
+.stat b{font-weight:700;font-variant-numeric:tabular-nums}
+.stat .lbl{color:var(--ink-soft);font-size:11px;margin-right:5px}
+.stat.run b{color:var(--accent)} .stat.queued b{color:var(--amber)}
+.stat.done b{color:var(--green)} .stat.fail b{color:var(--red)}
+.stat.cost b{color:#8A4B2E}
+.models{font-size:11.5px;color:var(--ink-soft)}
+.models .m{display:inline-block;margin:0 10px 2px 0;font-variant-numeric:tabular-nums}
+main{flex:1;display:flex;min-height:0}
+#map-pane{flex:1;overflow:auto;padding:14px 18px}
+#map-hint{color:var(--ink-soft);font-size:12px;margin-bottom:8px}
+#detail-pane{width:402px;min-width:402px;overflow-y:auto;border-left:1px solid var(--line);background:var(--card);padding:16px 18px}
+footer{height:30px;display:flex;align-items:center;gap:16px;padding:0 18px;border-top:1px solid var(--line);
+  background:var(--card);color:var(--ink-soft);font-size:12px;white-space:nowrap;overflow:hidden}
+.dot{width:8px;height:8px;border-radius:50%;background:#B9B4A8;display:inline-block;flex:none}
+.dot.ok{background:var(--green)} .dot.bad{background:var(--amber)} .dot.err{background:var(--red)}
+#sseq{font-family:var(--mono);font-size:11px}
+svg#tree .node{cursor:pointer}
+svg#tree .node rect{fill:#fff;stroke-width:1.5;transition:filter .15s}
+svg#tree .node:hover rect{filter:drop-shadow(0 2px 6px rgba(61,57,41,.18))}
+svg#tree .node.selected rect{stroke-width:2.5}
+@keyframes pulse{50%{opacity:.5}}
+svg#tree .node.run rect{animation:pulse 1.6s ease-in-out infinite}
+.dk{font-size:11px;letter-spacing:.1em;color:var(--accent);font-weight:600;text-transform:uppercase;margin:16px 0 6px}
+.dk:first-child{margin-top:0}
+h2.aname{font-family:Georgia,"Songti SC",serif;font-size:18px;font-weight:600;word-break:break-all;line-height:1.35}
+.cli-badge{display:inline-block;font-size:11px;font-weight:600;border-radius:6px;padding:1px 8px;margin-left:6px;vertical-align:2px}
+table.sum{width:100%;border-collapse:collapse;font-size:12.5px}
+table.sum td{padding:3px 0;border-bottom:1px dashed var(--line);word-break:break-all}
+table.sum td:first-child{color:var(--ink-soft);width:92px;flex:none}
+table.sum tr:last-child td{border-bottom:none}
+.cur-act{font-size:12.5px;background:#FBFAF7;border:1px solid var(--line);border-radius:10px;padding:8px 12px;margin-top:4px;word-break:break-all}
+.cur-act .tn{font-weight:600;color:var(--accent)}
+.cur-act .in{color:var(--ink-soft);font-family:var(--mono);font-size:11px;white-space:pre-wrap}
+.msgs{display:flex;flex-direction:column;gap:8px}
+.msg{background:#FBFAF7;border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:12.5px;white-space:pre-wrap;word-break:break-word}
+.msg.delta{border-style:dashed;color:var(--ink-soft)}
+.msg .seq{color:var(--ink-soft);font-size:10.5px;margin-right:6px;font-family:var(--mono)}
+.btn{font:inherit;font-size:12px;padding:4px 12px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink-soft);cursor:pointer;margin:8px 0}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.events{display:flex;flex-direction:column;gap:4px;font-size:11.5px}
+.ev{display:flex;gap:8px;align-items:baseline}
+.ev .seq{color:#B9B4A8;font-family:var(--mono);font-size:10.5px}
+.ev .tp{font-weight:600;white-space:nowrap}
+.ev .py{color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty{color:var(--ink-soft);font-size:12.5px;padding:24px 0;text-align:center}
+.legend{font-size:11px;color:var(--ink-soft);margin-top:2px}
+.legend .sw{display:inline-block;width:14px;height:3px;border-radius:2px;margin:0 4px 2px 10px;vertical-align:middle}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="topline">
+    <span class="kicker">Live Monitor</span>
+    <h1>Agent MCP</h1>
+    <span class="hint">只读监控 · token 为派发侧估算</span>
+    <select id="sess" class="sess" title="会话切换（按 snapshot 事件聚合）"><option value="all">全部会话</option></select>
+  </div>
+  <div class="stats">
+    <span class="stat run"><span class="lbl">进行中</span><b id="st-run">0</b></span>
+    <span class="stat queued"><span class="lbl">排队</span><b id="st-queued">0</b></span>
+    <span class="stat done"><span class="lbl">已完成</span><b id="st-done">0</b></span>
+    <span class="stat fail"><span class="lbl">失败</span><b id="st-fail">0</b></span>
+    <span class="stat"><span class="lbl">token</span><b id="st-tok">0</b></span>
+    <span class="stat"><span class="lbl">成本</span><b id="st-cost" class="cost">$0</b></span>
+    <span class="models" id="st-models"></span>
+  </div>
+</header>
+
+<main>
+  <section id="map-pane">
+    <div id="map-hint">任务树：主任务 → agent 分支 → 汇合（点击节点查看详情）</div>
+    <div id="map"><div class="empty">加载中…</div></div>
+  </section>
+  <aside id="detail-pane"><div class="empty">点击左侧导图节点查看详情</div></aside>
+</main>
+
+<footer>
+  <span class="dot" id="sse-dot"></span>
+  <span id="sse-txt">连接中…</span>
+  <span>last_seq <span id="sseq">0</span></span>
+  <span id="snap-state"></span>
+  <span style="margin-left:auto">数据口径：派发侧估算 · 仅本机回环</span>
+</footer>
+
+<script>
+"use strict";
+/* 事件类型全集（与 agent_mcp/events.py EVENT_TYPES 对齐；delta 只广播不落库） */
+const EVENT_TYPES=["agent.spawned","agent.running","agent.message","agent.message_delta",
+  "agent.tool_use","agent.tool_result","agent.usage",
+  "agent.thread_message_sent","agent.thread_message_received",
+  "agent.idle","agent.terminated","agent.error","agent.cancelled"];
+const SEQ_KEY="amcp_last_seq";
+const MSG_PAGE=50;
+
+/* 状态：快照为底 + SSE 增量（事件按 seq 幂等，delta 无 seq 直接应用） */
+const S={session:"all",agents:new Map(),children:new Map(),eventLog:new Map(),
+  usage:new Map(),deltas:new Map(),curTool:new Map(),
+  selected:null,lastSeq:0,seen:new Set(),sessions:new Set(["all"]),
+  sse:"connecting",msgsShown:MSG_PAGE,snapTimer:null,snapErr:""};
+
+const $=id=>document.getElementById(id);
+/* SVG 命名空间 URI（浏览器必需的标准字符串；拼接以避免源码中的字面量外链形态，页面不加载任何外部资源） */
+const NS="http:"+"//www.w3.org/2000/svg";
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num=v=>{const n=Number(v);return Number.isFinite(n)?n:0;};
+function fmtTok(n){n=num(n);
+  if(n>=1e6)return (n/1e6).toFixed(1)+"M";
+  if(n>=1e3)return (n/1e3).toFixed(1)+"k";
+  return String(Math.round(n));}
+function fmtCost(c){return "$"+num(c).toFixed(4);}
+function fmtTime(iso){if(!iso)return"—";const d=new Date(iso);
+  return isNaN(d)?iso:d.toLocaleString();}
+function shortName(tn){const s=String(tn||"");const p=s.split("/").filter(Boolean);
+  const last=p.length?p[p.length-1]:s;return last.length>22?last.slice(0,21)+"…":last;}
+function cliColor(cli,isRoot){if(isRoot)return"var(--accent)";
+  return cli==="grok"?"var(--grok)":cli==="opencode"?"var(--opencode)"
+    :cli==="omp"?"var(--omp)":"var(--claude)";}
+function statusColor(st){return st==="running"?"var(--accent)":st==="terminated"?"var(--green)"
+  :st==="error"?"var(--red)":st==="cancelled"?"var(--gray)":"var(--gray)";}
+function statusLabel(st){return st==="running"?"运行中":st==="terminated"?"完成"
+  :st==="queued"?"排队":st==="error"?"失败":st==="cancelled"?"已取消"
+  :st==="incomplete"?"超时":(st||"—");}
+
+/* ── 快照加载（刷新重建 / spawned 补拉 / 会话切换） ── */
+function clearState(){
+  S.agents=new Map();S.children=new Map();S.eventLog=new Map();S.usage=new Map();
+  S.deltas=new Map();S.curTool=new Map();S.seen=new Set();S.lastSeq=0;
+  S.selected=null;S.msgsShown=MSG_PAGE;
+}
+async function loadSnapshot(reset){
+  if(reset)clearState();
+  const q=S.session!=="all"?"?session_id="+encodeURIComponent(S.session):"";
+  try{
+    const resp=await fetch("/api/snapshot"+q);
+    if(!resp.ok){S.snapErr="快照不可用 ("+resp.status+")";scheduleRender();return;}
+    applySnapshot(await resp.json());
+    S.snapErr="";
+  }catch(err){S.snapErr="无法连接 daemon";scheduleRender();}
+}
+function applySnapshot(snap){
+  /* 合并而非覆盖：SSE 已收到但 seq > snapshot.last_seq 的本地事件必须保留
+     （spawned 补拉时快照可能落后于广播） */
+  const kept=[...S.eventLog.entries()].filter(([s])=>s>snap.last_seq);
+  S.eventLog.clear();
+  for(const e of snap.events||[])if(typeof e.seq==="number")S.eventLog.set(e.seq,e);
+  for(const [s,e] of kept)if(!S.eventLog.has(s))S.eventLog.set(s,e);
+  S.seen=new Set(S.eventLog.keys());
+  S.lastSeq=snap.last_seq||0;
+  for(const a of snap.agents||[])if(!S.agents.has(a.id))S.agents.set(a.id,a);
+  rebuildChildren();
+  for(const u of((snap.usage||{}).per_agent)||[])S.usage.set(u.agent_id,u);
+  S.sessions=new Set(["all"]);
+  for(const e of snap.events||[])if(e.session_id)S.sessions.add(e.session_id);
+  if(!S.agents.has(S.selected))S.selected=firstRoot();
+  localStorage.setItem(SEQ_KEY,String(S.lastSeq));
+  scheduleRender();
+}
+function rebuildChildren(){
+  S.children=new Map();
+  for(const a of S.agents.values()){
+    const p=a.parent_id;
+    if(p==null)continue;
+    if(!S.children.has(p))S.children.set(p,[]);
+    S.children.get(p).push(a.id);
+  }
+}
+function rootsOf(){return[...S.agents.values()].filter(a=>a.parent_id==null)
+  .sort((a,b)=>a.id-b.id);}
+function firstRoot(){const r=rootsOf();return r.length?r[0].id:null;}
+/* spawned 事件到达但本地无元数据（payload 仅 agent_id）→ 去抖补拉快照 */
+function scheduleSnapshot(){if(S.snapTimer)return;
+  S.snapTimer=setTimeout(()=>{S.snapTimer=null;loadSnapshot(false);},500);}
+
+/* ── SSE（EventSource 自动重连；事件按 seq 幂等） ── */
+function connect(){
+  const last=localStorage.getItem(SEQ_KEY);
+  const es=new EventSource("/events"+(last?"?last_seq="+last:""));
+  es.onopen=()=>{S.sse="connected";scheduleRender();};
+  es.onerror=()=>{S.sse="reconnecting";scheduleRender();};
+  for(const t of EVENT_TYPES)es.addEventListener(t,ev=>onEvent(t,ev));
+}
+function onEvent(type,ev){
+  let data=null;
+  try{data=JSON.parse(ev.data);}catch(e){return;}
+  const seq=ev.lastEventId?parseInt(ev.lastEventId,10):null;
+  const payload=(data&&data.payload)||{};
+  if(seq!=null&&!isNaN(seq)){
+    if(S.seen.has(seq))return;           /* 断线重连/补拉去重 */
+    S.seen.add(seq);
+    S.eventLog.set(seq,data);
+    if(seq>S.lastSeq){S.lastSeq=seq;localStorage.setItem(SEQ_KEY,String(seq));}
+  }
+  const aid=data&&data.agent_id!=null?Number(data.agent_id):null;
+  switch(type){
+    case "agent.spawned":
+      if(aid!=null&&!S.agents.has(aid))scheduleSnapshot();
+      break;
+    case "agent.running": case "agent.terminated":
+    case "agent.error": case "agent.cancelled":
+      if(aid!=null&&S.agents.has(aid)){
+        const a=S.agents.get(aid);
+        a.status=type.slice("agent.".length);
+        if(payload.stop_reason)a.stop_reason=payload.stop_reason;
+        if(payload.pid)a.pid=payload.pid;
+      }
+      break;
+    case "agent.idle":                     /* CLI 内部态，不迁移 agents 状态 */
+      break;
+    case "agent.message":                  /* 权威事件替换增量占位 */
+      if(aid!=null)S.deltas.delete(aid);
+      break;
+    case "agent.message_delta":
+      if(aid!=null)S.deltas.set(aid,(S.deltas.get(aid)||"")+String(payload.delta||""));
+      break;
+    case "agent.tool_use":
+      if(aid!=null)S.curTool.set(aid,payload);
+      break;
+    case "agent.usage":                    /* payload 为累计值，覆盖式更新 */
+      if(aid!=null)S.usage.set(aid,payload);
+      break;
+    default: break;                        /* tool_result / thread_message_* 入事件列表 */
+  }
+  scheduleRender();
+}
+
+/* ── rAF 合并渲染（防逐事件 reflow） ── */
+let _raf=null;
+function scheduleRender(){if(_raf)return;_raf=requestAnimationFrame(()=>{_raf=null;renderAll();});}
+function renderAll(){renderHeader();renderTree();renderDetail();renderFooter();}
+
+/* ── 顶栏：任务数 / token 总量 / 成本 / 按模型拆分 ── */
+function renderHeader(){
+  const sel=$("sess");
+  const cur=sel.value;
+  sel.innerHTML="";
+  for(const s of[...S.sessions].sort()){
+    const o=document.createElement("option");
+    o.value=s;o.textContent=s==="all"?"全部会话":s;
+    sel.appendChild(o);
+  }
+  sel.value=S.sessions.has(cur)?cur:"all";
+  let run=0,queued=0,done=0,fail=0;
+  const tot={input:0,output:0,cc:0,cr:0,cost:0};
+  const byModel={};
+  for(const a of S.agents.values()){
+    if(a.status==="running")run++;
+    else if(a.status==="queued")queued++;
+    else if(a.status==="terminated")done++;
+    else fail++;                            /* error / cancelled / incomplete */
+    const u=S.usage.get(a.id);
+    if(u){
+      const m=a.model||"aggregate";
+      const mb=byModel[m]||(byModel[m]={input:0,output:0,cache:0,cost:0});
+      const key={input:"input_tokens",output:"output_tokens",
+        cc:"cache_creation",cr:"cache_read"};
+      for(const k of["input","output","cc","cr"]){
+        const v=num(u[key[k]]);
+        tot[k]+=v;if(k==="input"||k==="output")mb[k]+=v;else mb.cache+=v;
+      }
+      mb.cost+=num(u.cost_usd);tot.cost+=num(u.cost_usd);
+    }
+  }
+  $("st-run").textContent=run;
+  $("st-queued").textContent=queued;
+  $("st-done").textContent=done;
+  $("st-fail").textContent=fail;
+  $("st-tok").textContent=[fmtTok(tot.input)+" in",fmtTok(tot.output)+" out",
+    fmtTok(tot.cc+tot.cr)+" cache"].join(" · ");
+  $("st-cost").textContent=fmtCost(tot.cost);
+  $("st-models").innerHTML=Object.keys(byModel).sort().map(m=>{
+    const b=byModel[m];
+    return `<span class="m">${esc(m)}：${fmtTok(b.input)}/in · ${fmtTok(b.output)}/out · ${fmtTok(b.cache)}/cache</span>`;
+  }).join("");
+}
+
+/* ── 知识导图：手写 DFS 树布局（叶节点分配 y 槽，内部节点取子树中点） ── */
+const NODE_W=180,NODE_H=56,X_STEP=208,Y_STEP=68,MG=16;
+function layoutTree(){
+  const roots=rootsOf();const pos=new Map();let y=0,maxDepth=0;
+  const dfs=(id,depth)=>{
+    if(depth>maxDepth)maxDepth=depth;
+    const kids=S.children.get(id)||[];
+    if(kids.length===0){
+      pos.set(id,{x:MG+depth*X_STEP,y:MG+y*Y_STEP});y++;
+    }else{
+      for(const k of kids)dfs(k,depth+1);
+      const ys=kids.map(k=>pos.get(k).y);
+      pos.set(id,{x:MG+depth*X_STEP,y:(Math.min(...ys)+Math.max(...ys))/2});
+    }
+  };
+  for(const r of roots)dfs(r.id,0);
+  return{pos,roots,width:MG*2+maxDepth*X_STEP+NODE_W,height:MG+y*Y_STEP};
+}
+function renderTree(){
+  const pane=$("map");
+  const roots=rootsOf();
+  if(!roots.length){pane.innerHTML='<div class="empty">暂无任务 · 等待 agent 派发（SSE 实时接入中）</div>';return;}
+  const{pos,roots:rs,width,height}=layoutTree();
+  const svg=document.createElementNS(NS,"svg");
+  /* 注意：上方字符串仅为 SVG 命名空间 URI（浏览器必需），页面不加载任何外部资源 */
+  svg.setAttribute("id","tree");
+  svg.setAttribute("width",Math.max(width,$("map-pane").clientWidth-40));
+  svg.setAttribute("height",height+52);
+  svg.setAttribute("viewBox","0 0 "+width+" "+(height+52));
+  /* 连线：父右缘 → 子左缘 正交肘形 */
+  for(const a of S.agents.values()){
+    const p=a.parent_id;
+    if(p==null||!pos.has(a.id)||!pos.has(p))continue;
+    const px=pos.get(p),cx=pos.get(a.id);
+    const x1=px.x+NODE_W,y1=px.y+NODE_H/2,x2=cx.x,y2=cx.y+NODE_H/2,mx=(x1+x2)/2;
+    const path=document.createElementNS(NS,"path");
+    path.setAttribute("d",`M${x1} ${y1} H${mx} V${y2} H${x2}`);
+    path.setAttribute("stroke","#D8D3C8");path.setAttribute("stroke-width","1.2");
+    path.setAttribute("fill","none");
+    svg.appendChild(path);
+  }
+  /* 节点卡片 */
+  for(const a of S.agents.values()){
+    const p=pos.get(a.id);if(!p)continue;
+    const isRoot=a.parent_id==null;
+    const stroke=cliColor(a.cli,isRoot);
+    const g=document.createElementNS(NS,"g");
+    g.setAttribute("transform",`translate(${p.x},${p.y})`);
+    g.setAttribute("data-aid",String(a.id));
+    g.setAttribute("class","node"+(a.status==="running"?" run":"")
+      +(S.selected===a.id?" selected":""));
+    const rect=document.createElementNS(NS,"rect");
+    rect.setAttribute("width",NODE_W);rect.setAttribute("height",NODE_H);
+    rect.setAttribute("rx",12);rect.setAttribute("fill","#fff");
+    rect.setAttribute("stroke",stroke);
+    if(a.status==="cancelled"){rect.setAttribute("stroke-dasharray","5 3");rect.setAttribute("fill","#F7F6F2");}
+    if(a.status==="error")rect.setAttribute("stroke","var(--red)");
+    if(a.status==="incomplete")rect.setAttribute("stroke","var(--gray)");
+    g.appendChild(rect);
+    if(a.status==="cancelled"){             /* 灰斜线 */
+      const diag=document.createElementNS(NS,"line");
+      diag.setAttribute("x1",4);diag.setAttribute("y1",NODE_H-4);
+      diag.setAttribute("x2",NODE_W-4);diag.setAttribute("y2",4);
+      diag.setAttribute("stroke","#B9B4A8");diag.setAttribute("stroke-dasharray","4 3");
+      diag.setAttribute("opacity",".7");
+      g.appendChild(diag);
+    }
+    const dot=document.createElementNS(NS,"circle");
+    dot.setAttribute("cx",14);dot.setAttribute("cy",14);dot.setAttribute("r",4.5);
+    dot.setAttribute("fill",statusColor(a.status));
+    g.appendChild(dot);
+    const t1=document.createElementNS(NS,"text");
+    t1.setAttribute("x",26);t1.setAttribute("y",23);
+    t1.setAttribute("font-size","12.5");t1.setAttribute("font-weight","600");
+    t1.setAttribute("fill","var(--ink)");
+    t1.textContent=shortName(a.task_name);
+    g.appendChild(t1);
+    const t2=document.createElementNS(NS,"text");
+    t2.setAttribute("x",26);t2.setAttribute("y",39);
+    t2.setAttribute("font-size","11");t2.setAttribute("fill","var(--ink-soft)");
+    const u=S.usage.get(a.id);
+    const tok=u?fmtTok(num(u.input_tokens)+num(u.output_tokens)
+      +num(u.cache_creation)+num(u.cache_read))+" tok":null;
+    const parts=[statusLabel(a.status)];
+    if(a.stop_reason)parts.push(a.stop_reason);
+    if(tok)parts.push(tok);
+    t2.textContent=parts.join(" · ");
+    g.appendChild(t2);
+    const title=document.createElementNS(NS,"title");
+    title.textContent=[a.task_name,a.cli,a.model||""].filter(Boolean).join(" · ");
+    g.appendChild(title);
+    svg.appendChild(g);
+  }
+  /* 汇合标记：分支产出回收到主任务的收束线 */
+  const joinY=height+8;
+  const jl=document.createElementNS(NS,"line");
+  jl.setAttribute("x1",MG);jl.setAttribute("y1",joinY);
+  jl.setAttribute("x2",width-MG);jl.setAttribute("y2",joinY);
+  jl.setAttribute("stroke","#C9C3B6");jl.setAttribute("stroke-dasharray","6 4");
+  jl.setAttribute("stroke-width","1.2");
+  svg.appendChild(jl);
+  const jt=document.createElementNS(NS,"text");
+  jt.setAttribute("x",width-MG-6);jt.setAttribute("y",joinY+16);
+  jt.setAttribute("text-anchor","end");jt.setAttribute("font-size","11");
+  jt.setAttribute("fill","var(--ink-soft)");
+  jt.textContent="汇合 · 分支产出回传主任务";
+  svg.appendChild(jt);
+  pane.innerHTML="";
+  pane.appendChild(svg);
+}
+
+/* ── 详情面板 ── */
+function messagesOf(aid){
+  const out=[];
+  for(const e of S.eventLog.values())
+    if(e.agent_id===aid&&e.type==="agent.message")out.push(e);
+  out.sort((a,b)=>a.seq-b.seq);
+  return out;
+}
+function usageSeries(aid){
+  const out=[];
+  for(const e of S.eventLog.values())
+    if(e.agent_id===aid&&e.type==="agent.usage")out.push(e);
+  out.sort((a,b)=>a.seq-b.seq);
+  return out.map(e=>e.payload||{});
+}
+function tokenChart(aid){
+  const pts=usageSeries(aid);
+  if(pts.length<2)return'<div class="empty">等待 usage 数据…</div>';
+  const W=330,H=86,P=8;
+  const max=Math.max(1,...pts.map(u=>Math.max(num(u.input_tokens),num(u.output_tokens))));
+  const line=key=>pts.map((u,i)=>{
+    const x=P+(pts.length===1?0:i*(W-2*P)/(pts.length-1));
+    const y=H-P-(num(u[key])/max)*(H-2*P);
+    return x.toFixed(1)+","+y.toFixed(1);
+  }).join(" ");
+  return '<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:'+(H*1.6)+'px">'
+    +'<polyline points="'+line("input_tokens")+'" fill="none" stroke="var(--accent)" stroke-width="1.6"/>'
+    +'<polyline points="'+line("output_tokens")+'" fill="none" stroke="#8A4B2E" stroke-width="1.6"/>'
+    +'</svg>'
+    +'<div class="legend"><span class="sw" style="background:var(--accent)"></span>input'
+    +'<span class="sw" style="background:#8A4B2E"></span>output</div>';
+}
+function renderDetail(){
+  const pane=$("detail-pane");
+  const a=S.agents.get(S.selected);
+  if(!a){pane.innerHTML='<div class="empty">点击左侧导图节点查看详情</div>';return;}
+  /* 活动摘要（快照 agents 仅含精简字段；cwd/created_at 后端未下发 → 占位） */
+  let created="—",pid="—";
+  for(const e of S.eventLog.values()){
+    if(e.agent_id!==a.id)continue;
+    if(e.type==="agent.spawned"&&created==="—")created=fmtTime(e.created_at);
+    if(e.type==="agent.running"&&pid==="—"&&e.payload&&e.payload.pid)pid=e.payload.pid;
+  }
+  let curTool=S.curTool.get(a.id);
+  if(!curTool){                       /* 快照重建后回退到事件日志找最近 tool_use */
+    for(const e of[...S.eventLog.values()].reverse()){
+      if(e.agent_id===a.id&&e.type==="agent.tool_use"){curTool=e.payload;break;}
+    }
+  }
+  const toolHtml=curTool
+    ?'<div class="cur-act"><span class="tn">'+esc(curTool.name||"tool")+'</span>'
+      +'<div class="in">'+esc(JSON.stringify(curTool.input||{}).slice(0,260))+'</div>'
+      +(curTool.output?'<div class="in">'+esc(String(curTool.output).slice(0,160))+'</div>':"")
+      +'</div>'
+    :'<div class="empty" style="padding:8px 0">暂无工具调用</div>';
+  /* 消息流：本地事件缓存过滤 + 分页 + delta 打字机占位 */
+  const msgs=messagesOf(a.id);
+  const shown=msgs.slice(-S.msgsShown);
+  const delta=S.deltas.get(a.id);
+  let msgsHtml="";
+  if(!msgs.length&&!delta)msgsHtml='<div class="empty" style="padding:8px 0">暂无消息</div>';
+  else{
+    msgsHtml=(msgs.length>S.msgsShown
+      ?'<button class="btn" id="more-msgs">加载更早 '+S.msgsShown+' / '+msgs.length+' 条</button>':"")
+      +shown.map(m=>'<div class="msg"><span class="seq">#'+m.seq+'</span>'
+        +esc(String((m.payload&&m.payload.text)||"")).slice(0,4000)+'</div>').join("");
+    if(delta)msgsHtml+='<div class="msg delta">'+esc(delta).slice(-1200)+'</div>';
+  }
+  /* 最近事件（倒序 20 条） */
+  const evs=[...S.eventLog.values()].filter(e=>e.agent_id===a.id)
+    .sort((x,y)=>y.seq-x.seq).slice(0,20)
+    .map(e=>'<div class="ev"><span class="seq">#'+e.seq+'</span>'
+      +'<span class="tp" style="color:'+cliColor(a.cli,a.parent_id==null)+'">'+esc(e.type)+'</span>'
+      +'<span class="py">'+esc(payloadSummary(e))+'</span></div>').join("");
+  pane.innerHTML=
+    '<h2 class="aname">'+esc(shortName(a.task_name))
+      +'<span class="cli-badge" style="background:'+cliColor(a.cli,a.parent_id==null)
+      +';color:#fff">'+esc(a.cli||"—")+'</span></h2>'
+    +'<div style="color:var(--ink-soft);font-size:12px;word-break:break-all;margin-top:2px">'
+      +esc(a.task_name||"")+'</div>'
+    +'<div class="dk">活动摘要</div>'
+    +'<table class="sum">'
+    +'<tr><td>状态</td><td>'+esc(statusLabel(a.status))+(a.stop_reason?' · '+esc(a.stop_reason):"")+'</td></tr>'
+    +'<tr><td>模型</td><td>'+esc(a.model||"—")+'</td></tr>'
+    +'<tr><td>CLI</td><td>'+esc(a.cli||"—")+'</td></tr>'
+    +'<tr><td>PID</td><td>'+esc(pid)+'</td></tr>'
+    +'<tr><td>创建于</td><td>'+esc(created)+'</td></tr>'
+    +'<tr><td>更新于</td><td>'+esc(fmtTime(a.updated_at))+'</td></tr>'
+    +'<tr><td>工作目录</td><td>'+esc("—")+'</td></tr>'
+    +'</table>'
+    +'<div class="dk">当前活动</div>'+toolHtml
+    +'<div class="dk">Token 曲线</div>'+tokenChart(a.id)
+    +'<div class="dk">消息流</div><div class="msgs">'+msgsHtml+'</div>'
+    +'<div class="dk">最近事件</div><div class="events">'+evs+'</div>';
+}
+function payloadSummary(e){
+  const p=e.payload||{};
+  if(e.type==="agent.tool_use")return p.name+" "+JSON.stringify(p.input||{}).slice(0,60);
+  if(e.type==="agent.message")return String(p.text||"").slice(0,60);
+  if(e.type==="agent.thread_message_sent"||e.type==="agent.thread_message_received")
+    return String(p.content||p.text||"").slice(0,60);
+  return JSON.stringify(p).slice(0,90);
+}
+
+/* ── 状态栏 ── */
+function renderFooter(){
+  const dot=$("sse-dot"),txt=$("sse-txt");
+  if(S.sse==="connected"){dot.className="dot ok";txt.textContent="SSE 已连接";}
+  else if(S.sse==="reconnecting"){dot.className="dot bad";txt.textContent="断线重连中…";}
+  else{dot.className="dot";txt.textContent="连接中…";}
+  $("sseq").textContent=S.lastSeq;
+  $("snap-state").textContent=S.snapErr;
+}
+
+/* ── 交互 ── */
+function selectAgent(id){S.selected=id;S.msgsShown=MSG_PAGE;scheduleRender();}
+document.addEventListener("DOMContentLoaded",()=>{
+  $("map-pane").addEventListener("click",e=>{
+    const g=e.target.closest?e.target.closest("[data-aid]"):null;
+    if(g)selectAgent(Number(g.dataset.aid));
+  });
+  $("detail-pane").addEventListener("click",e=>{
+    if(e.target.id==="more-msgs"){S.msgsShown+=MSG_PAGE;scheduleRender();}
+  });
+  $("sess").addEventListener("change",e=>{
+    S.session=e.target.value;S.selected=null;
+    loadSnapshot(true);
+  });
+  renderAll();
+  loadSnapshot(false);
+  connect();
+});
+</script>
+</body>
+</html>
