@@ -101,7 +101,8 @@ class GrokAdapter(ClaudeAdapter):
     cli_name = "grok"
     _BIN = ["grok", str(HOME / ".grok/bin/grok")]
     PERMISSION_FLAGS = {
-        "plan": ["--permission-mode", "plan"],
+        # plan 模式禁用子代理（只读规划，不让子代理扩散执行）
+        "plan": ["--permission-mode", "plan", "--no-subagents"],
         "acceptEdits": ["--permission-mode", "acceptEdits"],
         "fullAccess": ["--permission-mode", "bypassPermissions", "--always-approve"],
     }
@@ -194,7 +195,8 @@ class OpencodeAdapter(ClaudeAdapter):
         return cmd
     def parse_stream(self, lines) -> tuple[list[dict], dict]:
         # opencode run --format json 实测（1.14.51）：事件仅
-        # step_start/text/tool_use/step_finish；usage 在 step_finish.part.tokens
+        # step_start/text/tool_use/step_finish；usage 在 step_finish.part.tokens。
+        # 无 agent.terminated 为有意设计，终止判定由 dispatch 层 exit code 兜底
         events: list[dict] = []
         usage: dict[str, Any] = {}
         for line in lines:

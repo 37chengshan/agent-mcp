@@ -1,4 +1,10 @@
-from agent_mcp.dispatch import SlotScheduler, build_worker_command, terminate_process_tree, is_pid_running
+import json
+import subprocess
+import pytest
+from agent_mcp import cli_adapters
+from agent_mcp.dispatch import (SlotScheduler, build_worker_command,
+                                terminate_process_tree, is_pid_running,
+                                spawn_cli_worker, spawn_detached)
 
 def test_slot_scheduler_fifo():
     s = SlotScheduler(max_concurrent=2)
@@ -48,3 +54,25 @@ def test_is_pid_running_and_reaped():
     assert not is_pid_running(p.pid)
     assert not is_pid_running(None)
     assert not is_pid_running(-1)
+
+def test_spawn_cli_worker_builds_and_spawns(monkeypatch, tmp_path):
+    captured = {}
+    def fake_spawn(cmd, **kw):
+        captured["cmd"] = cmd
+        return subprocess.Popen(["true"])
+    monkeypatch.setattr("agent_mcp.dispatch.spawn_detached", fake_spawn)
+    pid, summary = spawn_cli_worker("claude", prompt="hi", cwd="/tmp",
+                                    permission_mode="plan",
+                                    state_dir=tmp_path)
+    cmd = captured["cmd"]
+    assert any("dispatch_worker.py" in c for c in cmd)
+    assert any(c.startswith(str(tmp_path)) for c in cmd)  # state/out/err 落在 state_dir 下
+    cli_json = json.loads(cmd[-1])
+    assert cli_json[0].endswith("claude") and "hi" in cli_json
+    assert "claude" in summary and "--permission-mode" in summary
+    assert is_pid_running(pid)  # spawn 的对象存活（true 进程）
+
+def test_spawn_cli_worker_binary_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_adapters._CLAUDE, "binary", lambda: None)
+    with pytest.raises(ValueError, match="was not found"):
+        spawn_cli_worker("claude", prompt="hi", cwd="/tmp", state_dir=tmp_path)

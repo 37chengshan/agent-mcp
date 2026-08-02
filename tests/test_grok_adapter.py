@@ -54,6 +54,7 @@ def test_grok_command_plan_mode_no_approve():
     cmd = a.build_command(prompt="do it", cwd="/tmp", model=None,
                           permission_mode="plan", max_turns=10, resume=None)
     assert "--permission-mode" in cmd and "plan" in cmd
+    assert "--no-subagents" in cmd  # plan 模式禁用子代理
     assert "--always-approve" not in cmd
 
 def test_grok_parse_message_extracts_text_from_blocks():
