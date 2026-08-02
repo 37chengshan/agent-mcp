@@ -107,19 +107,19 @@ def spawn_detached(command: list[str], *, env: dict[str, str] | None = None) -> 
 def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
                      permission_mode: str = "plan", model: str | None = None,
                      max_turns: int = 8, resume: str | None = None,
-                     state_dir: Path) -> tuple[int, str]:
+                     state_dir: Path) -> dict[str, Any]:
     """spawn 一个 CLI 任务 worker（T9 daemon 用）。
 
     流程：get_adapter → binary() 检查（缺失抛结构化 ValueError）→
     build_command → build_worker_command → spawn_detached。
-    返回 (worker_pid, CLI 命令摘要)；state_dir 下按任务生成
-    {cli}-{tag}.json / .out.log / .err.log（并发安全）。
+    返回 {"worker_pid": ..., "command_summary": ...}；state_dir 下按任务
+    生成 {cli}-{tag}.json / .out.log / .err.log（并发安全）。
     """
     adapter = get_adapter(target_cli)
     binary = adapter.binary()
     if not binary:
         raise ValueError(
-            f"CLI '{target_cli}' was not found on PATH or known install locations")
+            f"CLI {target_cli} was not found. Install it or set PATH")
     cli_cmd = adapter.build_command(prompt=prompt, cwd=cwd, model=model,
                                     permission_mode=permission_mode,
                                     max_turns=max_turns, resume=resume)
@@ -132,4 +132,4 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
         err_path=state_dir / f"{tag}.err.log",
         cwd=cwd, cli_command=cli_cmd)
     proc = spawn_detached(worker_cmd)
-    return proc.pid, " ".join(cli_cmd)
+    return {"worker_pid": proc.pid, "command_summary": " ".join(cli_cmd)}

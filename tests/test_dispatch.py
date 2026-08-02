@@ -61,16 +61,17 @@ def test_spawn_cli_worker_builds_and_spawns(monkeypatch, tmp_path):
         captured["cmd"] = cmd
         return subprocess.Popen(["true"])
     monkeypatch.setattr("agent_mcp.dispatch.spawn_detached", fake_spawn)
-    pid, summary = spawn_cli_worker("claude", prompt="hi", cwd="/tmp",
-                                    permission_mode="plan",
-                                    state_dir=tmp_path)
+    info = spawn_cli_worker("claude", prompt="hi", cwd="/tmp",
+                            permission_mode="plan",
+                            state_dir=tmp_path)
     cmd = captured["cmd"]
     assert any("dispatch_worker.py" in c for c in cmd)
     assert any(c.startswith(str(tmp_path)) for c in cmd)  # state/out/err 落在 state_dir 下
     cli_json = json.loads(cmd[-1])
     assert cli_json[0].endswith("claude") and "hi" in cli_json
-    assert "claude" in summary and "--permission-mode" in summary
-    assert is_pid_running(pid)  # spawn 的对象存活（true 进程）
+    assert "claude" in info["command_summary"]
+    assert "--permission-mode" in info["command_summary"]
+    assert is_pid_running(info["worker_pid"])  # spawn 的对象存活（true 进程）
 
 def test_spawn_cli_worker_binary_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_adapters._CLAUDE, "binary", lambda: None)
