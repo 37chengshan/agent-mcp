@@ -48,6 +48,12 @@ class SlotScheduler:
         with self._lock:
             return list(self._queue)
 
+    def remove(self, agent_key: str) -> None:
+        """从队列/活动中移除（中断排队任务用），不触发补位。"""
+        with self._lock:
+            self._active.discard(agent_key)
+            self._queue = [k for k in self._queue if k != agent_key]
+
 
 def terminate_process_tree(pid: int, *, timeout: float = 5.0) -> bool:
     """跨平台进程树终止。macOS 用 SIGTERM→SIGKILL；Windows TerminateProcess。"""
@@ -114,8 +120,8 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
 
     流程：get_adapter → binary() 检查（缺失抛结构化 ValueError）→
     build_command → build_worker_command → spawn_detached。
-    返回 {"worker_pid": ..., "command_summary": ...}；state_dir 下按任务
-    生成 {cli}-{tag}.json / .out.log / .err.log（并发安全）。
+    返回 {"worker_pid", "command_summary", "state_path", "out_path", "err_path"}；
+    state_dir 下按任务生成 {cli}-{tag}.json / .out.log / .err.log（并发安全）。
     """
     adapter = get_adapter(target_cli)
     binary = adapter.binary()
@@ -128,10 +134,12 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{target_cli}-{uuid.uuid4().hex[:8]}"
-    worker_cmd = build_worker_command(
-        state_path=state_dir / f"{tag}.json",
-        out_path=state_dir / f"{tag}.out.log",
-        err_path=state_dir / f"{tag}.err.log",
-        cwd=cwd, cli_command=cli_cmd)
+    state_path = state_dir / f"{tag}.json"
+    out_path = state_dir / f"{tag}.out.log"
+    err_path = state_dir / f"{tag}.err.log"
+    worker_cmd = build_worker_command(state_path=state_path, out_path=out_path,
+                                      err_path=err_path, cwd=cwd, cli_command=cli_cmd)
     proc = spawn_detached(worker_cmd)
-    return {"worker_pid": proc.pid, "command_summary": " ".join(cli_cmd)}
+    return {"worker_pid": proc.pid, "command_summary": " ".join(cli_cmd),
+            "state_path": str(state_path), "out_path": str(out_path),
+            "err_path": str(err_path)}

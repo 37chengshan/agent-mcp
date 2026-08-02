@@ -9,11 +9,16 @@ from typing import Any
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 MAX_SSE_CLIENTS = 32
 HEARTBEAT_SECONDS = 15.0
-_API_PATHS = frozenset({
-    "/api/agents/spawn", "/api/agents/send_message", "/api/agents/followup",
-    "/api/agents/wait", "/api/agents/interrupt", "/api/agents/list",
-    "/api/agents/activity", "/api/usage",
-})
+_API_METHODS = {
+    "/api/agents/spawn": "spawn",
+    "/api/agents/send_message": "send_message",
+    "/api/agents/followup": "followup",
+    "/api/agents/wait": "wait",
+    "/api/agents/interrupt": "interrupt",
+    "/api/agents/list": "list_agents",
+    "/api/agents/activity": "activity",
+    "/api/usage": "usage",
+}
 
 
 class EventBroadcaster:
@@ -118,30 +123,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_token():
             return
         path = self.path.split("?")[0]
-        if path not in _API_PATHS:
+        method = _API_METHODS.get(path)
+        if method is None:
             self.send_error(404)
             return
         if self.server.dispatcher is None:
             self._send_json(503, {"error": "dispatcher not ready"})
             return
-        dispatcher = self.server.dispatcher
         body = self._read_json()
-        if path == "/api/agents/spawn":
-            self._send_json(200, dispatcher.spawn(body))
-        elif path == "/api/agents/send_message":
-            self._send_json(200, dispatcher.send_message(body))
-        elif path == "/api/agents/followup":
-            self._send_json(200, dispatcher.followup(body))
-        elif path == "/api/agents/wait":
-            self._send_json(200, dispatcher.wait(body))
-        elif path == "/api/agents/interrupt":
-            self._send_json(200, dispatcher.interrupt(body))
-        elif path == "/api/agents/list":
-            self._send_json(200, dispatcher.list_agents(body))
-        elif path == "/api/agents/activity":
-            self._send_json(200, dispatcher.activity(body))
-        elif path == "/api/usage":
-            self._send_json(200, dispatcher.usage(body))
+        try:
+            result = getattr(self.server.dispatcher, method)(body)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(200, result)
 
     def _stream_events(self):
         client = self.server.broadcaster.connect()
