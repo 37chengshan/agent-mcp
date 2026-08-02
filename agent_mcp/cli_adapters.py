@@ -97,6 +97,93 @@ class ClaudeAdapter(BaseAdapter):
         return events, usage
 
 
+class GrokAdapter(ClaudeAdapter):
+    cli_name = "grok"
+    _BIN = ["grok", str(HOME / ".grok/bin/grok")]
+    PERMISSION_FLAGS = {
+        "plan": ["--permission-mode", "plan"],
+        "acceptEdits": ["--permission-mode", "acceptEdits"],
+        "fullAccess": ["--permission-mode", "bypassPermissions", "--always-approve"],
+    }
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        cmd = [self.binary(), "--cwd", str(cwd), "--output-format",
+               "streaming-messages-json", "--max-turns", str(max_turns)]
+        cmd += self.PERMISSION_FLAGS.get(permission_mode, self.PERMISSION_FLAGS["plan"])
+        if model:
+            cmd += ["--model", model]
+        if resume:
+            cmd += ["--resume", resume]
+        cmd += ["--single", prompt]
+        return cmd
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        # grok streaming-messages-json 实测（0.2.118）：assistant/result 行与
+        # claude 同构（snake_case）；assistant.message.content 为 thinking/text 块数组
+        events: list[dict] = []
+        usage: dict[str, Any] = {}
+        seen_ids: set[str] = set()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            typ = raw.get("type")
+            if typ == "assistant" and isinstance(raw.get("message"), dict):
+                msg = raw["message"]
+                mid = msg.get("id")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    if isinstance(msg.get("usage"), dict):
+                        u = msg["usage"]
+                        usage = _merge_usage(usage, {
+                            "input_tokens": u.get("input_tokens", 0),
+                            "output_tokens": u.get("output_tokens", 0),
+                            "cache_creation": u.get("cache_creation_input_tokens", 0),
+                            "cache_read": u.get("cache_read_input_tokens", 0),
+                            "cost_usd": 0.0,
+                        })
+                events.append({"type": "agent.message",
+                               "payload": {"text": _extract_text(msg.get("content"))}})
+            elif typ == "result":
+                # grok 实测：usage/stop_reason/session_id/total_cost_usd 在顶层，
+                # result 字段只是最终输出文本（与 claude 的嵌套 result 不同）
+                res = raw
+                u = res.get("usage") or {}
+                usage = {
+                    "input_tokens": u.get("input_tokens", 0),
+                    "output_tokens": u.get("output_tokens", 0),
+                    "cache_creation": u.get("cache_creation_input_tokens", 0),
+                    "cache_read": u.get("cache_read_input_tokens", 0),
+                    "cost_usd": res.get("total_cost_usd", 0.0) or 0.0,
+                }
+                events.append({"type": "agent.usage", "payload": dict(usage)})
+                sid = res.get("session_id")
+                if sid:
+                    events.append({"type": "agent.terminated",
+                                   "payload": {"stop_reason": res.get("stop_reason", "end_turn"),
+                                               "session_id": sid}})
+        return events, usage
+    def extract_session_id(self, raw: dict) -> str | None:
+        # system init / assistant / result 行均带顶层 session_id（实测）
+        sid = raw.get("session_id") if isinstance(raw, dict) else None
+        return str(sid) if sid else None
+
+
+def _extract_text(content) -> str:
+    """content 为字符串或内容块数组（Anthropic Messages 风格）时提取可见文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(b.get("text", "") for b in content
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
 def _merge_usage(base: dict, add: dict) -> dict:
     out = dict(base)
     for k, v in add.items():
@@ -105,7 +192,8 @@ def _merge_usage(base: dict, add: dict) -> dict:
 
 
 _CLAUDE = ClaudeAdapter()
-_ADAPTERS: dict[str, BaseAdapter] = {"claude": _CLAUDE}
+_GROK = GrokAdapter()
+_ADAPTERS: dict[str, BaseAdapter] = {"claude": _CLAUDE, "grok": _GROK}
 
 
 def get_adapter(name: str) -> BaseAdapter:
