@@ -9,6 +9,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# 脚本直接启动（python agent_mcp/daemon_main.py 或 spawn_detached 拉起）时，
+# sys.path[0] 是脚本目录而非项目根，需手动补项目根才能 import agent_mcp 包
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agent_mcp.cli_adapters import get_adapter
 from agent_mcp.daemon_http import DaemonHTTPServer, EventBroadcaster, HEARTBEAT_SECONDS
 from agent_mcp.db import DB
 from agent_mcp.dispatch import (SlotScheduler, is_pid_running, spawn_cli_worker,
@@ -289,6 +294,10 @@ class Dispatcher:
             self._workers.pop(agent_id, None)
             rc = state.get("process_status", 0)
             summary = _tail(info["out_path"])
+        agent = self.db.get_agent(agent_id)
+        if agent is not None:
+            self._ingest_output(agent_id, agent["cli"], info["out_path"],
+                                agent["session_id"])
         if rc == 0:
             self.db.set_status(agent_id, "terminated", stop_reason="end_turn")
             self._broadcast("agent.terminated", {"agent_id": agent_id,
@@ -353,6 +362,50 @@ class Dispatcher:
             if e.get("agent_id") == agent_id and e.get("type") == type_:
                 return e.get("payload") or {}
         return {}
+
+    def _ingest_output(self, agent_id: int, cli: str, out_path: Path | str,
+                       session_id: str) -> None:
+        """worker 完成后一次性解析 stdout 流 → 事件落库 + 广播 + usage 累计。
+
+        parse_stream 返回 (events, usage)：普通事件落库并广播；
+        agent.message_delta 只广播不落库（前端打字机）；parse_stream 产出的
+        agent.terminated 由 monitor 统一迁移广播，这里仅回填其 session_id
+        到 cli_session_id（resume 用）。usage 为聚合 dict 无 model 拆分，
+        统一按 model="aggregate" 落库（简单为准）。
+        """
+        try:
+            lines = Path(out_path).read_text(encoding="utf-8",
+                                             errors="replace").splitlines()
+            if not lines:
+                return
+            adapter = get_adapter(cli)
+            events, usage = adapter.parse_stream(lines)
+        except Exception as exc:
+            print(f"[dispatcher] ingest failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
+            return
+        for ev in events:
+            typ = ev.get("type")
+            payload = ev.get("payload") or {}
+            if typ == "agent.terminated":
+                sid = payload.get("session_id")
+                if sid:
+                    agent = self.db.get_agent(agent_id)
+                    if agent:
+                        self.db.set_status(agent_id, agent["status"],
+                                           cli_session_id=str(sid))
+                continue
+            seq = self.db.insert_event(agent_id=agent_id, type=typ,
+                                       payload=payload, session_id=session_id)
+            self.broadcaster.publish({"type": typ, "agent_id": agent_id,
+                                      "payload": payload, "seq": seq}, seq=seq)
+        if usage:
+            self.db.upsert_usage(agent_id=agent_id, model="aggregate",
+                                 input_tokens=usage.get("input_tokens", 0),
+                                 output_tokens=usage.get("output_tokens", 0),
+                                 cache_creation=usage.get("cache_creation", 0),
+                                 cache_read=usage.get("cache_read", 0),
+                                 cost_usd=usage.get("cost_usd", 0.0) or 0.0)
 
     def _broadcast(self, type_: str, payload: dict, agent_id: int) -> None:
         agent = self.db.get_agent(agent_id)

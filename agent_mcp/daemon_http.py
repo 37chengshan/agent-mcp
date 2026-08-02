@@ -43,8 +43,11 @@ class EventBroadcaster:
             client["closed"] = True
             self._clients.pop(client["id"], None)
 
-    def publish(self, event: dict[str, Any], *, seq: int) -> None:
-        payload = (f"id: {seq}\nevent: {event['type']}\n"
+    def publish(self, event: dict[str, Any], *, seq: int | None) -> None:
+        # seq=None 的事件（agent.message_delta）不落库，SSE 不带 id，
+        # 断线回放只对齐落库 seq，不会与其冲突
+        id_line = f"id: {seq}\n" if seq is not None else ""
+        payload = (f"{id_line}event: {event['type']}\n"
                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
         with self._lock:
             clients = list(self._clients.values())
