@@ -174,6 +174,70 @@ class GrokAdapter(ClaudeAdapter):
         return str(sid) if sid else None
 
 
+class OpencodeAdapter(ClaudeAdapter):
+    cli_name = "opencode"
+    _BIN = ["opencode"]
+    # opencode 无 permission-mode CLI flag（权限走配置文件 allow 规则），
+    # 仅 fullAccess 对应 --dangerously-skip-permissions（实测 1.14.51）
+    PERMISSION_FLAGS = {
+        "fullAccess": ["--dangerously-skip-permissions"],
+    }
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        cmd = [self.binary(), "run", "--format", "json", "--dir", str(cwd)]
+        cmd += self.PERMISSION_FLAGS.get(permission_mode, [])
+        if model:
+            cmd += ["--model", model]
+        if resume:
+            cmd += ["--session", resume]
+        cmd.append(prompt)
+        return cmd
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        # opencode run --format json 实测（1.14.51）：事件仅
+        # step_start/text/tool_use/step_finish；usage 在 step_finish.part.tokens
+        events: list[dict] = []
+        usage: dict[str, Any] = {}
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            typ = raw.get("type")
+            part = raw.get("part") if isinstance(raw.get("part"), dict) else {}
+            if typ == "text":
+                events.append({"type": "agent.message",
+                               "payload": {"text": part.get("text", "")}})
+            elif typ == "tool_use":
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                events.append({"type": "agent.tool_use", "payload": {
+                    "name": part.get("tool", ""),
+                    "input": state.get("input") or {},
+                    "output": state.get("output", ""),
+                }})
+            elif typ == "step_finish":
+                tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+                cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+                usage = _merge_usage(usage, {
+                    "input_tokens": tokens.get("input", 0),
+                    "output_tokens": tokens.get("output", 0),
+                    "cache_creation": cache.get("write", 0),
+                    "cache_read": cache.get("read", 0),
+                    "reasoning_tokens": tokens.get("reasoning", 0),
+                    "cost_usd": part.get("cost", 0.0) or 0.0,
+                })
+                events.append({"type": "agent.usage", "payload": dict(usage)})
+        return events, usage
+    def extract_session_id(self, raw: dict) -> str | None:
+        # 实测：所有事件带顶层 sessionID（camelCase）
+        sid = raw.get("sessionID") if isinstance(raw, dict) else None
+        return str(sid) if sid else None
+
+
 def _extract_text(content) -> str:
     """content 为字符串或内容块数组（Anthropic Messages 风格）时提取可见文本。"""
     if isinstance(content, str):
@@ -193,7 +257,9 @@ def _merge_usage(base: dict, add: dict) -> dict:
 
 _CLAUDE = ClaudeAdapter()
 _GROK = GrokAdapter()
-_ADAPTERS: dict[str, BaseAdapter] = {"claude": _CLAUDE, "grok": _GROK}
+_OPENCODE = OpencodeAdapter()
+_ADAPTERS: dict[str, BaseAdapter] = {"claude": _CLAUDE, "grok": _GROK,
+                                     "opencode": _OPENCODE}
 
 
 def get_adapter(name: str) -> BaseAdapter:
