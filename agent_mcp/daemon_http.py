@@ -1,0 +1,199 @@
+from __future__ import annotations
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+MAX_SSE_CLIENTS = 32
+HEARTBEAT_SECONDS = 15.0
+_API_PATHS = frozenset({
+    "/api/agents/spawn", "/api/agents/send_message", "/api/agents/followup",
+    "/api/agents/wait", "/api/agents/interrupt", "/api/agents/list",
+    "/api/agents/activity", "/api/usage",
+})
+
+
+class EventBroadcaster:
+    """SSE 统一广播：事件循环单写，非阻塞写，写失败断开，统一心跳。"""
+    def __init__(self, max_clients: int = MAX_SSE_CLIENTS):
+        self.max = max_clients
+        self._clients: dict[int, dict[str, Any]] = {}
+        self._next = 0
+        self._lock = threading.Lock()
+
+    def connect(self) -> dict[str, Any] | None:
+        with self._lock:
+            if len(self._clients) >= self.max:
+                return None
+            self._next += 1
+            client = {"id": self._next, "buffer": [], "closed": False}
+            self._clients[self._next] = client
+            return client
+
+    def close(self, client: dict[str, Any]) -> None:
+        with self._lock:
+            client["closed"] = True
+            self._clients.pop(client["id"], None)
+
+    def publish(self, event: dict[str, Any], *, seq: int) -> None:
+        payload = (f"id: {seq}\nevent: {event['type']}\n"
+                   f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
+        with self._lock:
+            clients = list(self._clients.values())
+        for client in clients:
+            if not client["closed"]:
+                client["buffer"].append(payload)
+
+    def drain(self, client: dict[str, Any]) -> str | None:
+        """取出并清空缓冲（与 publish/heartbeat 同锁，避免 join 期间丢事件）。"""
+        with self._lock:
+            if not client["buffer"]:
+                return None
+            chunk = "".join(client["buffer"])
+            del client["buffer"][:]
+            return chunk
+
+    def heartbeat_all(self) -> None:
+        with self._lock:
+            clients = list(self._clients.values())
+        for client in clients:
+            if not client["closed"]:
+                client["buffer"].append(": ping\n\n")
+
+
+class DaemonHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr, web_root: Path, *, token: str, db: Any,
+                 dispatcher: Any, broadcaster: EventBroadcaster | None = None):
+        self.web_root = Path(web_root)
+        self.token = token
+        self.db = db
+        self.dispatcher = dispatcher
+        self.broadcaster = broadcaster or EventBroadcaster()
+        super().__init__(addr, Handler)
+        self.server_name = "agent-mcp-daemon"
+
+
+class Handler(BaseHTTPRequestHandler):
+    server: DaemonHTTPServer  # type: ignore[assignment]
+
+    def log_message(self, fmt, *args):  # 静默访问日志
+        pass
+
+    def _check_host(self) -> bool:
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if host in ALLOWED_HOSTS:
+            return True
+        self.send_error(400, "bad host")
+        return False
+
+    def _check_token(self) -> bool:
+        if self.headers.get("X-Auth-Token") == self.server.token:
+            return True
+        self.send_error(401, "unauthorized")
+        return False
+
+    def do_GET(self):
+        if not self._check_host():
+            return
+        path = self.path.split("?")[0]
+        if path == "/health":
+            self._send_json(200, {"ok": True, "version": 1})
+        elif path == "/events":
+            self._stream_events()
+        elif path == "/" or path == "/index.html":
+            self._send_file("index.html")
+        elif path.startswith("/static/"):
+            self._send_file(path[len("/static/"):])
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not self._check_host():
+            return
+        if not self._check_token():
+            return
+        path = self.path.split("?")[0]
+        if path not in _API_PATHS:
+            self.send_error(404)
+            return
+        if self.server.dispatcher is None:
+            self._send_json(503, {"error": "dispatcher not ready"})
+            return
+        dispatcher = self.server.dispatcher
+        body = self._read_json()
+        if path == "/api/agents/spawn":
+            self._send_json(200, dispatcher.spawn(body))
+        elif path == "/api/agents/send_message":
+            self._send_json(200, dispatcher.send_message(body))
+        elif path == "/api/agents/followup":
+            self._send_json(200, dispatcher.followup(body))
+        elif path == "/api/agents/wait":
+            self._send_json(200, dispatcher.wait(body))
+        elif path == "/api/agents/interrupt":
+            self._send_json(200, dispatcher.interrupt(body))
+        elif path == "/api/agents/list":
+            self._send_json(200, dispatcher.list_agents(body))
+        elif path == "/api/agents/activity":
+            self._send_json(200, dispatcher.activity(body))
+        elif path == "/api/usage":
+            self._send_json(200, dispatcher.usage(body))
+
+    def _stream_events(self):
+        client = self.server.broadcaster.connect()
+        if client is None:
+            self.send_error(503, "too many SSE clients")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            while not client["closed"]:
+                chunk = self.server.broadcaster.drain(client)
+                if chunk:
+                    try:
+                        self.wfile.write(chunk.encode("utf-8"))
+                        self.wfile.flush()
+                    except (BrokenPipeError, OSError):
+                        break
+                else:
+                    time.sleep(0.1)
+        finally:
+            self.server.broadcaster.close(client)
+
+    def _send_json(self, code: int, payload: Any):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_file(self, name: str):
+        root = self.server.web_root.resolve()
+        path = (root / name).resolve()
+        if not path.is_file() or root not in path.parents:
+            self.send_error(404)
+            return
+        data = path.read_bytes()
+        self.send_response(200)
+        ctype = "text/html; charset=utf-8" if name.endswith(".html") else "application/octet-stream"
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_json(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                return {}
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            return {}
