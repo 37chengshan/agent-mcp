@@ -93,6 +93,10 @@
 | 5 | Windows 平台 | 三处跨平台分支（进程树/拉起/控制台）未在真实 Windows 验证 | 双平台 CI 冒烟 |
 | 6 | 网页浏览器渲染 | 本次仅静态结构 + SSE 直播流断言；impl-t11 已交付渲染验证 | 人工复核 `http://127.0.0.1:8765/` |
 | 7 | skill 跨宿主自动编排 | 六步工作流装载依赖宿主 skill 机制 | 各主载体新会话实测 |
+| 8 | 任务级 timeout_seconds 未实现 | schema 与 skill 文档声明 1-1800，但 Dispatcher→spawn_cli_worker 全链路未读该参数；wait_agent 30s 上限是轮询超时非任务超时 | 实现终止定时器后启用；当前传值被忽略 |
+| 9 | 运行中无实时事件流 | 事件为 worker 完成后一次性 ingest（daemon_main._ingest_output）；运行中 agent 在网页上无 message/tool_use 实时显示，仅状态迁移直播（spawned→running→terminated） | 后续做 worker 侧流式 tail + 增量 ingest |
+| 10 | daemon 崩溃孤儿回收未实现 | 重启无孤儿扫描：崩溃时运行中 worker 继续跑，重启后 agent 卡 running、out.log 无人 ingest | 启动时扫 state_dir 非 finished worker 标记 daemon_restart |
+| 11 | SSE last_seq 回放未实现 | daemon_http._stream_events 忽略 last_seq 查询参数与 Last-Event-ID 头；断线期间事件丢失（前端 dedupe 有、回放无） | 实现按 seq 回放后前端无需改动 |
 
 ## 验收总评
 

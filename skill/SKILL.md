@@ -75,7 +75,8 @@
 创建任务 agent 并启动 CLI 子进程。
 
 - **必填**：`target_cli`（claude | grok | opencode | omp）· `prompt` · `cwd`
-- **可选**：`permission_mode`（plan | acceptEdits | fullAccess，默认 plan）· `model` · `context`（父摘要，注入 prompt 前）· `resume`（续接 CLI session id）· `max_turns`（1-50）· `timeout_seconds`（1-1800）· `parent_agent_id`（挂任务树）· `task_name`（分层名如 /root/task1）· `session_id`
+- **可选**：`permission_mode`（plan | acceptEdits | fullAccess，默认 plan）· `model` · `context`（父摘要，注入 prompt 前）· `resume`（续接 CLI session id）· `max_turns`（1-50）· `parent_agent_id`（挂任务树）· `task_name`（分层名如 /root/task1）· `session_id`
+- **⚠️ `timeout_seconds`（1-1800）当前未实现**：schema 接受该参数但派发链路不读它（无任务级终止定时器）；超时控制请用 `wait_agent` 的 timeout（≤30s 轮询上限）自行决策是否 interrupt
 - **返回**：`agent_id`（后续监控/消息/续接都靠它）+ `status`（running / queued）+ `pid`
 
 ### send_message
@@ -158,7 +159,7 @@ token 统计，**派发侧估算**（`estimated=true`）。
 **各 CLI 实测特性**（派发时利用）：
 
 - omp 事件流最完整（原生增量/成本），`--smol/--slow/--plan` 四模型角色
-- grok 首次模型发现慢（>120s），spawn 的 `timeout_seconds` 预算要预留
+- grok 首次模型发现慢（>120s），`wait_agent` 轮询时要有耐心（多轮 wait 直到 terminated）
 - claude 与 grok 的 result/usage 结构同构；opencode 需指定 opencodex 模型（默认 provider key 401）
 
 ---
@@ -175,8 +176,8 @@ token 统计，**派发侧估算**（`estimated=true`）。
   "cwd": "/path/to/project",
   "permission_mode": "plan",
   "max_turns": 20,
-  "timeout_seconds": 600,
   "parent_agent_id": 1
+  // timeout_seconds 未实现（见 §工具速查 ⚠️ 注），示例省略
 }
 ```
 
