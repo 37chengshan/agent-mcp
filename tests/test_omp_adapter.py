@@ -63,6 +63,33 @@ def test_omp_parse_text_delta():
     deltas = [e for e in events if e["type"] == "agent.message_delta"]
     assert deltas and deltas[0]["payload"]["delta"] == "OK"
 
+def test_omp_multi_turn_usage_accumulates():
+    # 实测（17.2.4 多 turn）：message_end.usage 为每 turn 增量（第二 turn
+    # cacheRead 小于第一 turn 即非累计），双 message_end 应累加
+    a = get_adapter("omp")
+    end1 = {"type": "message_end", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "a"}],
+            "usage": {"input": 48, "output": 139, "cacheRead": 56832,
+                      "cacheWrite": 0, "reasoningTokens": 10,
+                      "cost": {"total": 0.008}}}}
+    end2 = {"type": "message_end", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "b"}],
+            "usage": {"input": 21666, "output": 555, "cacheRead": 36608,
+                      "cacheWrite": 0, "reasoningTokens": 100,
+                      "cost": {"total": 0.041}}}}
+    events, usage = a.parse_stream([json.dumps(end1), json.dumps(end2)])
+    assert usage["input_tokens"] == 48 + 21666
+    assert usage["output_tokens"] == 139 + 555
+    assert usage["cache_read"] == 56832 + 36608
+    assert usage["reasoning_tokens"] == 10 + 100
+    assert abs(usage["cost_usd"] - (0.008 + 0.041)) < 1e-9
+
+def test_omp_parse_tolerates_malformed_lines():
+    a = get_adapter("omp")
+    lines = ["", "not-json{", '["a"]', "null", '{"type":"message_end","message":']
+    events, usage = a.parse_stream(lines)
+    assert events == [] and usage == {}
+
 def test_omp_parse_terminated():
     a = get_adapter("omp")
     events, _ = a.parse_stream([json.dumps(OMP_SESSION),

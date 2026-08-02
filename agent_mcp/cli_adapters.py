@@ -62,31 +62,17 @@ class ClaudeAdapter(BaseAdapter):
                 continue
             typ = raw.get("type")
             if typ == "assistant" and isinstance(raw.get("message"), dict):
-                msg = raw["message"]
-                mid = msg.get("id")
-                if mid and mid not in seen_ids:
-                    seen_ids.add(mid)
-                    if isinstance(msg.get("usage"), dict):
-                        u = msg["usage"]
-                        usage = _merge_usage(usage, {
-                            "input_tokens": u.get("input_tokens", 0),
-                            "output_tokens": u.get("output_tokens", 0),
-                            "cache_creation": u.get("cache_creation_input_tokens", 0),
-                            "cache_read": u.get("cache_read_input_tokens", 0),
-                            "cost_usd": 0.0,
-                        })
-                events.append({"type": "agent.message",
-                               "payload": {"text": msg.get("content", "")}})
+                usage = _assistant_event(events, usage, seen_ids, raw["message"])
             elif typ == "result" and isinstance(raw.get("result"), dict):
                 # result.usage 是会话最终权威值，直接覆盖（而非累加）
                 res = raw["result"]
                 u = res.get("usage") or {}
                 usage = {
-                    "input_tokens": u.get("input_tokens", 0),
-                    "output_tokens": u.get("output_tokens", 0),
-                    "cache_creation": u.get("cache_creation_input_tokens", 0),
-                    "cache_read": u.get("cache_read_input_tokens", 0),
-                    "cost_usd": res.get("total_cost_usd", 0.0) or 0.0,
+                    "input_tokens": _num(u.get("input_tokens")),
+                    "output_tokens": _num(u.get("output_tokens")),
+                    "cache_creation": _num(u.get("cache_creation_input_tokens")),
+                    "cache_read": _num(u.get("cache_read_input_tokens")),
+                    "cost_usd": _num(res.get("total_cost_usd")),
                 }
                 events.append({"type": "agent.usage", "payload": dict(usage)})
                 sid = res.get("session_id")
@@ -135,32 +121,18 @@ class GrokAdapter(ClaudeAdapter):
                 continue
             typ = raw.get("type")
             if typ == "assistant" and isinstance(raw.get("message"), dict):
-                msg = raw["message"]
-                mid = msg.get("id")
-                if mid and mid not in seen_ids:
-                    seen_ids.add(mid)
-                    if isinstance(msg.get("usage"), dict):
-                        u = msg["usage"]
-                        usage = _merge_usage(usage, {
-                            "input_tokens": u.get("input_tokens", 0),
-                            "output_tokens": u.get("output_tokens", 0),
-                            "cache_creation": u.get("cache_creation_input_tokens", 0),
-                            "cache_read": u.get("cache_read_input_tokens", 0),
-                            "cost_usd": 0.0,
-                        })
-                events.append({"type": "agent.message",
-                               "payload": {"text": _extract_text(msg.get("content"))}})
+                usage = _assistant_event(events, usage, seen_ids, raw["message"])
             elif typ == "result":
                 # grok 实测：usage/stop_reason/session_id/total_cost_usd 在顶层，
                 # result 字段只是最终输出文本（与 claude 的嵌套 result 不同）
                 res = raw
                 u = res.get("usage") or {}
                 usage = {
-                    "input_tokens": u.get("input_tokens", 0),
-                    "output_tokens": u.get("output_tokens", 0),
-                    "cache_creation": u.get("cache_creation_input_tokens", 0),
-                    "cache_read": u.get("cache_read_input_tokens", 0),
-                    "cost_usd": res.get("total_cost_usd", 0.0) or 0.0,
+                    "input_tokens": _num(u.get("input_tokens")),
+                    "output_tokens": _num(u.get("output_tokens")),
+                    "cache_creation": _num(u.get("cache_creation_input_tokens")),
+                    "cache_read": _num(u.get("cache_read_input_tokens")),
+                    "cost_usd": _num(res.get("total_cost_usd")),
                 }
                 events.append({"type": "agent.usage", "payload": dict(usage)})
                 sid = res.get("session_id")
@@ -222,15 +194,16 @@ class OpencodeAdapter(ClaudeAdapter):
                     "output": state.get("output", ""),
                 }})
             elif typ == "step_finish":
+                # step_finish.tokens 为每步增量；若上游版本改为累计值则 usage 翻倍
                 tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
                 cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
                 usage = _merge_usage(usage, {
-                    "input_tokens": tokens.get("input", 0),
-                    "output_tokens": tokens.get("output", 0),
-                    "cache_creation": cache.get("write", 0),
-                    "cache_read": cache.get("read", 0),
-                    "reasoning_tokens": tokens.get("reasoning", 0),
-                    "cost_usd": part.get("cost", 0.0) or 0.0,
+                    "input_tokens": _num(tokens.get("input")),
+                    "output_tokens": _num(tokens.get("output")),
+                    "cache_creation": _num(cache.get("write")),
+                    "cache_read": _num(cache.get("read")),
+                    "reasoning_tokens": _num(tokens.get("reasoning")),
+                    "cost_usd": _num(part.get("cost")),
                 })
                 events.append({"type": "agent.usage", "payload": dict(usage)})
         return events, usage
@@ -295,17 +268,19 @@ class OmpAdapter(ClaudeAdapter):
                 if stop:
                     last_stop_reason = str(stop)
                 if isinstance(msg.get("usage"), dict):
-                    # message_end.usage 是会话最终权威值，直接覆盖（同 claude result 语义）
+                    # 实测（17.2.4 多 turn：两次工具调用）：message_end.usage 是
+                    # 每 turn 增量而非会话累计（第二 turn cacheRead 36608 < 第一 turn
+                    # 56832，累计值不可能下降）→ 与 opencode 同语义，累加
                     u = msg["usage"]
                     cost = u.get("cost") if isinstance(u.get("cost"), dict) else {}
-                    usage = {
-                        "input_tokens": u.get("input", 0),
-                        "output_tokens": u.get("output", 0),
-                        "cache_creation": u.get("cacheWrite", 0),
-                        "cache_read": u.get("cacheRead", 0),
-                        "reasoning_tokens": u.get("reasoningTokens", 0),
-                        "cost_usd": cost.get("total", 0.0) or 0.0,
-                    }
+                    usage = _merge_usage(usage, {
+                        "input_tokens": _num(u.get("input")),
+                        "output_tokens": _num(u.get("output")),
+                        "cache_creation": _num(u.get("cacheWrite")),
+                        "cache_read": _num(u.get("cacheRead")),
+                        "reasoning_tokens": _num(u.get("reasoningTokens")),
+                        "cost_usd": _num(cost.get("total")),
+                    })
                     events.append({"type": "agent.usage", "payload": dict(usage)})
             elif typ == "agent_end":
                 stop = last_stop_reason or ("end_turn" if raw.get("isTerminal") else "unknown")
@@ -319,6 +294,11 @@ class OmpAdapter(ClaudeAdapter):
         return str(sid) if sid else None
 
 
+def _num(v):
+    """usage 字段数值防护：非 int/float（None/字符串/布尔）一律按 0。"""
+    return v if isinstance(v, (int, float)) else 0
+
+
 def _extract_text(content) -> str:
     """content 为字符串或内容块数组（Anthropic Messages 风格）时提取可见文本。"""
     if isinstance(content, str):
@@ -329,10 +309,30 @@ def _extract_text(content) -> str:
     return ""
 
 
+def _assistant_event(events, usage, seen_ids, msg) -> dict:
+    """claude/grok 共享的 assistant 行处理：按 message.id 去重累加 usage，
+    追加 agent.message（content 统一走 _extract_text）。返回更新后的 usage。"""
+    mid = msg.get("id")
+    if mid and mid not in seen_ids:
+        seen_ids.add(mid)
+        if isinstance(msg.get("usage"), dict):
+            u = msg["usage"]
+            usage = _merge_usage(usage, {
+                "input_tokens": _num(u.get("input_tokens")),
+                "output_tokens": _num(u.get("output_tokens")),
+                "cache_creation": _num(u.get("cache_creation_input_tokens")),
+                "cache_read": _num(u.get("cache_read_input_tokens")),
+                "cost_usd": 0.0,
+            })
+    events.append({"type": "agent.message",
+                   "payload": {"text": _extract_text(msg.get("content"))}})
+    return usage
+
+
 def _merge_usage(base: dict, add: dict) -> dict:
     out = dict(base)
     for k, v in add.items():
-        out[k] = out.get(k, 0) + (v if isinstance(v, (int, float)) else 0)
+        out[k] = out.get(k, 0) + _num(v)
     return out
 
 

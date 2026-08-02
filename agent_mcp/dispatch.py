@@ -34,6 +34,8 @@ class SlotScheduler:
     def release(self, agent_key: str) -> str | None:
         """释放槽位，返回可补位的排队 key（若有）。"""
         with self._lock:
+            if agent_key not in self._active:
+                return None  # 防重复 release 过度激活
             self._active.discard(agent_key)
             while self._queue:
                 nxt = self._queue.pop(0)
