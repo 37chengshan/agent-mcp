@@ -37,6 +37,13 @@ def test_tools_list_has_eight_tools_in_order():
                      "get_token_usage"]
 
 
+def test_spawn_schema_requires_cwd():
+    """与 daemon Dispatcher 对齐：cwd 必填（缺失时 daemon 返回 400）。"""
+    schema = next(t for t in mcp_server.TOOLS if t["name"] == "spawn_agent")["inputSchema"]
+    assert "cwd" in schema["required"]
+    assert set(schema["required"]) == {"target_cli", "prompt", "cwd"}
+
+
 def test_host_from_client_info():
     assert mcp_server.host_from_client_info({"name": "codex"}) == "codex"
     assert mcp_server.host_from_client_info({"name": "claude-ai"}) == "claude"

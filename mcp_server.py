@@ -50,7 +50,7 @@ _DAEMON_PATHS = {
 TOOLS = [
     {
         "name": "spawn_agent",
-        "description": "创建任务 agent 并启动 CLI 子进程（槽位满则排队）。"
+        "description": "创建任务 agent 并启动 CLI 子进程（槽位满则排队，返回 status=queued）。"
                        "target_cli 为 claude/grok/opencode/omp；context 注入父摘要；"
                        "resume 透传 CLI session id。返回 agent_id 用于后续监控。",
         "inputSchema": {
@@ -60,7 +60,7 @@ TOOLS = [
                                "description": "执行任务的 CLI。"},
                 "prompt": {"type": "string", "description": "任务提示词。"},
                 "task_name": {"type": "string", "description": "分层名称，如 /root/task1。"},
-                "cwd": {"type": "string", "description": "工作目录。"},
+                "cwd": {"type": "string", "description": "工作目录（必填，daemon 校验）。"},
                 "permission_mode": {"type": "string", "enum": ["plan", "acceptEdits", "fullAccess"],
                                     "default": "plan", "description": "CLI 权限模式。"},
                 "model": {"type": "string", "description": "CLI 使用的模型。"},
@@ -71,15 +71,15 @@ TOOLS = [
                 "parent_agent_id": {"type": "integer", "description": "父 agent（同会话）。"},
                 "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
             },
-            "required": ["target_cli", "prompt"],
+            "required": ["target_cli", "prompt", "cwd"],
             "additionalProperties": False,
         },
         "annotations": {"destructiveHint": True},
     },
     {
         "name": "send_message",
-        "description": "投递消息到 daemon 消息队列：运行中挂起，终止后标 undelivered；"
-                       "永不触发执行——只有 followup_task 会把挂起消息合并进新 run。",
+        "description": "投递消息到 daemon 消息队列：运行中返回 delivered，终止后返回 undelivered；"
+                       "永不触发执行——只有 followup_task 会把消息合并进新 run。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -93,8 +93,8 @@ TOOLS = [
     {
         "name": "followup_task",
         "description": "唯一触发新 turn 的入口：合并该 agent 的挂起消息与 prompt 重新 spawn"
-                       "（parent_id = 原 agent 的 parent）。运行中返回 error 提示先 wait/interrupt；"
-                       "interrupt=true 先终止再重派。",
+                       "（复用同一 agent 节点）。运行中返回 queued，当前 run 结束后自动串联；"
+                       "interrupt=true 先终止再立即重派。返回 merged_messages 计合并条数。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -110,7 +110,8 @@ TOOLS = [
     {
         "name": "wait_agent",
         "description": "短阻塞等待 agent 进入终止态（terminated/error/cancelled/incomplete），"
-                       "最多 30 秒；返回状态 + 最新消息摘要（截断），不返回全文。超时返回当前状态。",
+                       "最多 30 秒。terminated 返回最新输出摘要（截断）；error 返回错误信息；"
+                       "超时返回当前状态 + hint 轮询指引。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -150,15 +151,14 @@ TOOLS = [
     },
     {
         "name": "get_agent_activity",
-        "description": "agent 的实时活动流（事件按 seq 分页）+ 消息流分页。since_seq 用于增量拉取。",
+        "description": "agent 的实时活动流（规范化事件按 seq 排序）。since_seq 用于增量拉取，"
+                       "返回 events + next_seq。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent_id": {"type": "integer"},
                 "since_seq": {"type": "integer", "minimum": 0, "default": 0,
                               "description": "只返回 seq 更大的事件。"},
-                "page": {"type": "integer", "minimum": 0, "default": 0},
-                "size": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
             },
             "required": ["agent_id"],
             "additionalProperties": False,
@@ -167,15 +167,13 @@ TOOLS = [
     },
     {
         "name": "get_token_usage",
-        "description": "token 统计（派发侧估算）：scope=agent（单任务）/subtree（含后代）/"
-                       "global（会话或全部）。返回按 agent+model 拆分与 totals。",
+        "description": "token 统计（派发侧估算，estimated=true）：agent_id 指定单 agent；"
+                       "缺省聚合会话（session_id 过滤）或全局。返回四字段 tokens + cost_usd。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agent_id": {"type": "integer", "description": "scope=agent|subtree 时必填。"},
-                "scope": {"type": "string", "enum": ["agent", "subtree", "global"],
-                          "default": "agent"},
-                "session_id": {"type": "string", "description": "scope=global 时按会话过滤。"},
+                "agent_id": {"type": "integer", "description": "指定单 agent 的 usage。"},
+                "session_id": {"type": "string", "description": "缺省 agent_id 时按会话过滤。"},
             },
             "additionalProperties": False,
         },
@@ -294,9 +292,14 @@ def _post_once(base: str, token: str, path: str, payload: dict[str, Any]) -> dic
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:400]
-        return {"status": "error", "summary": f"daemon returned HTTP {exc.code}",
+        hint = detail
+        try:
+            hint = json.loads(detail).get("error") or detail
+        except json.JSONDecodeError:
+            pass
+        return {"status": "error", "summary": f"daemon returned HTTP {exc.code}: {hint}",
                 "root_cause_hint": detail or None,
-                "next_actions": ["check the daemon log and auth token"]}
+                "next_actions": ["check the arguments and the daemon log"]}
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
 
