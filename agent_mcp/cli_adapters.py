@@ -238,6 +238,85 @@ class OpencodeAdapter(ClaudeAdapter):
         return str(sid) if sid else None
 
 
+class OmpAdapter(ClaudeAdapter):
+    cli_name = "omp"
+    _BIN = ["omp", str(HOME / ".bun/bin/omp")]
+    # omp 无 max-turns flag（有 --max-time），max_turns 参数按接口保留但忽略；
+    # 权限映射基于 --approval-mode (always-ask|write|yolo) / --auto-approve
+    PERMISSION_FLAGS = {
+        "plan": ["--approval-mode", "always-ask"],
+        "acceptEdits": ["--approval-mode", "write"],
+        "fullAccess": ["--auto-approve"],
+    }
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        cmd = [self.binary(), "--print", "--mode", "json", "--cwd", str(cwd)]
+        cmd += self.PERMISSION_FLAGS.get(permission_mode, self.PERMISSION_FLAGS["plan"])
+        if model:
+            cmd += ["--model", model]
+        if resume:
+            cmd += ["--resume", resume]
+        cmd.append(prompt)
+        return cmd
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        # omp -p --mode=json 实测（17.2.4）：session/agent_start/turn_start/
+        # message_start/message_update(text_delta)/message_end/turn_end/agent_end；
+        # usage 权威值在 assistant message_end（message_start 为 0 占位），
+        # 字段 camelCase（input/output/cacheRead/cacheWrite/cost.total）
+        events: list[dict] = []
+        usage: dict[str, Any] = {}
+        session_id = ""
+        last_stop_reason = ""
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            typ = raw.get("type")
+            if typ == "session" and raw.get("id"):
+                session_id = str(raw["id"])
+            elif typ == "message_update":
+                ev = raw.get("assistantMessageEvent")
+                if isinstance(ev, dict) and ev.get("type") == "text_delta":
+                    events.append({"type": "agent.message_delta",
+                                   "payload": {"delta": ev.get("delta", "")}})
+            elif typ == "message_end" and isinstance(raw.get("message"), dict):
+                msg = raw["message"]
+                events.append({"type": "agent.message",
+                               "payload": {"text": _extract_text(msg.get("content"))}})
+                stop = msg.get("stopReason")
+                if stop:
+                    last_stop_reason = str(stop)
+                if isinstance(msg.get("usage"), dict):
+                    # message_end.usage 是会话最终权威值，直接覆盖（同 claude result 语义）
+                    u = msg["usage"]
+                    cost = u.get("cost") if isinstance(u.get("cost"), dict) else {}
+                    usage = {
+                        "input_tokens": u.get("input", 0),
+                        "output_tokens": u.get("output", 0),
+                        "cache_creation": u.get("cacheWrite", 0),
+                        "cache_read": u.get("cacheRead", 0),
+                        "reasoning_tokens": u.get("reasoningTokens", 0),
+                        "cost_usd": cost.get("total", 0.0) or 0.0,
+                    }
+                    events.append({"type": "agent.usage", "payload": dict(usage)})
+            elif typ == "agent_end":
+                stop = last_stop_reason or ("end_turn" if raw.get("isTerminal") else "unknown")
+                events.append({"type": "agent.terminated",
+                               "payload": {"stop_reason": stop,
+                                           "session_id": session_id}})
+        return events, usage
+    def extract_session_id(self, raw: dict) -> str | None:
+        # 实测：session 事件顶层 id
+        sid = raw.get("id") if isinstance(raw, dict) else None
+        return str(sid) if sid else None
+
+
 def _extract_text(content) -> str:
     """content 为字符串或内容块数组（Anthropic Messages 风格）时提取可见文本。"""
     if isinstance(content, str):
@@ -258,8 +337,9 @@ def _merge_usage(base: dict, add: dict) -> dict:
 _CLAUDE = ClaudeAdapter()
 _GROK = GrokAdapter()
 _OPENCODE = OpencodeAdapter()
+_OMP = OmpAdapter()
 _ADAPTERS: dict[str, BaseAdapter] = {"claude": _CLAUDE, "grok": _GROK,
-                                     "opencode": _OPENCODE}
+                                     "opencode": _OPENCODE, "omp": _OMP}
 
 
 def get_adapter(name: str) -> BaseAdapter:
