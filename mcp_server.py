@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -354,6 +355,33 @@ def host_from_client_info(info: dict[str, Any] | None) -> str:
         return "omp"
     return "unknown"
 
+def _probe_legacy_daemon(base: str, token: str) -> bool:
+    """Authenticate a legacy daemon whose public health payload lacks identity fields."""
+    if not token:
+        return False
+    payload = json.dumps(
+        {"session_id": "agent-mcp-compatibility-probe"},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        base + "/api/agents/list",
+        data=payload,
+        method="POST",
+        headers={
+            "X-Auth-Token": token,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1) as response:
+            if response.status != 200:
+                return False
+            body = json.loads(response.read().decode("utf-8"))
+            return isinstance(body, dict) and isinstance(body.get("agents"), list)
+    except Exception:
+        return False
+
+
 def _probe(base: str) -> bool:
     token = _read_token()
     try:
@@ -361,11 +389,13 @@ def _probe(base: str) -> bool:
             if resp.status != 200:
                 return False
             body = json.loads(resp.read().decode("utf-8"))
-            if body.get("service") != "agent-mcp-daemon":
-                return False
-            fingerprint = body.get("token_sha256")
-            expected = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
-            return bool(expected and fingerprint == expected)
+            if body.get("service") == "agent-mcp-daemon":
+                fingerprint = body.get("token_sha256")
+                expected = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+                return bool(expected and fingerprint == expected)
+            if body.get("ok") is True and body.get("version") == 1:
+                return _probe_legacy_daemon(base, token)
+            return False
     except Exception:
         return False
 
@@ -402,23 +432,28 @@ def _spawn_detached(command: list[str], *, env: dict[str, str] | None = None) ->
     subprocess.Popen(command, **kwargs)
 
 
+_STARTUP_LOCK = threading.Lock()
+
+
 def ensure_daemon() -> tuple[str, str]:
     """原子拉起：探测 /health（10×0.5s）→ 无则补 token 文件 → spawn_detached(daemon_main)
-    → 轮询 /health。锁文件残留校验在 daemon_main 内部，薄层不重复。返回 (base_url, token)。"""
+    → 轮询 /health。锁文件残留校验在 daemon_main 内部，薄层不重复。返回 (base_url, token)。
+    进程级 _STARTUP_LOCK 串行化探测+拉起：多线程并发调用只拉起一个 daemon。"""
     base = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
-    token = _read_token()
-    spawned = False
-    for _ in range(_PROBE_ATTEMPTS):
-        if _probe(base):
-            return base, token
-        if not spawned:
-            token = _ensure_token_file()
-            _spawn_detached([sys.executable, str(DAEMON_SCRIPT),
-                             "--port", str(DAEMON_PORT), "--state-dir", str(STATE_DIR)])
-            spawned = True
-        time.sleep(_PROBE_INTERVAL)
-    raise RuntimeError(f"agent-mcp daemon failed to start on {base} within "
-                       f"{_PROBE_ATTEMPTS * _PROBE_INTERVAL:.0f}s")
+    with _STARTUP_LOCK:
+        token = _read_token()
+        spawned = False
+        for _ in range(_PROBE_ATTEMPTS):
+            if _probe(base):
+                return base, token
+            if not spawned:
+                token = _ensure_token_file()
+                _spawn_detached([sys.executable, str(DAEMON_SCRIPT),
+                                 "--port", str(DAEMON_PORT), "--state-dir", str(STATE_DIR)])
+                spawned = True
+            time.sleep(_PROBE_INTERVAL)
+        raise RuntimeError(f"agent-mcp daemon failed to start on {base} within "
+                           f"{_PROBE_ATTEMPTS * _PROBE_INTERVAL:.0f}s")
 
 
 def _session_id() -> str:
@@ -456,10 +491,22 @@ def _post_once(base: str, token: str, path: str, payload: dict[str, Any],
 
 def _daemon_post(path: str, payload: dict[str, Any],
                  http_timeout: float | None = None) -> dict[str, Any]:
-    """调用 daemon；连接失败先失效缓存重新拉起，再重试一次。"""
+    """调用 daemon；连接失败先失效缓存重新拉起，再重试一次。
+
+    所有 ensure_daemon() 路径均被 try/except RuntimeError 包裹，
+    避免未保护的异常传播到 handle() → main() 导致进程退出、stdin pipe 关闭
+    （表现为 MCP 客户端 "Transport closed"）。
+    """
     global _DAEMON
     if _DAEMON is None:
-        _DAEMON = ensure_daemon()
+        try:
+            _DAEMON = ensure_daemon()
+        except RuntimeError as exc:
+            print(f"agent-mcp: daemon unreachable: {exc}", file=sys.stderr)
+            return {"status": "error", "summary": "agent-mcp daemon is not reachable",
+                    "root_cause_hint": str(exc),
+                    "next_actions": ["start the daemon manually: "
+                                     "python agent_mcp/daemon_main.py"]}
     base, token = _DAEMON
     out = _post_once(base, token, path, payload, http_timeout=http_timeout)
     if out is not None:
@@ -468,6 +515,7 @@ def _daemon_post(path: str, payload: dict[str, Any],
     try:
         base, token = ensure_daemon()
     except RuntimeError as exc:
+        print(f"agent-mcp: daemon still unreachable: {exc}", file=sys.stderr)
         return {"status": "error", "summary": "agent-mcp daemon is not reachable",
                 "root_cause_hint": str(exc),
                 "next_actions": ["start the daemon manually: "
@@ -540,6 +588,8 @@ def handle(request: dict[str, Any], *, emit=send) -> None:
             emit(result(request_id, payload, is_error=payload.get("status") == "error",
                         modern=modern))
     elif method in ("tasks/get", "tasks/update", "tasks/cancel"):
+        if request_id is None:
+            return  # 通知（无 id）不应返回响应
         if not modern or not _tasks_supported(request):
             emit(rpc_error(request_id, -32023, "Missing required client capability: "
                            "io.modelcontextprotocol/tasks"))
@@ -583,7 +633,11 @@ def main() -> int:
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
-            handle(parsed)
+            try:
+                handle(parsed)
+            except Exception as exc:
+                # 任何未捕获异常 → 写 stderr 诊断，不崩溃进程
+                print(f"agent-mcp: unhandled error: {exc}", file=sys.stderr)
     return 0
 
 

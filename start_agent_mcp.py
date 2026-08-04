@@ -110,7 +110,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.open:
         subprocess.Popen(browser_command(url), stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
-    print(json.dumps({"status": "started" if started else "already_running", "url": url}))
+    # When the browser is opened for the user, the write token has already
+    # been delivered through the local URL fragment.  Do not duplicate it in
+    # stdout, where terminal capture or automation logs may persist it.
+    reported_url = f"{base_url}/" if args.open else url
+    print(json.dumps({
+        "status": "started" if started else "already_running",
+        "url": reported_url,
+        "write_auth": "opened_in_browser" if args.open else "url_fragment",
+    }))
     return 0
 
 

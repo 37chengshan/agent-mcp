@@ -42,6 +42,7 @@ def test_omp_command_full_access():
     a = get_adapter("omp")
     cmd = a.build_command(prompt="do it", cwd="/tmp", model=None,
                           permission_mode="fullAccess", max_turns=8, resume=None)
+    assert cmd[cmd.index("--approval-mode") + 1] == "yolo"
     assert "--auto-approve" in cmd
 
 def test_omp_parse_message_and_usage():

@@ -320,7 +320,7 @@ def test_mcp_stdio_end_to_end(mcp_proc):
     init = _rpc(proc, q, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
                           "params": {"protocolVersion": "2025-03-26",
                                      "clientInfo": {"name": "codex", "version": "1.0"}}})
-    assert init["result"]["serverInfo"] == {"name": "agent-mcp", "version": "2.0.0"}
+    assert init["result"]["serverInfo"] == {"name": "agent-mcp", "version": mcp_server.SERVER_VERSION}
     assert init["result"]["protocolVersion"] == "2025-03-26"
 
     tools = _rpc(proc, q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})

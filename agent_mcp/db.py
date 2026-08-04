@@ -40,7 +40,13 @@ class DB:
                  retention_days: int = 7, max_messages_per_agent: int = 500,
                  retain_interval: float = 60.0):
         self.path = Path(path)
-        self._lock = threading.Lock()
+        # One sqlite connection is shared by the dispatcher monitor and the
+        # threaded HTTP server.  check_same_thread=False only disables the
+        # affinity check; it does not make concurrent use of the same
+        # connection safe.  Serialize reads and writes to prevent control-plane
+        # requests from hanging inside sqlite3 when monitoring and HTTP reads
+        # overlap.
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # 跨进程写（daemon + worker ingest）锁等待：10s 而非 sqlite3 默认 5s
@@ -87,16 +93,22 @@ class DB:
             self._conn.commit()
 
     def get_agent(self, agent_id: int) -> dict[str, Any] | None:
-        row = self._conn.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone()
-        return dict(row) if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM agents WHERE id=?", (agent_id,)
+            ).fetchone()
+            return dict(row) if row else None
 
     def agents_by_session(self, session_id: str | None) -> list[dict[str, Any]]:
-        if session_id is None:
-            rows = self._conn.execute("SELECT * FROM agents ORDER BY id").fetchall()
-        else:
-            rows = self._conn.execute("SELECT * FROM agents WHERE session_id=? ORDER BY id",
-                                      (session_id,)).fetchall()
-        return [dict(r) for r in rows]
+        with self._lock:
+            if session_id is None:
+                rows = self._conn.execute("SELECT * FROM agents ORDER BY id").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM agents WHERE session_id=? ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     def insert_event(self, *, agent_id: int, type: str, payload: dict,
                      session_id: str) -> int | None:
@@ -113,15 +125,16 @@ class DB:
 
     def events_since(self, seq: int, *, session_id: str | None = None,
                      limit: int = 1000) -> list[dict[str, Any]]:
-        if session_id is None:
-            rows = self._conn.execute(
-                "SELECT seq, session_id, agent_id, type, payload, created_at FROM events"
-                " WHERE seq>? ORDER BY seq LIMIT ?", (seq, limit)).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT seq, session_id, agent_id, type, payload, created_at FROM events"
-                " WHERE seq>? AND session_id=? ORDER BY seq LIMIT ?",
-                (seq, session_id, limit)).fetchall()
+        with self._lock:
+            if session_id is None:
+                rows = self._conn.execute(
+                    "SELECT seq, session_id, agent_id, type, payload, created_at FROM events"
+                    " WHERE seq>? ORDER BY seq LIMIT ?", (seq, limit)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT seq, session_id, agent_id, type, payload, created_at FROM events"
+                    " WHERE seq>? AND session_id=? ORDER BY seq LIMIT ?",
+                    (seq, session_id, limit)).fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -134,8 +147,9 @@ class DB:
 
     def max_seq(self) -> int:
         """事件表当前最大 seq；无事件时返回 0（SSE 断线回放固定上界用）。"""
-        row = self._conn.execute("SELECT MAX(seq) AS m FROM events").fetchone()
-        return int(row["m"]) if row and row["m"] is not None else 0
+        with self._lock:
+            row = self._conn.execute("SELECT MAX(seq) AS m FROM events").fetchone()
+            return int(row["m"]) if row and row["m"] is not None else 0
 
     def events_by_agents(self, agent_ids: list[int], *, per_agent_limit: int = 60) -> list[dict[str, Any]]:
         """每个 agent 取最近 per_agent_limit 条事件，按 seq 合并升序（快照详情用）。
@@ -143,18 +157,19 @@ class DB:
         避免 events_since 全局 limit 把后 spawn 的 agent 事件整体切掉。
         """
         out: list[dict[str, Any]] = []
-        for agent_id in agent_ids:
-            rows = self._conn.execute(
-                "SELECT seq, session_id, agent_id, type, payload, created_at FROM events"
-                " WHERE agent_id=? ORDER BY seq DESC LIMIT ?",
-                (agent_id, per_agent_limit)).fetchall()
-            for r in rows:
-                d = dict(r)
-                try:
-                    d["payload"] = _json_loads(d["payload"])
-                except Exception:
-                    d["payload"] = {}
-                out.append(d)
+        with self._lock:
+            for agent_id in agent_ids:
+                rows = self._conn.execute(
+                    "SELECT seq, session_id, agent_id, type, payload, created_at FROM events"
+                    " WHERE agent_id=? ORDER BY seq DESC LIMIT ?",
+                    (agent_id, per_agent_limit)).fetchall()
+                for r in rows:
+                    d = dict(r)
+                    try:
+                        d["payload"] = _json_loads(d["payload"])
+                    except Exception:
+                        d["payload"] = {}
+                    out.append(d)
         out.sort(key=lambda e: e["seq"])
         return out
 
@@ -174,13 +189,16 @@ class DB:
             self._conn.commit()
 
     def usage_total(self, agent_id: int) -> dict[str, int | float]:
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(input_tokens),0) input_tokens,"
-            " COALESCE(SUM(output_tokens),0) output_tokens,"
-            " COALESCE(SUM(cache_creation),0) cache_creation,"
-            " COALESCE(SUM(cache_read),0) cache_read,"
-            " COALESCE(SUM(cost_usd),0) cost_usd FROM usage WHERE agent_id=?", (agent_id,)).fetchone()
-        return dict(row)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(input_tokens),0) input_tokens,"
+                " COALESCE(SUM(output_tokens),0) output_tokens,"
+                " COALESCE(SUM(cache_creation),0) cache_creation,"
+                " COALESCE(SUM(cache_read),0) cache_read,"
+                " COALESCE(SUM(cost_usd),0) cost_usd FROM usage WHERE agent_id=?",
+                (agent_id,),
+            ).fetchone()
+            return dict(row)
 
     def insert_message(self, *, agent_id: int, role: str, content: str) -> None:
         with self._lock:
@@ -192,10 +210,13 @@ class DB:
             self._conn.commit()
 
     def messages_for(self, agent_id: int, *, page: int = 0, size: int = 100) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT id, role, content, ts FROM messages WHERE agent_id=? ORDER BY id LIMIT ? OFFSET ?",
-            (agent_id, size, page * size)).fetchall()
-        return [dict(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, role, content, ts FROM messages WHERE agent_id=?"
+                " ORDER BY id LIMIT ? OFFSET ?",
+                (agent_id, size, page * size),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def _maybe_retain(self) -> None:
         # 低频清理：retain_interval 秒内最多跑一次，避免每次 insert_event 全表 COUNT

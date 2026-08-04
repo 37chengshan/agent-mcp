@@ -230,7 +230,7 @@ class OmpAdapter(ClaudeAdapter):
     PERMISSION_FLAGS = {
         "plan": ["--approval-mode", "always-ask"],
         "acceptEdits": ["--approval-mode", "write"],
-        "fullAccess": ["--auto-approve"],
+        "fullAccess": ["--approval-mode", "yolo", "--auto-approve"],
     }
     def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
                       max_turns=8, resume=None) -> list[str]:

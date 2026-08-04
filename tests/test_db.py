@@ -1,4 +1,6 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+
 from agent_mcp.db import DB
 
 def test_agent_crud_and_tree(tmp_path):
@@ -73,3 +75,36 @@ def test_retention_cleanup_is_low_frequency(tmp_path):
     db2 = DB(tmp_path / "test.db", max_events=5, retain_interval=0)
     db2.insert_event(agent_id=1, type="agent.message", payload={"i": 99}, session_id="s")
     assert len(db2.events_since(0)) <= 6  # interval=0 时仍保留清理能力
+
+
+def test_shared_connection_serializes_concurrent_reads_and_writes(tmp_path):
+    """HTTP threads and the monitor may share one DB object without concurrent sqlite use."""
+    db = DB(tmp_path / "test.db", retain_interval=3600)
+    aid = db.insert_agent(
+        parent_id=None,
+        session_id="s",
+        task_name="/root",
+        cli="atomcode",
+        cwd=str(tmp_path),
+    )
+
+    def exercise(worker: int) -> None:
+        for i in range(50):
+            db.insert_event(
+                agent_id=aid,
+                type="agent.message",
+                payload={"worker": worker, "i": i},
+                session_id="s",
+            )
+            assert db.get_agent(aid)["id"] == aid
+            assert db.agents_by_session("s")[0]["id"] == aid
+            db.messages_for(aid, size=1)
+            db.usage_total(aid)
+            db.max_seq()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(exercise, worker) for worker in range(8)]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert db.max_seq() == 400

@@ -3,6 +3,7 @@
 不依赖真实 daemon 进程：ensure_daemon/_daemon_post/_post_once 全部 monkeypatch。
 """
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -172,6 +173,18 @@ def test_task_methods_require_negotiated_capability(method):
 
 
 @pytest.mark.parametrize("method", ["tasks/get", "tasks/update", "tasks/cancel"])
+def test_task_methods_notification_silent(method):
+    """JSON-RPC 通知（无 id）不应返回任何响应。"""
+    out = []
+    params = {"taskId": "agent:1", "_meta": _modern_task_meta()}
+    if method == "tasks/update":
+        params["inputResponses"] = {"x": {"action": "accept", "content": "msg"}}
+    mcp_server.handle({"jsonrpc": "2.0", "method": method, "params": params},
+                       emit=out.append)
+    assert out == []  # 无 id 则不 emit
+
+
+@pytest.mark.parametrize("method", ["tasks/get", "tasks/update", "tasks/cancel"])
 def test_task_methods_propagate_daemon_errors(monkeypatch, method):
     monkeypatch.setattr(mcp_server, "call_tool", lambda name, args: {
         "status": "error", "http_status": 400, "summary": "agent 999 not found"})
@@ -290,6 +303,137 @@ def test_unknown_tool_rpc_error():
 
 # ---- ensure_daemon 原子拉起 ----
 
+class _ProbeResponse:
+    def __init__(self, body, status=200):
+        self.status = status
+        self._body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _write_probe_token(monkeypatch, tmp_path, token="probe-token"):
+    daemon_json = tmp_path / "daemon.json"
+    daemon_json.write_text(json.dumps({"token": token}), encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "DAEMON_JSON", daemon_json)
+    return token
+
+
+def test_probe_accepts_current_daemon_identity(monkeypatch, tmp_path):
+    token = _write_probe_token(monkeypatch, tmp_path)
+    fingerprint = mcp_server.hashlib.sha256(token.encode("utf-8")).hexdigest()
+    monkeypatch.setattr(
+        mcp_server.urllib.request,
+        "urlopen",
+        lambda _request, timeout=1: _ProbeResponse(
+            {
+                "ok": True,
+                "service": "agent-mcp-daemon",
+                "token_sha256": fingerprint,
+            }
+        ),
+    )
+
+    assert mcp_server._probe("http://127.0.0.1:8765")
+
+
+def test_probe_accepts_legacy_daemon_only_after_authenticated_read(monkeypatch, tmp_path):
+    token = _write_probe_token(monkeypatch, tmp_path)
+    requests = []
+
+    def fake_urlopen(request, timeout=1):
+        requests.append(request)
+        if isinstance(request, str):
+            return _ProbeResponse({"ok": True, "version": 1})
+        assert request.full_url.endswith("/api/agents/list")
+        assert request.get_header("X-auth-token") == token
+        assert json.loads(request.data) == {
+            "session_id": "agent-mcp-compatibility-probe"
+        }
+        return _ProbeResponse({"agents": []})
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
+
+    assert mcp_server._probe("http://127.0.0.1:8765")
+    assert len(requests) == 2
+
+
+def test_probe_rejects_legacy_health_when_authenticated_read_fails(monkeypatch, tmp_path):
+    _write_probe_token(monkeypatch, tmp_path, token="wrong-token")
+    calls = 0
+
+    def fake_urlopen(request, timeout=1):
+        nonlocal calls
+        calls += 1
+        if isinstance(request, str):
+            return _ProbeResponse({"ok": True, "version": 1})
+        raise OSError("unauthorized")
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
+
+    assert not mcp_server._probe("http://127.0.0.1:8765")
+    assert calls == 2
+
+
+def test_probe_rejects_unrecognized_health_without_auth_fallback(monkeypatch, tmp_path):
+    _write_probe_token(monkeypatch, tmp_path)
+    calls = 0
+
+    def fake_urlopen(_request, timeout=1):
+        nonlocal calls
+        calls += 1
+        return _ProbeResponse({"ok": True, "version": 2, "service": "other"})
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
+
+    assert not mcp_server._probe("http://127.0.0.1:8765")
+    assert calls == 1
+
+
+def test_probe_rejects_new_health_with_wrong_fingerprint(monkeypatch, tmp_path):
+    """新契约下 token 无效：service 正确但 token_sha256 与本地 token 不符
+    （另一 token 的 daemon）→ 立即拒绝，不回退认证探测。"""
+    _write_probe_token(monkeypatch, tmp_path, token="real-token")
+    calls = 0
+
+    def fake_urlopen(_request, timeout=1):
+        nonlocal calls
+        calls += 1
+        return _ProbeResponse({
+            "ok": True,
+            "service": "agent-mcp-daemon",
+            "token_sha256": mcp_server.hashlib.sha256(b"other-token").hexdigest(),
+        })
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
+
+    assert not mcp_server._probe("http://127.0.0.1:8765")
+    assert calls == 1  # 指纹不匹配即拒绝，不做多余请求
+
+
+def test_probe_rejects_wrong_service_with_matching_fingerprint(monkeypatch, tmp_path):
+    """service 声明为其它服务（即使带匹配指纹）→ 拒绝。"""
+    token = _write_probe_token(monkeypatch, tmp_path)
+    fingerprint = mcp_server.hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def fake_urlopen(_request, timeout=1):
+        return _ProbeResponse({
+            "ok": True,
+            "service": "some-other-service",
+            "token_sha256": fingerprint,
+        })
+
+    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
+
+    assert not mcp_server._probe("http://127.0.0.1:8765")
+
+
 def test_ensure_daemon_probe_alive(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "STATE_DIR", tmp_path)
     monkeypatch.setattr(mcp_server, "DAEMON_JSON", tmp_path / "daemon.json")
@@ -304,6 +448,47 @@ def test_ensure_daemon_probe_alive(monkeypatch, tmp_path):
     base, token = mcp_server.ensure_daemon()
     assert base == "http://127.0.0.1:8765"
     assert spawned == []  # 已存活，不拉起
+
+
+def test_ensure_daemon_concurrent_calls_spawn_once(monkeypatch, tmp_path):
+    """并发启动：多线程同时 ensure_daemon 且 daemon 未起 → 只拉起一个，
+    所有调用者拿到同一 (base, token)。"""
+    state_dir = tmp_path / "state"
+    spawned = []
+    alive = {"flag": False}
+
+    def fake_probe(base):
+        return alive["flag"]
+
+    def fake_spawn(cmd, **kw):
+        spawned.append(cmd)
+        alive["flag"] = True  # 拉起后视为存活
+
+    monkeypatch.setattr(mcp_server, "STATE_DIR", state_dir)
+    monkeypatch.setattr(mcp_server, "DAEMON_JSON", state_dir / "daemon.json")
+    monkeypatch.setattr(mcp_server, "DAEMON_SCRIPT", tmp_path / "daemon_main.py")
+    monkeypatch.setattr(mcp_server, "DAEMON_PORT", 8765)
+    monkeypatch.setattr(mcp_server, "_probe", fake_probe)
+    monkeypatch.setattr(mcp_server, "_spawn_detached", fake_spawn)
+
+    results = []
+    errors = []
+
+    def run():
+        try:
+            results.append(mcp_server.ensure_daemon())
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert errors == []
+    assert len(spawned) == 1  # 锁串行化：只拉起一次
+    assert len(results) == 4
+    assert len({r for r in results}) == 1  # 同一 (base, token)
 
 
 def test_ensure_daemon_spawns_when_down_and_writes_token(monkeypatch, tmp_path):
@@ -396,6 +581,88 @@ def test_main_reads_stdin_lines(monkeypatch, capsys):
     assert '"serverInfo"' in out
     assert '"tools"' in out
     assert out.count("\n") == 2  # 非 JSON 行被跳过，只响应两条
+
+
+def test_daemon_post_first_ensure_protected(monkeypatch):
+    """_daemon_post 首次 ensure_daemon() 失败 → 返回结构化错误，不抛异常崩溃进程。"""
+    calls = []
+    monkeypatch.setattr(mcp_server, "ensure_daemon",
+                        lambda: (_ for _ in ()).throw(RuntimeError("daemon down")))
+    monkeypatch.setattr(mcp_server, "_post_once",
+                        lambda *a, **kw: calls.append("unreachable"))
+    out = mcp_server._daemon_post("/api/agents/list", {})
+    assert out["status"] == "error"
+    assert "not reachable" in out["summary"] or "unreachable" in out["summary"]
+    assert len(calls) == 0  # ensure_daemon 失败，_post_once 未被调用
+
+
+def test_handle_tools_call_ensure_fails_returns_error(monkeypatch):
+    """tools/call 时 ensure_daemon 失败 → handle() 返回 JSON-RPC 错误，不崩溃进程。"""
+    def fail_ensure():
+        raise RuntimeError("daemon unreachable")
+    monkeypatch.setattr(mcp_server, "_daemon_post",
+                        lambda path, payload, http_timeout=None: (
+                            {"status": "error",
+                             "summary": "agent-mcp daemon is not reachable",
+                             "root_cause_hint": "daemon unreachable",
+                             "next_actions": ["start daemon"]}
+                        ))
+    monkeypatch.setattr(mcp_server, "ensure_daemon", fail_ensure)
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                       "params": {"name": "list_agents", "arguments": {}}},
+                      emit=out.append)
+    msg = out[0]
+    assert "error" not in msg  # 不是 JSON-RPC error（协议层正常）
+    assert msg["result"]["isError"] is True
+    body = json.loads(msg["result"]["content"][0]["text"])
+    assert body["status"] == "error"
+
+
+def test_main_handle_exception_does_not_crash(monkeypatch, capsys):
+    """main() 中 handle() 抛出异常 → 进程不退出，stderr 写诊断。"""
+    def crashing_handle(request, *, emit=mcp_server.send):
+        raise ValueError("simulated crash in handle")
+
+    monkeypatch.setattr(mcp_server, "handle", crashing_handle)
+    lines = iter([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+    ])
+    monkeypatch.setattr(mcp_server.sys, "stdin", lines)
+    # 不应抛出异常
+    assert mcp_server.main() == 0
+    err = capsys.readouterr().err
+    assert "unhandled error" in err
+    assert "simulated crash" in err
+
+
+def test_main_fresh_process_lifecycle(monkeypatch, capsys):
+    """fresh process 连续 initialize → tools/list → list_agents（daemon reachable）
+    不提前关闭 stdout 管道。"""
+    monkeypatch.setattr(mcp_server, "_daemon_post",
+                        lambda path, payload, http_timeout=None: (
+                            {"status": "ok", "agents": []}
+                            if "/api/agents/list" in path
+                            else {"status": "ok"}
+                        ))
+    lines = iter([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "codex-test"}}}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "list_agents", "arguments": {}}}),
+    ])
+    monkeypatch.setattr(mcp_server.sys, "stdin", lines)
+    assert mcp_server.main() == 0
+    out = capsys.readouterr().out
+    assert '"serverInfo"' in out  # initialize 响应
+    assert '"tools"' in out       # tools/list 响应
+    assert 'agents' in out  # list_agents 响应（在 JSON 转义的 text 字段内）
+    # 所有响应都是有效 JSON-RPC，每行一个
+    for line in out.strip().split("\n"):
+        msg = json.loads(line)
+        assert "jsonrpc" in msg
+        assert "id" in msg
 
 
 def test_state_dir_prefers_agent_mcp_home_over_codex_home(monkeypatch):

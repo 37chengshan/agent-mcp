@@ -224,7 +224,16 @@ class Dispatcher:
                                              "kind": "steer" if body.get("interrupt") else "followup"},
                         agent_id)
         resume = body.get("resume") or agent.get("cli_session_id")
-        body = {**body, "resume": resume}
+        body = {
+            **body,
+            "model": body.get("model") or agent.get("model"),
+            "permission_mode": (
+                body.get("permission_mode")
+                or agent.get("permission_mode")
+                or "plan"
+            ),
+            "resume": resume,
+        }
         params = (agent["cli"], merged, agent["cwd"], body)
         with self._lock:
             self._pending[agent_id] = params

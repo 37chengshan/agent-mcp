@@ -250,10 +250,16 @@ class Handler(BaseHTTPRequestHandler):
                         if seq > boundary:
                             reached_boundary = True  # 边界后的新写入，交由 live 缓冲
                             break
-                        payload = (f"id: {seq}\nevent: {ev['type']}\ndata: "
-                                   f"{json.dumps({'type': ev['type'], 'agent_id': ev['agent_id'],
-                                                  'payload': ev['payload'], 'seq': seq},
-                                                 ensure_ascii=False)}\n\n")
+                        event_payload = {
+                            "type": ev["type"],
+                            "agent_id": ev["agent_id"],
+                            "payload": ev["payload"],
+                            "seq": seq,
+                        }
+                        payload = (
+                            f"id: {seq}\nevent: {ev['type']}\ndata: "
+                            f"{json.dumps(event_payload, ensure_ascii=False)}\n\n"
+                        )
                         try:
                             self.wfile.write(payload.encode("utf-8"))
                             self.wfile.flush()

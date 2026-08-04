@@ -261,11 +261,39 @@ def test_followup_automatically_resumes_saved_cli_session(tmp_path):
 def test_steer_running_agent_interrupts_and_starts_followup(tmp_path, monkeypatch):
     """中途插话是显式 steer：终止当前 run，保留节点并立即开始下一 turn。"""
     fake, calls = _fake_spawn(tmp_path)
-    d, db, _ = _make(tmp_path, spawn_fn=fake)
+    inherited = []
+
+    def capture_inheritance(
+        target_cli, *, prompt, cwd, permission_mode="plan", model=None,
+        max_turns=8, resume=None, state_dir, timeout_seconds=None,
+    ):
+        inherited.append({
+            "model": model,
+            "permission_mode": permission_mode,
+        })
+        return fake(
+            target_cli,
+            prompt=prompt,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            model=model,
+            max_turns=max_turns,
+            resume=resume,
+            state_dir=state_dir,
+            timeout_seconds=timeout_seconds,
+        )
+
+    d, db, _ = _make(tmp_path, spawn_fn=capture_inheritance)
     monkeypatch.setattr("agent_mcp.daemon_main.terminate_process_tree", lambda _pid: True)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "first", "cwd": str(tmp_path)})
+        a = d.spawn({
+            "target_cli": "claude",
+            "prompt": "first",
+            "cwd": str(tmp_path),
+            "model": "deepseek-v4-flash",
+            "permission_mode": "fullAccess",
+        })
         db.set_status(a["agent_id"], "running", cli_session_id="session-42")
         result = d.steer({"agent_id": a["agent_id"], "message": "先停一下，改做 B"})
         assert result["status"] == "running"
@@ -273,6 +301,10 @@ def test_steer_running_agent_interrupts_and_starts_followup(tmp_path, monkeypatc
         assert result["resumed_session_id"] == "session-42"
         assert calls[1]["resume"] == "session-42"
         assert "先停一下，改做 B" in calls[1]["prompt"]
+        assert inherited[1] == {
+            "model": "deepseek-v4-flash",
+            "permission_mode": "fullAccess",
+        }
         assert db.get_agent(a["agent_id"])["status"] == "running"
     finally:
         d.stop()
