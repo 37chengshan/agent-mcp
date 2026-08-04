@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any
 
 EVENT_TYPES = frozenset({
-    "agent.spawned", "agent.running", "agent.message", "agent.message_delta",
+    "agent.spawned", "agent.user_turn", "agent.running", "agent.message", "agent.message_delta",
     "agent.tool_use", "agent.tool_result", "agent.usage",
     "agent.thread_message_sent", "agent.thread_message_received",
     "agent.idle", "agent.terminated", "agent.error", "agent.cancelled",

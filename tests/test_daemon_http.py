@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -45,6 +46,42 @@ def test_health_endpoint(tmp_path):
         assert body["ok"] is True
     finally:
         srv.shutdown()
+
+def test_health_identifies_daemon_without_exposing_token(tmp_path):
+    import hashlib
+    srv = _make_server(tmp_path)
+    try:
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/health")
+        body = json.loads(resp.read())
+        assert body["service"] == "agent-mcp-daemon"
+        assert body["token_sha256"] == hashlib.sha256(b"t").hexdigest()
+        assert "token" not in body
+    finally:
+        srv.shutdown()
+
+
+def test_config_endpoint_never_exposes_write_token(tmp_path):
+    srv = _make_server(tmp_path)
+    try:
+        resp = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/api/config")
+        body = json.loads(resp.read())
+        assert body == {"max_message_chars": 20_000, "write_auth": "url-fragment"}
+    finally:
+        srv.shutdown()
+
+
+def test_html_and_json_responses_send_security_headers(tmp_path):
+    (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+    srv = _make_server(tmp_path)
+    try:
+        for path in ("/", "/health"):
+            resp = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}{path}")
+            assert resp.headers["X-Frame-Options"] == "DENY"
+            assert "frame-ancestors 'none'" in resp.headers["Content-Security-Policy"]
+            assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    finally:
+        srv.shutdown()
+
 
 
 def test_bad_host_rejected(tmp_path):
@@ -121,16 +158,169 @@ def test_snapshot_no_token_and_session_filter(tmp_path):
     try:
         srv.db.insert_agent(parent_id=None, session_id="only", task_name="a",
                             cli="claude", model=None, cwd=str(tmp_path))
-        # 无 token 可访问（GET 只读）
         resp = urllib.request.urlopen(
             f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot")
         body = json.loads(resp.read())
         assert [a["task_name"] for a in body["agents"]] == ["a"]
-        # 指定不存在的 session → 400
         req = urllib.request.Request(
             f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot?session_id=nope")
         with pytest.raises(urllib.error.HTTPError) as exc:
             urllib.request.urlopen(req)
         assert exc.value.code == 400
+    finally:
+        srv.shutdown()
+
+
+def test_events_last_seq_replays_persisted_events_then_live(tmp_path):
+    """/events?last_seq=N：先回放 SQLite 中 seq>N 的事件，随后进入 live；不重复。"""
+    import http.client
+    srv = _make_server(tmp_path)
+    try:
+        aid = srv.db.insert_agent(parent_id=None, session_id="s", task_name="t",
+                                  cli="claude", cwd=str(tmp_path))
+        for i in range(3):
+            srv.db.insert_event(agent_id=aid, type="agent.message",
+                                payload={"i": i}, session_id="s")
+        got = []
+
+        def read():
+            conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", "/events?last_seq=1")
+            resp = conn.getresponse()
+            got.append(resp.read1(65536))  # 回放段即时写出
+            time.sleep(0.6)
+            got.append(resp.read1(65536))  # live 段
+            conn.close()
+
+        t = threading.Thread(target=read)
+        t.start()
+        time.sleep(0.4)
+        srv.broadcaster.publish({"type": "agent.running", "agent_id": aid,
+                                 "payload": {}, "seq": 4}, seq=4)
+        t.join(timeout=5)
+        assert not t.is_alive()
+        data = (got[0] or b"").decode("utf-8", "replace") + \
+               (got[1] or b"").decode("utf-8", "replace")
+        assert "id: 2\n" in data and "id: 3\n" in data
+        assert "id: 1\n" not in data          # last_seq=1 之前的 seq1 不回放
+        assert data.count("event: agent.message") == 2  # seq2/seq3 各一次，不重复
+        assert "id: 4\n" in data and "event: agent.running" in data  # 进入 live
+    finally:
+        srv.shutdown()
+
+
+def test_events_replays_over_1000_persisted_events_tail_delivered(tmp_path):
+    """>1000 条持久化事件断线回放：分页补齐 (last_seq, boundary]，
+    尾部 seq 必须交付，不丢不重、严格递增。"""
+    import http.client
+    import re
+    import socket
+    srv = _make_server(tmp_path)
+    try:
+        aid = srv.db.insert_agent(parent_id=None, session_id="big", task_name="t",
+                                  cli="claude", cwd=str(tmp_path))
+        total = 1005  # 回放范围 (3, 1005] 共 1002 条 > 1000 单页上限
+        for i in range(total):
+            srv.db.insert_event(agent_id=aid, type="agent.message",
+                                payload={"i": i}, session_id="big")
+        data = bytearray()
+
+        def read():
+            conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
+            conn.request("GET", "/events?last_seq=3")
+            resp = conn.getresponse()
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                try:
+                    chunk = resp.read1(65536)
+                except (socket.timeout, TimeoutError):
+                    break
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if b"id: 1005\n" in data:
+                    break
+            conn.close()
+
+        t = threading.Thread(target=read)
+        t.start()
+        t.join(timeout=30)
+        assert not t.is_alive(), "SSE 读取线程未在期限内结束"
+        text = bytes(data).decode("utf-8", "replace")
+        ids = [int(m) for m in re.findall(r"id: (\d+)\n", text)]
+        assert ids == list(range(4, total + 1)), \
+            f"seq 缺漏/重复/乱序: 共{len(ids)}条, 头{ids[:3]} 尾{ids[-3:]}"
+        assert text.count("event: agent.message") == total - 3
+    finally:
+        srv.shutdown()
+
+
+def test_events_replay_over_1000_with_live_publish_race_no_dup(tmp_path):
+    """>1000 回放期间 live publish 与回放范围重叠：重叠 seq 恰好交付一次，
+    回放范围内外事件顺序严格、无重复。"""
+    import http.client
+    import re
+    import socket
+    srv = _make_server(tmp_path)
+    try:
+        aid = srv.db.insert_agent(parent_id=None, session_id="race", task_name="t",
+                                  cli="claude", cwd=str(tmp_path))
+        total = 1005
+        for i in range(total):
+            srv.db.insert_event(agent_id=aid, type="agent.message",
+                                payload={"i": i}, session_id="race")
+        data = bytearray()
+
+        def read():
+            conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
+            conn.request("GET", "/events?last_seq=3")
+            resp = conn.getresponse()
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                try:
+                    chunk = resp.read1(65536)
+                except (socket.timeout, TimeoutError):
+                    break
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if b"id: 1010\n" in data:
+                    break
+            conn.close()
+
+        t = threading.Thread(target=read)
+        t.start()
+        time.sleep(0.05)  # 回放进行中，模拟断线补发与 live 的竞态窗口
+        # 回放范围内 (1004/1005) 与范围外 (1006..1010) 的 live 事件并发发布
+        for seq in (1004, 1005):
+            srv.broadcaster.publish({"type": "agent.message", "agent_id": aid,
+                                     "payload": {"i": seq - 1}, "seq": seq}, seq=seq)
+        for seq in range(1006, 1011):
+            srv.broadcaster.publish({"type": "agent.running", "agent_id": aid,
+                                     "payload": {}, "seq": seq}, seq=seq)
+        t.join(timeout=30)
+        assert not t.is_alive(), "SSE 读取线程未在期限内结束"
+        text = bytes(data).decode("utf-8", "replace")
+        ids = [int(m) for m in re.findall(r"id: (\d+)\n", text)]
+        assert ids == list(range(4, 1011)), \
+            f"seq 缺漏/重复/乱序: 共{len(ids)}条, 头{ids[:3]} 尾{ids[-3:]}"
+        assert text.count("event: agent.message") == total - 3  # 1004/1005 live 副本不重复
+        assert text.count("event: agent.running") == 5
+    finally:
+        srv.shutdown()
+
+
+def test_oversized_json_body_rejected(tmp_path):
+    import http.client
+    srv = _make_server(tmp_path)
+    try:
+        big = json.dumps({"prompt": "x" * 1_100_000})
+        conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        conn.request("POST", "/api/agents/spawn", body=big.encode(),
+                     headers={"X-Auth-Token": "t", "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 413
+        conn.close()
     finally:
         srv.shutdown()

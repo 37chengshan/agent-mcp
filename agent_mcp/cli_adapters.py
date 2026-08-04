@@ -1,10 +1,14 @@
 from __future__ import annotations
+import re
 import json
 import shutil
 from pathlib import Path
 from typing import Any
 
 HOME = Path.home()
+
+class ResumeUnsupportedError(ValueError):
+    pass
 
 
 class BaseAdapter:
@@ -299,6 +303,61 @@ class OmpAdapter(ClaudeAdapter):
         return str(sid) if sid else None
 
 
+
+class AtomCodeAdapter(BaseAdapter):
+    cli_name = "atomcode"
+    _BIN = ["atomcode", str(HOME / ".local/bin/atomcode")]
+    # AtomCode 5.0.3 bundled docs advertise --disable-tools, but the installed
+    # binary rejects it. Keep plan/acceptEdits at native approval defaults;
+    # only fullAccess elevates with the verified -y flag.
+
+    def binary(self) -> str | None:
+        for candidate in self._BIN:
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        return None
+
+    def build_command(self, *, prompt: str, cwd: str, model: str | None,
+                      permission_mode: str, max_turns: int,
+                      resume: str | None) -> list[str]:
+        if resume:
+            raise ResumeUnsupportedError("AtomCode does not support stable session-id resume")
+        command = [self.binary(), "-C", str(cwd)]
+        if model:
+            command.extend(("--model", model))
+        if permission_mode == "fullAccess":
+            command.append("--dangerously-skip-permissions")
+        command.extend(("-v", "-p", prompt))
+        return command
+
+    def parse_stream(self, lines: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        visible: list[str] = []
+        usage: dict[str, Any] = {}
+        for raw_line in lines:
+            line = raw_line.rstrip("\n")
+            match = re.fullmatch(
+                r"\[tokens\]\s+prompt=(\d+)\s+completion=(\d+)\s+cached=(\d+)",
+                line.strip())
+            if match:
+                usage = {"input_tokens": int(match.group(1)),
+                         "output_tokens": int(match.group(2)),
+                         "cache_creation": 0, "cache_read": int(match.group(3)),
+                         "cost_usd": 0.0}
+                continue
+            if line.lstrip().startswith("[done]"):
+                continue
+            visible.append(line)
+        text = "\n".join(visible).strip()
+        events: list[dict[str, Any]] = []
+        if text:
+            events.append({"type": "agent.message", "payload": {"text": text}})
+        if usage:
+            events.append({"type": "agent.usage", "payload": dict(usage)})
+        return events, usage
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        return None
 def _num(v):
     """usage 字段数值防护：非 int/float（None/字符串/布尔）一律按 0。"""
     return v if isinstance(v, (int, float)) else 0
@@ -345,8 +404,14 @@ _CLAUDE = ClaudeAdapter()
 _GROK = GrokAdapter()
 _OPENCODE = OpencodeAdapter()
 _OMP = OmpAdapter()
-_ADAPTERS: dict[str, BaseAdapter] = {"claude": _CLAUDE, "grok": _GROK,
-                                     "opencode": _OPENCODE, "omp": _OMP}
+_ATOMCODE = AtomCodeAdapter()
+_ADAPTERS: dict[str, BaseAdapter] = {
+    "claude": _CLAUDE,
+    "grok": _GROK,
+    "opencode": _OPENCODE,
+    "omp": _OMP,
+    "atomcode": _ATOMCODE,
+}
 
 
 def get_adapter(name: str) -> BaseAdapter:

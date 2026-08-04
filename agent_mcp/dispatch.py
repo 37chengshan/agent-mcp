@@ -93,11 +93,15 @@ def is_pid_running(pid: int | None) -> bool:
 
 
 def build_worker_command(*, state_path: Path, out_path: Path, err_path: Path,
-                         cwd: str, cli_command: list[str]) -> list[str]:
-    """分离 worker：本脚本 --dispatch-worker 模式（与现有 grok MCP 同构）。"""
+                         cwd: str, cli_command: list[str],
+                         timeout_seconds: float | None = None) -> list[str]:
+    """分离 worker：本脚本 --dispatch-worker 模式（与现有 grok MCP 同构）。
+
+    timeout_seconds 置于 command json 之前（保持 json 末位，向后兼容旧 argv）。"""
     worker = Path(__file__).resolve().parent.parent / "dispatch_worker.py"
     return [sys.executable, str(worker), str(state_path), str(out_path),
-            str(err_path), cwd, json.dumps(cli_command, ensure_ascii=False)]
+            str(err_path), cwd, str(timeout_seconds or 0),
+            json.dumps(cli_command, ensure_ascii=False)]
 
 
 def spawn_detached(command: list[str], *, env: dict[str, str] | None = None) -> subprocess.Popen:
@@ -115,13 +119,15 @@ def spawn_detached(command: list[str], *, env: dict[str, str] | None = None) -> 
 def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
                      permission_mode: str = "plan", model: str | None = None,
                      max_turns: int = 8, resume: str | None = None,
-                     state_dir: Path) -> dict[str, Any]:
+                     state_dir: Path,
+                     timeout_seconds: float | None = None) -> dict[str, Any]:
     """spawn 一个 CLI 任务 worker（T9 daemon 用）。
 
     流程：get_adapter → binary() 检查（缺失抛结构化 ValueError）→
     build_command → build_worker_command → spawn_detached。
     返回 {"worker_pid", "command_summary", "state_path", "out_path", "err_path"}；
     state_dir 下按任务生成 {cli}-{tag}.json / .out.log / .err.log（并发安全）。
+    timeout_seconds 透传给 worker（超时由 worker 终止进程树并标 timed_out）。
     """
     adapter = get_adapter(target_cli)
     binary = adapter.binary()
@@ -133,12 +139,15 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
                                     max_turns=max_turns, resume=resume)
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(state_dir, 0o700)
     tag = f"{target_cli}-{uuid.uuid4().hex[:8]}"
     state_path = state_dir / f"{tag}.json"
     out_path = state_dir / f"{tag}.out.log"
     err_path = state_dir / f"{tag}.err.log"
     worker_cmd = build_worker_command(state_path=state_path, out_path=out_path,
-                                      err_path=err_path, cwd=cwd, cli_command=cli_cmd)
+                                      err_path=err_path, cwd=cwd, cli_command=cli_cmd,
+                                      timeout_seconds=timeout_seconds)
     proc = spawn_detached(worker_cmd)
     return {"worker_pid": proc.pid, "command_summary": " ".join(cli_cmd),
             "state_path": str(state_path), "out_path": str(out_path),

@@ -141,7 +141,7 @@ def test_wait_ingests_events_end_to_end(tmp_path):
     """fake worker 完成路径（wait → _check_worker → _ingest_output）全链路。"""
     calls = []
     def fake_spawn(target_cli, *, prompt, cwd, permission_mode="plan", model=None,
-                   max_turns=8, resume=None, state_dir):
+                   max_turns=8, resume=None, state_dir, timeout_seconds=None):
         state_path = tmp_path / "claude-0.json"
         state_path.write_text(json.dumps({"status": "starting"}))
         out_path = tmp_path / "claude-0.out.log"

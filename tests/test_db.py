@@ -45,3 +45,31 @@ def test_messages_retention_limit(tmp_path):
     msgs = db.messages_for(1)
     assert len(msgs) == 3
     assert msgs[0]["content"] == "msg2"  # 只保留最近 3 条
+
+
+def test_events_by_agents_per_agent_limit(tmp_path):
+    db = DB(tmp_path / "test.db")
+    for i in range(5):
+        db.insert_event(agent_id=1, type="agent.message", payload={"i": i}, session_id="s1")
+    for i in range(3):
+        db.insert_event(agent_id=2, type="agent.message", payload={"i": i}, session_id="s1")
+    rows = db.events_by_agents([1, 2], per_agent_limit=2)
+    assert [e["seq"] for e in rows] == [4, 5, 7, 8]  # 每 agent 最近 2 条，合并后按 seq 升序
+    assert all(e["agent_id"] in (1, 2) and isinstance(e["payload"], dict) for e in rows)
+    rows0 = db.events_by_agents([1, 2], per_agent_limit=0)
+    assert rows0 == []
+
+
+def test_busy_timeout_pragma_set(tmp_path):
+    db = DB(tmp_path / "test.db")
+    assert db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 10000
+
+
+def test_retention_cleanup_is_low_frequency(tmp_path):
+    db = DB(tmp_path / "test.db", max_events=5, retain_interval=3600)
+    for i in range(10):
+        db.insert_event(agent_id=1, type="agent.message", payload={"i": i}, session_id="s")
+    assert len(db.events_since(0)) > 5  # 高频插入不立即触发清理
+    db2 = DB(tmp_path / "test.db", max_events=5, retain_interval=0)
+    db2.insert_event(agent_id=1, type="agent.message", payload={"i": 99}, session_id="s")
+    assert len(db2.events_since(0)) <= 6  # interval=0 时仍保留清理能力

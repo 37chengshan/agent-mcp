@@ -1,254 +1,86 @@
+---
+name: agent-mcp
+description: Agent MCP 编排：把任务拆解、派发到多 CLI（claude/grok/opencode/omp/atomcode）执行并监控汇合。9 个工具（spawn_agent、send_message、steer_agent、followup_task、wait_agent、interrupt_agent、list_agents、get_agent_activity、get_token_usage）实现拆解→并行派发→监控→汇合→迭代审查工作流。
+---
+
 # Agent MCP 编排 Skill
 
-> 主 agent（教主）如何用 agent-mcp 的 8 个工具把任务拆解、派发到多 CLI、监控、汇合并迭代审查。
-> 三主载体（codex / claude / omp）通用，被派发 CLI 池为 claude / grok / opencode / omp（四者互为载体）。
+> 主 agent（编排者）把一个大任务拆成子任务、判断并行度，再用 MCP 工具派发给多个 CLI 子代理执行、监控、汇合。
+> **编排决策全部由主 agent 做；MCP 只是派发基础设施**（同 opencodex v2 spawn 面 / MCP Orchestrator-Worker 模式），不替你做拆解、不决定派谁、不解决文件冲突。
 
-**核心原则：去模型化。** 本 skill 不硬编码任何 CLI 载体或模型；派发参数（target_cli / model / permission_mode）由主 agent 按 §4 匹配指南现场决策，模型默认绑定留在各主载体配置里。
+## 1. 编排五步（主 agent 的工作）
 
----
+**第一步：拆解规划**
+把任务拆成可独立验证的子任务（有明确产出物或验收点），用 `skill/agents/planner.md` 辅助。每个子任务标注：**读密集**（探索/审查/搜索）还是**写密集**（改代码/写文件）。
 
-## 1. 六步工作流
+**第二步：判定并行（关键）**
+- 无数据依赖的子任务 → **并行**派发
+- 写同一批文件的子任务 → **串行**（或按依赖分批、同批并行）
+- 有依赖的 → 父任务先跑，产出作 `context` 传给子任务
 
-### 步骤一：拆解
+**第三步：MCP 式派发**
+对每个子任务调 `spawn_agent`（可并发调用多个）：
+- `target_cli` 按 §3 匹配；`model` 现场决策（去模型化，不硬编码）
+- `prompt` = 角色提示词 + 任务描述 + 输出要求（要求以 `FINAL_ANSWER: <摘要>` 结尾回传）
+- `cwd` 必填；`parent_agent_id` 挂到当前任务树；`permission_mode` 默认 plan，写文件才升档
 
-主 agent 分析任务，用 `skill/agents/planner.md` 的角色提示词辅助拆解：识别子任务、依赖关系、风险，产出任务清单。
+**第四步：监控**
+- 并行多分支：`list_agents` / `get_agent_activity`（since_seq 增量）轮询
+- 顺序依赖处：`wait_agent`（短阻塞，timeout 可自定义，默认 30s、上限 600s）
+- 中途改向：`steer_agent`（运行中先终止当前 run，再在同一节点立即续接；稳定 session id 的 CLI 自动恢复原会话）
+- 网页操作台由 `start_agent_mcp.py --open` 打开：横向 Conversation graph + agent 详情，可中途插话 / 继续会话 / 停止；写授权只放在 URL fragment，页面读取后立即清除，不由 `/api/config` 暴露。
 
-- 每个子任务要**可独立验证**（有明确产出物或验收点）
-- 标注任务类型：**读密集**（探索/审查/搜索）还是**写密集**（改代码/写文件）
+**第五步：汇合与迭代**
+- 分支以 `FINAL_ANSWER:` 回传摘要；主 agent 综合核对、识别冲突、决定返工
+- 不合格分支 → `followup_task`（复用同一 agent 节点）迭代修复，不阻塞其他分支
+- 关键路径（认证/支付/数据）必须过 `security-reviewer`
 
-### 步骤二：规划审查（主 agent 自查）
+## 2. 工具速查（9）
 
-派发前主 agent 自查三件事：
-
-1. **并行性**：无数据依赖的子任务必须并行；写密集任务之间若操作同一批文件则串行
-2. **载体匹配**：按 §4 给每个子任务定 target_cli 与 model
-3. **输出要求**：每个分支都要求以 `FINAL_ANSWER: <摘要>` 结尾回传，只收摘要、不收全文
-
-### 步骤三：并行派发
-
-对每个子任务调用 `spawn_agent`（可并发调用多分支）：
-
-- `prompt` = 角色提示词 + 任务描述 + 输出要求（见 §6）
-- `context` = 父摘要（可选，注入 prompt 前）
-- `cwd` 必填；`parent_agent_id` 挂在当前 agent 下形成任务树
-- 读密集任务**并行**派发；写密集任务按依赖分批、同批并行
-
-### 步骤四：监控
-
-三种监控手段配合：
-
-1. `wait_agent` **短阻塞**（≤30s）：等单个分支出结果，适合顺序依赖处
-2. `list_agents` / `get_agent_activity`（since_seq 增量）**轮询**：看状态与活动流，适合并行多分支
-3. **网页可视**：`http://127.0.0.1:8765/` 知识导图实时查看任务树、活动与 token（只读，SSE 推送）
-
-### 步骤五：汇合
-
-- 每个分支以 `FINAL_ANSWER:` 行回传结论摘要
-- 分支全部 terminated 后，主 agent 综合各摘要：核对产出物、识别冲突、决定是否返工
-- 发现某分支结果不合格 → 该分支进入步骤六迭代，不阻塞其他分支
-
-### 步骤六：审查迭代
-
-产出物汇合后，用 `skill/agents/code-reviewer.md` / `security-reviewer.md` 提示词发起审查分支：
-
-- 审查发现问题 → 用 `followup_task` 对**原实现分支**发起修复迭代（复用同一 agent 节点与上下文）
-- 修复后再次审查，直至通过或达到迭代上限
-- 关键路径（认证/支付/用户数据）必须过 `security-reviewer`
-
----
-
-## 2. 工具速查（8）
-
-| 工具 | 一句话语义 |
+| 工具 | 用途 |
 |---|---|
-| `spawn_agent` | 创建任务 agent 并启动 CLI 子进程（槽位满排队，返回 status=queued） |
-| `send_message` | 投递消息到队列（运行中 delivered / 终止后 undelivered），**永不触发执行** |
-| `followup_task` | **唯一触发新 turn 的入口**；运行中返回 queued，当前 run 结束后自动串联 |
-| `wait_agent` | 短阻塞（≤30s）等 agent 进入终止态 |
-| `interrupt_agent` | 终止 agent 进程树（SIGTERM→SIGKILL），标记 cancelled |
-| `list_agents` | 列出 agent 树（状态/CLI/父 id/最近消息） |
-| `get_agent_activity` | agent 实时活动流（规范化事件，since_seq 增量拉取） |
-| `get_token_usage` | token 统计（**派发侧估算**，estimated=true） |
+| spawn_agent | 派发新 agent（立即返回 agent_id + status；槽位满返回 queued） |
+| send_message | 投递消息到队列，不触发执行 |
+| steer_agent | 中途插话：先终止当前 run，再在同一节点立即开始下一 turn；稳定 session id 的 CLI 自动恢复原会话 |
+| followup_task | 唯一触发新 turn 的入口：合并挂起消息重新 spawn（复用同一 agent 节点）；运行中返回 queued，当前 run 结束后自动串联；interrupt=true 先终止再重派；返回 merged_messages |
+| wait_agent | 短阻塞等 agent 终止（timeout 可自定义，默认 30s、上限 600s） |
+| interrupt_agent | 终止进程树（不可恢复，慎用） |
+| list_agents | 列 agent 树（状态/CLI/父 id/最近消息） |
+| get_agent_activity | 实时活动流（since_seq 增量） |
+| get_token_usage | token 统计（派发侧估算） |
 
-### spawn_agent
+**协议**：兼容 legacy MCP 2025-03-26 与 modern 2026-07-28。modern 客户端声明
+`io.modelcontextprotocol/tasks` 扩展时，spawn_agent 返回持久 task 句柄；tasks/get 轮询状态、
+tasks/update 把接受的 input response 作为 steer 内容、tasks/cancel 中断任务；daemon 错误
+原样映射为 JSON-RPC error，legacy 客户端继续走普通工具结果。
 
-创建任务 agent 并启动 CLI 子进程。
+## 3. 派发决策（去模型化）
 
-- **必填**：`target_cli`（claude | grok | opencode | omp）· `prompt` · `cwd`
-- **可选**：`permission_mode`（plan | acceptEdits | fullAccess，默认 plan）· `model` · `context`（父摘要，注入 prompt 前）· `resume`（续接 CLI session id）· `max_turns`（1-50）· `parent_agent_id`（挂任务树）· `task_name`（分层名如 /root/task1）· `session_id`
-- **⚠️ `timeout_seconds`（1-1800）当前未实现**：schema 接受该参数但派发链路不读它（无任务级终止定时器）；超时控制请用 `wait_agent` 的 timeout（≤30s 轮询上限）自行决策是否 interrupt
-- **返回**：`agent_id`（后续监控/消息/续接都靠它）+ `status`（running / queued）+ `pid`
+- **读密集**（探索/审查）→ 快模型：omp `smol`、grok luna/terra 类
+- **深推理**（规划/架构）→ 强模型：claude opus 类、grok-4.5 类
+- **写密集**（实现）→ 主载体自身或默认，`permission_mode` 升档
+- 模型绑定优先级：spawn_agent 显式 `model` → 主载体配置（codex / claude agent 配置 / omp `modelRoles`）
+- 各 CLI 特性：omp 事件流最全；AtomCode 仅作任务目标（task-only，不是安装载体）且是 one-shot（不支持稳定 session-id resume，`model` 必须传纯 API 名如 `deepseek-v4-flash`，`provider/模型` 形式与本地 catalog 键都会 403，且别显式传 provider）；grok 首次模型发现慢（>120s）；opencode 需指定 opencodex 模型
 
-### send_message
+## 4. 关键约定
 
-投递消息到 daemon 消息队列，**不触发任何执行**。
+- 分支只回传 `FINAL_ANSWER:` 摘要，不收全文
+- `cwd` 必填；任务间避免写同一批文件（文件冲突由主 agent 分配，不是 MCP 的事）
+- `timeout_seconds`（spawn_agent / followup_task，1–1800）：任务级超时，daemon 透传 worker，超时终止进程树并标记 `incomplete`（stop_reason=timeout，可 resume/重派）；`wait_agent` 的 timeout 只是轮询阻塞上限，两者不同
+- usage 为派发侧估算，对账以 CLI 侧为准
 
-- 参数：`agent_id` · `message`
-- 返回：`status` = delivered（运行中挂起）| undelivered（已终止）
-- 挂起的消息只会在下一次 `followup_task` 时被合并进新 prompt
+## 5. 错误恢复
 
-### followup_task
-
-唯一触发新 turn 的入口：合并该 agent 的挂起消息与 `prompt` 重新派发（复用同一 agent 节点）。
-
-- 参数：`agent_id` · `prompt` · `interrupt`（可选，先终止运行中的再立即重派）
-- 返回：`status` + `merged_messages`（合并了几条挂起消息）
-- **运行中调用 → queued**：当前 run 结束后自动串联执行，无需手动等
-- 迭代修复的标准手段：`followup_task(agent_id=原分支, prompt=修复指令)`
-
-### wait_agent
-
-短阻塞等待 agent 进入终止态（terminated / error / cancelled / incomplete）。
-
-- 参数：`agent_id` · `timeout`（1-30s，默认 30）
-- 返回：terminated → 最新输出摘要（截断）；error → 错误信息；超时 → 当前状态 + hint（提示轮询）
-
-### interrupt_agent
-
-终止 agent 进程树（SIGTERM→SIGKILL）并标记 cancelled（stop_reason=interrupted）。不可恢复，慎用。
-
-- 参数：`agent_id`
-
-### list_agents
-
-列出 agent 树：`id` / `parent_id` / `task_name` / `cli` / `model` / `status` / `stop_reason` / `updated_at` + `last_message`。
-
-- 参数：`session_id`（缺省当前宿主会话）
-
-### get_agent_activity
-
-agent 的实时活动流（规范化事件按 seq 排序）。
-
-- 参数：`agent_id` · `since_seq`（只取更大的 seq）
-- 返回：`events` + `next_seq`（下次增量拉取起点）
-
-### get_token_usage
-
-token 统计，**派发侧估算**（`estimated=true`）。
-
-- 参数：`agent_id`（单 agent）；缺省按 `session_id` 聚合会话或全局
-- 返回：四字段 tokens + `cost_usd`
-- 口径见 §3 最后一条
-
----
-
-## 3. 错误恢复路径
-
-| 症状 | 恢复动作 |
+| 症状 | 动作 |
 |---|---|
-| **超时**（wait 超时/任务超时） | 再 `wait_agent` 一次；仍不结束 → `interrupt_agent` 后 `spawn_agent` 新任务，`context` 带前次输出摘要续跑 |
-| **认证失败**（cli 报登录错误） | 检查对应 CLI 登录态：claude / grok 走 OAuth；opencode 检查 provider key；确认 opencodex 代理存活（127.0.0.1:10100） |
-| **binary 未找到**（status=error, cli_missing） | 检查 PATH：omp 在 `~/.bun/bin`，grok 在 `~/.grok/bin`；确认安装后重派 |
-| **权限拒绝**（agent 无法写文件/执行命令） | 改 `permission_mode` 重派：plan → acceptEdits → fullAccess（自低向高） |
-| **排队滞留**（status=queued 久不变） | 槽位被占；`list_agents` 查看并发，必要时 `interrupt_agent` 低优分支释放槽位 |
-| **daemon 未起/失联** | MCP 薄层会自动拉起；手动验证：`python agent_mcp/daemon_main.py`，网页 `http://127.0.0.1:8765/` |
+| 超时 | 任务级：spawn/followup 传 `timeout_seconds` 自动终止（incomplete/timeout，可 resume）；轮询超时 → 再 wait 一次；仍不结束 → interrupt + 重派（context 带前次摘要） |
+| 认证失败 | 查登录态：claude/grok OAuth；opencode provider key；opencodex 代理 (127.0.0.1:10100) |
+| AtomCode 403 model not enabled | `model` 传纯 API 名（`deepseek-v4-flash`），别带 provider 前缀/catalog 键，别显式 provider |
+| binary 未找到 | 查 PATH：omp `~/.bun/bin`，grok `~/.grok/bin`，AtomCode `~/.local/bin/atomcode` |
+| 权限拒绝 | `permission_mode` 升档：plan → acceptEdits → fullAccess |
+| 排队滞留 | 槽位被占；interrupt 低优分支释放 |
+| daemon 失联 | MCP 自动拉起；手动 `python agent_mcp/daemon_main.py`；网页 8765 |
 
-**usage 口径（重要）**：`get_token_usage` 是**派发侧估算**，非各 CLI 精确账本。claude / grok 的 result 事件含终值 usage，派发侧以其**覆盖终值**；opencode / omp 逐 turn 累加估算。与 CLI 自带 usage 对账时以 CLI 侧为准。
+## 6. 内置角色预设
 
----
-
-## 4. 载体与模型匹配指南（去模型化）
-
-**本 skill 不指定具体 CLI 与模型**，只给匹配原则；具体绑定由主 agent 按任务类型现场决策，或留给主载体配置：
-
-- **探索 / 审查类（读密集）**：派**快模型**——omp 的 `smol` 角色，grok 的 `ocx-*-luna/terra` 类；这类任务吞吐优先、推理深度次要
-- **深推理类（规划 / 架构 / 复杂实现）**：派**主 CLI 强模型**——claude 的 opus 类、grok-4.5 类；一次想清楚胜过多轮返工
-- **实现类（写密集）**：主 CLI 或你所在载体自身，`permission_mode` 按写权限需求升档
-- **模型绑定位置**（按优先级）：① spawn_agent 显式 `model` 参数 → ② 主载体配置——codex `[agents] default_subagent_model`、claude 的 agent 配置、omp 的 `modelRoles` 与 `PI_*` env
-
-**各 CLI 实测特性**（派发时利用）：
-
-- omp 事件流最完整（原生增量/成本），`--smol/--slow/--plan` 四模型角色
-- grok 首次模型发现慢（>120s），`wait_agent` 轮询时要有耐心（多轮 wait 直到 terminated）
-- claude 与 grok 的 result/usage 结构同构；opencode 需指定 opencodex 模型（默认 provider key 401）
-
----
-
-## 5. 调用示例
-
-### 5.1 spawn_agent：派 planner 到 grok
-
-```json
-{
-  "target_cli": "grok",
-  "task_name": "/root/plan-billing",
-  "prompt": "（planner 角色提示词）\n\n任务：为订阅计费功能制定实现计划。\n输出要求：以 FINAL_ANSWER: 开头给出 3-5 行计划摘要，含阶段划分与关键文件。",
-  "cwd": "/path/to/project",
-  "permission_mode": "plan",
-  "max_turns": 20,
-  "parent_agent_id": 1
-  // timeout_seconds 未实现（见 §工具速查 ⚠️ 注），示例省略
-}
-```
-
-返回 `{"agent_id": 7, "status": "running", "pid": 12345}`。
-
-### 5.2 followup_task：审查后迭代修复
-
-```json
-{
-  "agent_id": 7,
-  "prompt": "code-reviewer 发现如下问题，请修复：1) XSS 风险（第 42 行 innerHTML）；2) 缺少错误处理。修复后以 FINAL_ANSWER: 列出改动文件。"
-}
-```
-
-运行中调用会返回 `{"status": "queued"}`，当前 run 结束后自动串联执行。
-
-### 5.3 wait 轮询循环（伪代码）
-
-```text
-loop:
-    r = wait_agent(agent_id=7, timeout=30)
-    if r.status in (terminated, error, cancelled, incomplete):
-        break
-    # 超时：看活动流决定继续等还是干预
-    act = get_agent_activity(agent_id=7, since_seq=last)
-    last = act.next_seq
-    if 长时间无进展 and 任务可重建:
-        interrupt_agent(agent_id=7); spawn_agent(...); break
-# 汇合
-if r.status == terminated: 读 r.summary 提取 FINAL_ANSWER
-else: 查 list_agents 的 stop_reason 定位失败原因
-```
-
----
-
-## 6. 内置 agent 预设使用说明
-
-`skill/agents/*.md` 是 10 个内置角色提示词模板（planner / architect / code-reviewer / security-reviewer / tdd-guide / build-error-resolver / e2e-runner / refactor-cleaner / doc-updater / code-explorer），**只含提示词、不指定 CLI 与模型**。
-
-**使用方法**：spawn 时组装 prompt：
-
-```text
-prompt = <角色提示词（agents/<name>.md 全文）>
-       + "\n\n任务：" + <任务描述>
-       + "\n输出要求：" + <FINAL_ANSWER 摘要要求等>
-```
-
-- `context` = 父摘要（任务背景）
-- `cwd` = 任务目录
-- `target_cli` / `model` / `permission_mode` = 主 agent 按 §4 决策
-- 每个文件 frontmatter 的 `description` 用于驱动主 agent 自动委派（判断什么任务该用哪个角色）
-
-**典型编排**：
-
-| 场景 | 分支组合 |
-|---|---|
-| 新功能 | planner（拆解）→ 并行实现分支 → code-reviewer（审查）→ tdd-guide（补测试） |
-| 大型重构 | code-explorer（摸清现状）∥ architect（定架构）→ 分模块实现 → refactor-cleaner（清理） |
-| 构建失败 | build-error-resolver（最小修复）→ 修复分支 followup 迭代 |
-| 发版前 | e2e-runner（关键流程）∥ security-reviewer（安全）→ 问题 followup 修复 |
-
----
-
-## 7. 分发与安装
-
-本 skill 三主载体分发路径（安装脚本自动处理，也可手动拷贝）：
-
-| 主载体 | 路径 |
-|---|---|
-| codex | `.agents/skills/`（项目级或用户级） |
-| claude | `~/.claude/skills/` |
-| omp | `~/.omp/agent/skills/` |
-
-内容通用、无需按载体改写；加载后主 agent 在任务拆解阶段即可按六步工作流自动编排。
+`skill/agents/*.md` 共 10 个角色提示词（planner / architect / code-reviewer / security-reviewer / tdd-guide / build-error-resolver / e2e-runner / refactor-cleaner / doc-updater / code-explorer），**只含提示词、不指定 CLI 与模型**。spawn 时把对应文件内容拼进 `prompt`，`target_cli` / `model` / `permission_mode` 由主 agent 按 §3 决策。

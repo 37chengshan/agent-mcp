@@ -22,7 +22,7 @@
 |---|---|---|
 | codex | ✅ | `python3 install.py --install --dry-run <abs>/mcp_server.py`：**实测检测到 `~/.codex/config.toml` 中旧 `[mcp_servers.grok-cli]` 注册并提示废弃**（`--remove-legacy` 可自动移除）；将追加 `[mcp_servers.agent-mcp]`（command=python3 + 脚本路径）|
 | claude | ✅ | dry-run 输出 `~/.claude.json` 的 `mcpServers.agent-mcp` 合并 JSON 片段（command/args）；`--claude-config` 可指定路径 |
-| omp | ⚠️ | 注册格式未实测（设计文档已标注"实现时按 omp 实际格式实测"），dry-run 输出**手动操作指引**（新增 server agent-mcp + 命令 + 超时 30s + 重启会话后 tools/list 确认 8 工具）——诚实标注：自动写入待 omp 配置格式实测 |
+| omp | ⚠️ | 注册格式未实测，dry-run 输出手动操作指引（新增 server agent-mcp + 命令 + 超时 30s + 重启会话后 tools/list 确认 9 工具）；skill 自动分发到 `~/.omp/agent/skills/agent-mcp` |
 | host 识别 | ✅ | `test_mcp_stdio_end_to_end`（真实 stdio）：initialize `clientInfo.name=codex` → 会话隔离 `codex-*` 生效；`host_from_client_info` 单测覆盖 codex/claude/omp/unknown 四分支 |
 
 **结论**：codex/claude 注册片段实测生效（dry-run）；omp 有待格式实测；host 识别端到端验证。
@@ -93,7 +93,7 @@
 | 5 | Windows 平台 | 三处跨平台分支（进程树/拉起/控制台）未在真实 Windows 验证 | 双平台 CI 冒烟 |
 | 6 | 网页浏览器渲染 | 本次仅静态结构 + SSE 直播流断言；impl-t11 已交付渲染验证 | 人工复核 `http://127.0.0.1:8765/` |
 | 7 | skill 跨宿主自动编排 | 六步工作流装载依赖宿主 skill 机制 | 各主载体新会话实测 |
-| 8 | 任务级 timeout_seconds 未实现 | schema 与 skill 文档声明 1-1800，但 Dispatcher→spawn_cli_worker 全链路未读该参数；wait_agent 30s 上限是轮询超时非任务超时 | 实现终止定时器后启用；当前传值被忽略 |
+| 8 | 任务级 timeout_seconds 未实现 | schema 与 skill 文档声明 1-1800，但 Dispatcher→spawn_cli_worker 全链路未读该参数；wait_agent 轮询超时上限已可自定义（默认 30s，`AGENT_MCP_MAX_WAIT` 环境变量可调至 600s），但那是轮询超时非任务超时 | 实现终止定时器后启用；当前传值被忽略 |
 | 9 | 运行中无实时事件流 | 事件为 worker 完成后一次性 ingest（daemon_main._ingest_output）；运行中 agent 在网页上无 message/tool_use 实时显示，仅状态迁移直播（spawned→running→terminated） | 后续做 worker 侧流式 tail + 增量 ingest |
 | 10 | daemon 崩溃孤儿回收未实现 | 重启无孤儿扫描：崩溃时运行中 worker 继续跑，重启后 agent 卡 running、out.log 无人 ingest | 启动时扫 state_dir 非 finished worker 标记 daemon_restart |
 | 11 | SSE last_seq 回放未实现 | daemon_http._stream_events 忽略 last_seq 查询参数与 Last-Event-ID 头；断线期间事件丢失（前端 dedupe 有、回放无） | 实现按 seq 回放后前端无需改动 |

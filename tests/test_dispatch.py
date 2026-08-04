@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 import time
 import pytest
 import psutil
@@ -77,3 +78,63 @@ def test_spawn_cli_worker_binary_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_adapters._CLAUDE, "binary", lambda: None)
     with pytest.raises(ValueError, match="was not found"):
         spawn_cli_worker("claude", prompt="hi", cwd="/tmp", state_dir=tmp_path)
+
+
+def test_worker_command_includes_timeout_seconds(tmp_path):
+    cmd = build_worker_command(state_path=tmp_path / "s.json",
+                               out_path=tmp_path / "o.log", err_path=tmp_path / "e.log",
+                               cwd=str(tmp_path), cli_command=["claude", "-p", "hi"],
+                               timeout_seconds=60)
+    assert cmd[-2] == "60"  # timeout 在 command json 之前（json 保持末位）
+    assert json.loads(cmd[-1]) == ["claude", "-p", "hi"]
+
+
+def test_dispatch_worker_timeout_terminates_tree(tmp_path):
+    """worker 超时：终止 CLI 进程树并写 timed_out 标记。"""
+    import dispatch_worker
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"status": "starting"}))
+    pidfile = tmp_path / "child.pid"
+    command = [sys.executable, "-c",
+               f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(5)"]
+    rc = dispatch_worker.dispatch_worker(state, tmp_path / "o.log", tmp_path / "e.log",
+                                         command, tmp_path, timeout=0.5)
+    st = json.loads(state.read_text())
+    assert st["timed_out"] is True
+    child_pid = int(pidfile.read_text())
+    deadline = time.time() + 5
+    while is_pid_running(child_pid) and time.time() < deadline:
+        time.sleep(0.05)
+    assert not is_pid_running(child_pid)  # 进程树已被终止
+
+
+def test_dispatch_worker_timeout_kills_parent_and_grandchild(tmp_path):
+    """回归：超时后不仅直接子进程退出，其孙进程也必须被终止（防泄漏）。"""
+    import dispatch_worker
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"status": "starting"}))
+    direct_pidfile = tmp_path / "direct.pid"
+    grand_pidfile = tmp_path / "grand.pid"
+    # 直接子进程再 spawn 一个孙进程（sleep 60），两者都活过 timeout
+    child_code = (
+        "import os, subprocess, sys, time\n"
+        f"open({str(direct_pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "grand = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(grand_pidfile)!r}, 'w').write(str(grand.pid))\n"
+        "time.sleep(30)\n"
+    )
+    command = [sys.executable, "-c", child_code]
+    rc = dispatch_worker.dispatch_worker(state, tmp_path / "o.log", tmp_path / "e.log",
+                                         command, tmp_path, timeout=1.0)
+    st = json.loads(state.read_text())
+    assert st["timed_out"] is True
+    assert rc == -9
+    assert st["process_status"] == -9
+    direct_pid = int(direct_pidfile.read_text())
+    grand_pid = int(grand_pidfile.read_text())
+    assert direct_pid != grand_pid
+    deadline = time.time() + 5
+    while (is_pid_running(direct_pid) or is_pid_running(grand_pid)) and time.time() < deadline:
+        time.sleep(0.05)
+    assert not is_pid_running(direct_pid)   # 直接子进程已退出
+    assert not is_pid_running(grand_pid)    # 孙进程也被终止，未泄漏

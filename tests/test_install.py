@@ -1,268 +1,364 @@
-"""T13 安装/迁移脚本测试：三主载体注册片段 + 写配置（备份）+ 回滚 + 旧 grok-cli 迁移。
-
-纯函数为主；文件写入测试用 tmp_path 注入路径，不触碰真实家目录。
-"""
+"""Isolated contracts for Agent MCP host installation and rollback."""
 import json
 from pathlib import Path
 
 import pytest
 
+import install
 from install import (
+    BACKUP_SUFFIX,
+    HOOK_MARKER,
     LEGACY_TOOL_MAP,
+    add_claude_session_start_hook,
+    add_codex_session_start_hook,
     apply_claude_install,
     apply_codex_install,
     backup_path,
     claude_registration_json,
+    claude_session_start_entry,
     codex_registration_toml,
+    codex_session_start_entry,
     find_legacy_section,
     has_section,
     install_host,
+    install_skill,
     legacy_tool_map_text,
+    main,
     omp_registration,
+    posix_session_start_command,
     remove_legacy_section,
+    rollback,
+    windows_session_start_command,
 )
 
 SCRIPT = "/tmp/mcp_server.py"
+STARTER = "/tmp/agent mcp/start_agent_mcp.py"
 
 
-# --- 三主载体注册片段（纯函数） ---
+def _skill_source(tmp_path):
+    source = tmp_path / "source-skill"
+    (source / "agents").mkdir(parents=True)
+    (source / "SKILL.md").write_text("agent-mcp")
+    (source / "agents" / "planner.md").write_text("planner")
+    return source
 
-def test_codex_toml_snippet():
-    toml = codex_registration_toml(SCRIPT)
-    assert "[mcp_servers.agent-mcp]" in toml
-    assert "mcp_server.py" in toml
-
-
-def test_codex_toml_has_command_and_timeout():
-    toml = codex_registration_toml(SCRIPT)
-    assert 'command = "python3"' in toml
-    assert "startup_timeout_sec = 30" in toml
-    assert "mcp_server.py" in toml.split("args =")[1]
-
-
-def test_claude_json_snippet():
-    obj = claude_registration_json(SCRIPT)
-    entry = obj["mcpServers"]["agent-mcp"]
-    assert entry["command"].endswith("python3")
-    assert "mcp_server.py" in entry["args"][0]
-
-
-def test_omp_registration_returns_notes():
-    notes = omp_registration(SCRIPT)
-    assert isinstance(notes, str) and len(notes) > 20
-
-
-# --- 备份命名 ---
-
-def test_backup_path_naming():
-    p = backup_path(Path("/tmp/config.toml"))
-    assert p.name.startswith("config.toml.bak-agentmcp-")
-    assert p.parent == Path("/tmp")
-
-
-def test_backup_path_uses_given_ts():
-    p = backup_path(Path("/tmp/config.toml"), ts="20260803T010203")
-    assert p.name == "config.toml.bak-agentmcp-20260803T010203"
-
-
-# --- codex config.toml 编辑（纯函数） ---
-
-def test_has_section_detects_existing():
-    text = "[model_provider]\nname = 'x'\n\n[mcp_servers.agent-mcp]\ncommand = 'python3'\n"
-    assert has_section(text, "mcp_servers.agent-mcp")
-    assert not has_section(text, "mcp_servers.grok-cli")
-
-
-def test_apply_codex_appends_when_missing():
-    snippet = codex_registration_toml(SCRIPT)
-    new_text, action = apply_codex_install("# existing config\n", snippet)
-    assert action == "append"
-    assert "[mcp_servers.agent-mcp]" in new_text
-    assert "# existing config" in new_text
-
-
-def test_apply_codex_skips_when_present():
-    snippet = codex_registration_toml(SCRIPT)
-    old = "[mcp_servers.agent-mcp]\ncommand = 'python3'\n"
-    new_text, action = apply_codex_install(old, snippet)
-    assert action == "skip"
-    assert new_text == old  # 原内容原样返回，不重复追加
-
-
-def test_apply_codex_preserves_no_trailing_newline_file():
-    snippet = codex_registration_toml(SCRIPT)
-    new_text, action = apply_codex_install("x = 1", snippet)
-    assert action == "append"
-    # 无尾随换行的文件先补换行，再追加块
-    assert new_text.endswith("startup_timeout_sec = 30\n")
-    assert "[mcp_servers.agent-mcp]" in new_text.split("x = 1")[1]
-
-
-# --- 旧 grok-cli 检测与移除 ---
-
-def test_find_legacy_section():
-    assert find_legacy_section("[mcp_servers.grok-cli]\ncommand = 'x'\n")
-    assert not find_legacy_section("[mcp_servers.agent-mcp]\n")
-    assert not find_legacy_section("")
-
-
-def test_remove_legacy_section():
-    text = ("# head\n"
-            "[mcp_servers.grok-cli]\n"
-            'command = "python3"\n'
-            'args = ["/tmp/grok_cli_mcp.py"]\n'
-            "\n"
-            "[other]\n"
-            "x = 1\n")
-    out = remove_legacy_section(text)
-    assert "[mcp_servers.grok-cli]" not in out
-    assert "# head" in out
-    assert "[other]" in out
-
-
-# --- claude JSON 合并（纯函数） ---
-
-def test_apply_claude_merges_other_servers():
-    cfg = {"mcpServers": {"other": {"command": "x", "args": ["y"]}}}
-    out = apply_claude_install(cfg, SCRIPT)
-    assert out["mcpServers"]["other"] == {"command": "x", "args": ["y"]}
-    assert out["mcpServers"]["agent-mcp"]["args"] == [SCRIPT]
-
-
-def test_apply_claude_keeps_unrelated_keys():
-    cfg = {"permissions": {"allow": ["Bash"]}, "mcpServers": {}}
-    out = apply_claude_install(cfg, SCRIPT)
-    assert out["permissions"] == {"allow": ["Bash"]}
-
-
-# --- install_host：dry-run 不写文件，实际安装写备份 ---
 
 def _paths(tmp_path):
     return {
-        "codex": tmp_path / "config.toml",
-        "claude": tmp_path / ".claude.json",
+        "codex_mcp": tmp_path / "codex" / "config.toml",
+        "codex_hooks": tmp_path / "codex" / "hooks.json",
+        "claude_mcp": tmp_path / "claude.json",
+        "claude_hooks": tmp_path / "claude" / "settings.json",
+        "codex_skill": tmp_path / "agents" / "skills" / "agent-mcp",
+        "claude_skill": tmp_path / "claude" / "skills" / "agent-mcp",
+        "omp_skill": tmp_path / "omp" / "skills" / "agent-mcp",
     }
 
 
-def test_install_dry_run_writes_nothing(tmp_path):
-    codex_cfg = tmp_path / "config.toml"
-    codex_cfg.write_text("# pre\n")
-    script = tmp_path / "mcp_server.py"
-    script.write_text("x")
-
-    logs = install_host("codex", str(script), _paths(tmp_path), dry_run=True)
-
-    assert any("[dry-run]" in line for line in logs)
-    assert codex_cfg.read_text() == "# pre\n"  # 未修改
-    assert not list(tmp_path.glob("*.bak-agentmcp-*"))  # 未产生备份
+def _owned(entries):
+    return [entry for entry in entries if HOOK_MARKER in json.dumps(entry)]
 
 
-def test_install_codex_writes_and_backs_up(tmp_path):
-    codex_cfg = tmp_path / "config.toml"
-    codex_cfg.write_text("# pre\n")
-    script = tmp_path / "mcp_server.py"
-    script.write_text("x")
+def test_registration_snippets():
+    toml = codex_registration_toml(SCRIPT)
+    assert "[mcp_servers.agent-mcp]" in toml
+    assert 'command = "python3"' in toml
+    assert "startup_timeout_sec = 30" in toml
+    entry = claude_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
+    assert entry["command"].endswith("python3")
+    assert entry["args"] == [SCRIPT]
+    assert "omp" in omp_registration(SCRIPT).lower()
 
-    logs = install_host("codex", str(script), _paths(tmp_path), dry_run=False)
 
-    text = codex_cfg.read_text()
-    assert "[mcp_servers.agent-mcp]" in text
-    assert "# pre" in text
-    backups = list(tmp_path.glob("*.bak-agentmcp-*"))
-    assert len(backups) == 1
-    assert backups[0].read_text() == "# pre\n"  # 备份是原内容
+def test_backup_and_toml_helpers():
+    path = backup_path(Path("/tmp/config.toml"), ts="20260803T010203")
+    assert path.name == "config.toml.bak-agentmcp-20260803T010203"
+    text = "[model_provider]\nname='x'\n\n[mcp_servers.agent-mcp]\ncommand='python3'\n"
+    assert has_section(text, "mcp_servers.agent-mcp")
+    assert not has_section(text, "mcp_servers.grok-cli")
+    appended, action = apply_codex_install("x = 1", codex_registration_toml(SCRIPT))
+    assert action == "append"
+    assert appended.startswith("x = 1\n")
+    unchanged, action = apply_codex_install(text, codex_registration_toml(SCRIPT))
+    assert action == "skip" and unchanged == text
+
+def test_backup_path_avoids_same_second_collisions(tmp_path):
+    target = tmp_path / "config.json"
+    first = backup_path(target, ts="20260803T010203")
+    first.write_text("first")
+    second = backup_path(target, ts="20260803T010203")
+    assert second != first
+    assert second.name.startswith("config.json.bak-agentmcp-20260803T010203")
+
+
+def test_legacy_detection_removal_and_map():
+    text = "# head\n[mcp_servers.grok-cli]\ncommand='x'\n\n[other]\nx=1\n"
+    assert find_legacy_section(text)
+    cleaned = remove_legacy_section(text)
+    assert "grok-cli" not in cleaned and "[other]" in cleaned
+    rendered = legacy_tool_map_text()
+    assert len(LEGACY_TOOL_MAP) == 9
+    for entry in LEGACY_TOOL_MAP:
+        assert entry["old"] in rendered and entry["new"] in rendered
+
+
+def test_apply_claude_install_is_pure_and_preserves_other_servers():
+    config = {"permissions": {"allow": ["Bash"]}, "mcpServers": {"other": {"command": "x"}}}
+    original = json.loads(json.dumps(config))
+    updated = apply_claude_install(config, SCRIPT)
+    assert config == original
+    assert updated["permissions"] == config["permissions"]
+    assert updated["mcpServers"]["other"] == {"command": "x"}
+    assert updated["mcpServers"]["agent-mcp"]["args"] == [SCRIPT]
+
+
+def test_session_commands_quote_paths_and_keep_owned_marker():
+    posix = posix_session_start_command(STARTER, python_executable="/tmp/Python 3")
+    assert posix == (
+        "nohup '/tmp/Python 3' '/tmp/agent mcp/start_agent_mcp.py' --open "
+        ">/dev/null 2>&1 & # agent-mcp-session-start"
+    )
+    windows = windows_session_start_command(STARTER, python_executable=r"C:\Python 3\python.exe")
+    assert windows.startswith('start "" /B ')
+    assert '"C:\\Python 3\\python.exe"' in windows
+    assert '"/tmp/agent mcp/start_agent_mcp.py"' in windows
+    assert windows.endswith(">NUL 2>&1 & REM agent-mcp-session-start")
+
+
+def test_host_specific_session_entries():
+    claude = claude_session_start_entry(STARTER, platform="posix", python_executable="python")
+    claude_action = claude["hooks"][0]
+    assert claude["matcher"] == "startup|resume"
+    assert claude_action["timeout"] == 10
+    assert "command_windows" not in claude_action
+    codex = codex_session_start_entry(STARTER, python_executable="python")
+    codex_action = codex["hooks"][0]
+    assert codex_action["timeout"] == 10
+    assert HOOK_MARKER in codex_action["command"]
+    assert "REM agent-mcp-session-start" in codex_action["command_windows"]
+
+
+@pytest.mark.parametrize("transform", [add_claude_session_start_hook, add_codex_session_start_hook])
+def test_hook_transform_is_pure_ordered_idempotent_and_deduplicating(transform):
+    unrelated_a = {"matcher": "startup", "hooks": [{"type": "command", "command": "first"}]}
+    unrelated_b = {"matcher": "resume", "hooks": [{"type": "command", "command": "last"}]}
+    old_owned = {"matcher": "old", "hooks": [{"type": "command", "command": f"old {HOOK_MARKER}"}]}
+    duplicate = {"matcher": "dup", "hooks": [{"type": "command", "command": f"dup {HOOK_MARKER}"}]}
+    config = {"hooks": {"SessionStart": [unrelated_a, old_owned, unrelated_b, duplicate]}, "keep": 1}
+    original = json.loads(json.dumps(config))
+    updated = transform(config, STARTER)
+    entries = updated["hooks"]["SessionStart"]
+    assert config == original
+    assert updated["keep"] == 1
+    assert entries[0] == unrelated_a and entries[2] == unrelated_b
+    assert len(_owned(entries)) == 1
+    assert "start_agent_mcp.py" in json.dumps(entries[1])
+    assert transform(updated, STARTER) == updated
+    moved = transform(updated, "/new/repo/start_agent_mcp.py")
+    assert len(_owned(moved["hooks"]["SessionStart"])) == 1
+    assert "/new/repo" in json.dumps(_owned(moved["hooks"]["SessionStart"])[0])
+    assert moved["hooks"]["SessionStart"][0] == unrelated_a
+    assert moved["hooks"]["SessionStart"][2] == unrelated_b
+
+def test_windows_claude_owned_hook_is_replaced_not_duplicated(monkeypatch):
+    monkeypatch.setattr(install.os, "name", "nt")
+    once = add_claude_session_start_hook({"hooks": {}}, STARTER)
+    twice = add_claude_session_start_hook(once, "/new/repo/start_agent_mcp.py")
+    entries = twice["hooks"]["SessionStart"]
+    assert len(entries) == 1
+    assert "/new/repo" in json.dumps(entries[0])
+
+
+def test_install_skill_replaces_atomically_and_is_idempotent(tmp_path):
+    source = _skill_source(tmp_path)
+    destination = tmp_path / "skills" / "agent-mcp"
+    sibling = destination.parent / "other-skill"
+    sibling.mkdir(parents=True)
+    (sibling / "SKILL.md").write_text("keep")
+    destination.mkdir()
+    (destination / "SKILL.md").write_text("old")
+    (destination / "stale.txt").write_text("remove")
+
+    logs = install_skill(source, destination)
+    assert (destination / "SKILL.md").read_text() == "agent-mcp"
+    assert (destination / "agents" / "planner.md").read_text() == "planner"
+    assert not (destination / "stale.txt").exists()
+    assert (sibling / "SKILL.md").read_text() == "keep"
+    backups = list(destination.parent.glob(destination.name + BACKUP_SUFFIX + "*"))
+    assert len(backups) == 1 and (backups[0] / "SKILL.md").read_text() == "old"
     assert any("备份" in line for line in logs)
 
-
-def test_install_claude_writes_and_backs_up(tmp_path):
-    claude_cfg = tmp_path / ".claude.json"
-    claude_cfg.write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}))
-    script = tmp_path / "mcp_server.py"
-    script.write_text("x")
-
-    logs = install_host("claude", str(script), _paths(tmp_path), dry_run=False)
-
-    data = json.loads(claude_cfg.read_text())
-    assert "agent-mcp" in data["mcpServers"]
-    assert data["mcpServers"]["other"]["command"] == "x"  # 已有 server 保留
-    assert list(tmp_path.glob(".claude.json.bak-agentmcp-*"))
-    assert any("备份" in line for line in logs)
+    second = install_skill(source, destination)
+    assert any("跳过" in line for line in second)
+    assert len(list(destination.parent.glob(destination.name + BACKUP_SUFFIX + "*"))) == 1
 
 
-def test_install_omp_only_returns_guidance(tmp_path):
-    script = tmp_path / "mcp_server.py"
-    script.write_text("x")
-    logs = install_host("omp", str(script), _paths(tmp_path))
-    assert len(logs) == 1
-    assert "omp" in logs[0].lower()
-    assert "mcp_server.py" in logs[0]
+def test_install_skill_dry_run_is_non_mutating(tmp_path):
+    source = _skill_source(tmp_path)
+    destination = tmp_path / "skills" / "agent-mcp"
+    logs = install_skill(source, destination, dry_run=True)
+    assert any("dry-run" in line for line in logs)
+    assert not destination.parent.exists()
 
 
-def test_install_skip_when_already_registered(tmp_path):
-    codex_cfg = tmp_path / "config.toml"
-    codex_cfg.write_text("[mcp_servers.agent-mcp]\ncommand = 'python3'\n")
-    script = tmp_path / "mcp_server.py"
-    script.write_text("x")
-
-    logs = install_host("codex", str(script), _paths(tmp_path), dry_run=False)
-
-    assert any("跳过" in line for line in logs)
-    assert not list(tmp_path.glob("*.bak-agentmcp-*"))  # 无变更不备份
-
-
-def test_install_detects_legacy_and_removes_with_flag(tmp_path):
-    codex_cfg = tmp_path / "config.toml"
-    codex_cfg.write_text("[mcp_servers.grok-cli]\ncommand = 'python3'\n")
-    script = tmp_path / "mcp_server.py"
-    script.write_text("x")
+@pytest.mark.parametrize(
+    ("host", "mcp_key", "hook_key", "skill_key"),
+    [
+        ("codex", "codex_mcp", "codex_hooks", "codex_skill"),
+        ("claude", "claude_mcp", "claude_hooks", "claude_skill"),
+    ],
+)
+def test_complete_host_install_and_second_run_noop(tmp_path, host, mcp_key, hook_key, skill_key):
     paths = _paths(tmp_path)
+    paths[mcp_key].parent.mkdir(parents=True, exist_ok=True)
+    paths[mcp_key].write_text("# existing\n" if host == "codex" else json.dumps({"mcpServers": {"other": {"command": "x"}}}))
+    paths[hook_key].parent.mkdir(parents=True, exist_ok=True)
+    paths[hook_key].write_text(json.dumps({"hooks": {"SessionStart": [{"matcher": "keep", "hooks": []}]}}))
+    paths[skill_key].mkdir(parents=True)
+    (paths[skill_key] / "SKILL.md").write_text("old")
+    source = _skill_source(tmp_path)
 
-    logs = install_host("codex", str(script), paths, dry_run=False)
-    assert any("grok-cli" in line for line in logs)  # 默认提示废弃
-    assert "[mcp_servers.grok-cli]" in codex_cfg.read_text()  # 未删除
+    logs = install_host(host, SCRIPT, STARTER, source, paths)
+    hook_config = json.loads(paths[hook_key].read_text())
+    assert hook_config["hooks"]["SessionStart"][0]["matcher"] == "keep"
+    assert len(_owned(hook_config["hooks"]["SessionStart"])) == 1
+    assert (paths[skill_key] / "agents" / "planner.md").read_text() == "planner"
+    for target in (paths[mcp_key], paths[hook_key], paths[skill_key]):
+        assert list(target.parent.glob(target.name + BACKUP_SUFFIX + "*"))
+    backup_count = len(list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*")))
+    assert any("已写入" in line or "已安装" in line for line in logs)
 
-    logs2 = install_host("codex", str(script), paths, dry_run=False, remove_legacy=True)
-    text = codex_cfg.read_text()
-    assert "[mcp_servers.grok-cli]" not in text
-    assert "[mcp_servers.agent-mcp]" in text
-    assert any("已移除" in line for line in logs2)
+    second = install_host(host, SCRIPT, STARTER, source, paths)
+    assert all("已写入" not in line and "已安装" not in line for line in second)
+    assert len(list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*"))) == backup_count
+
+
+def test_omp_installs_skill_without_hook_or_config(tmp_path):
+    paths = _paths(tmp_path)
+    logs = install_host("omp", SCRIPT, STARTER, _skill_source(tmp_path), paths)
+    assert (paths["omp_skill"] / "SKILL.md").read_text() == "agent-mcp"
+    assert any("SessionStart" in line and "不支持" in line for line in logs)
+    assert any("mcp_server.py" in line for line in logs)
+    assert not (tmp_path / "omp" / "config.yml").exists()
+    assert not (tmp_path / "omp" / "mcp.json").exists()
 
 
 def test_install_unknown_host_raises(tmp_path):
-    script = tmp_path / "mcp_server.py"
-    script.write_text("x")
     with pytest.raises(ValueError):
-        install_host("windows", str(script), _paths(tmp_path))
+        install_host("windows", SCRIPT, STARTER, _skill_source(tmp_path), _paths(tmp_path))
 
 
-def test_install_claude_corrupt_json_aborts_without_overwrite(tmp_path):
-    claude_cfg = tmp_path / ".claude.json"
-    claude_cfg.write_text("{not json")
+def test_dry_run_all_hosts_changes_nothing(tmp_path, monkeypatch, capsys):
+    paths = _paths(tmp_path)
+    paths["codex_mcp"].parent.mkdir(parents=True)
+    paths["codex_mcp"].write_text("# codex\n")
+    paths["codex_hooks"].write_text("{\"hooks\": {}}")
+    paths["claude_mcp"].write_text("{\"mcpServers\": {}}")
+    paths["claude_hooks"].parent.mkdir(parents=True)
+    paths["claude_hooks"].write_text("{\"hooks\": {}}")
+    before = {key: path.read_bytes() for key, path in paths.items() if path.is_file()}
     script = tmp_path / "mcp_server.py"
     script.write_text("x")
+    starter = tmp_path / "start_agent_mcp.py"
+    starter.write_text("x")
+    skill = _skill_source(tmp_path)
+    monkeypatch.setattr(install, "default_paths", lambda: paths)
+    monkeypatch.setattr(install, "default_starter_path", lambda: starter)
+    monkeypatch.setattr(install, "default_skill_path", lambda: skill)
 
-    logs = install_host("claude", str(script), _paths(tmp_path), dry_run=False)
-
-    assert any("错误" in line for line in logs)
-    assert claude_cfg.read_text() == "{not json"  # 原样保留
-    assert not list(tmp_path.glob(".claude.json.bak-agentmcp-*"))
-
-
-# --- 工具名映射表（旧 9 → 新 8） ---
-
-def test_legacy_tool_map_text_covers_all_nine():
-    text = legacy_tool_map_text()
-    assert "list_grok_models" in text
-    assert "cancel_grok_dispatch" in text
-    assert "spawn_agent" in text
-    assert "interrupt_agent" in text
-    assert "list_agents" in text
-    for entry in LEGACY_TOOL_MAP:
-        assert entry["old"] in text
-        assert entry["new"] in text
+    assert main(["--install", "--host", "all", "--dry-run", str(script)]) == 0
+    output = capsys.readouterr().out
+    assert "codex" in output and "claude" in output and "omp" in output
+    assert "AtomCode" not in output and "atomcode" not in output
+    for key, content in before.items():
+        assert paths[key].read_bytes() == content
+    assert not list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*"))
+    assert not paths["codex_skill"].exists()
+    assert not paths["claude_skill"].exists()
+    assert not paths["omp_skill"].exists()
 
 
-def test_legacy_tool_map_has_nine_entries():
-    assert len(LEGACY_TOOL_MAP) == 9
-    olds = [e["old"] for e in LEGACY_TOOL_MAP]
-    assert len(set(olds)) == 9  # 无重复
+def test_main_all_installs_every_supported_surface(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    script = tmp_path / "mcp_server.py"
+    script.write_text("x")
+    starter = tmp_path / "start_agent_mcp.py"
+    starter.write_text("x")
+    skill = _skill_source(tmp_path)
+    monkeypatch.setattr(install, "default_paths", lambda: paths)
+    monkeypatch.setattr(install, "default_starter_path", lambda: starter)
+    monkeypatch.setattr(install, "default_skill_path", lambda: skill)
+
+    assert main(["--install", "--host", "all", str(script)]) == 0
+    assert "agent-mcp" in paths["codex_mcp"].read_text()
+    assert "agent-mcp" in json.loads(paths["claude_mcp"].read_text())["mcpServers"]
+    assert len(_owned(json.loads(paths["codex_hooks"].read_text())["hooks"]["SessionStart"])) == 1
+    assert len(_owned(json.loads(paths["claude_hooks"].read_text())["hooks"]["SessionStart"])) == 1
+    for key in ("codex_skill", "claude_skill", "omp_skill"):
+        assert (paths[key] / "SKILL.md").read_text() == "agent-mcp"
+
+
+def test_corrupt_selected_hook_preflight_prevents_partial_install(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    paths["codex_mcp"].parent.mkdir(parents=True)
+    paths["codex_mcp"].write_text("# unchanged\n")
+    paths["codex_hooks"].write_text("{bad")
+    paths["claude_mcp"].write_text("{\"mcpServers\": {}}")
+    paths["claude_hooks"].parent.mkdir(parents=True)
+    paths["claude_hooks"].write_text("{\"hooks\": {}}")
+    script = tmp_path / "mcp_server.py"
+    script.write_text("x")
+    starter = tmp_path / "start_agent_mcp.py"
+    starter.write_text("x")
+    skill = _skill_source(tmp_path)
+    monkeypatch.setattr(install, "default_paths", lambda: paths)
+    monkeypatch.setattr(install, "default_starter_path", lambda: starter)
+    monkeypatch.setattr(install, "default_skill_path", lambda: skill)
+
+    assert main(["--install", "--host", "all", str(script)]) == 1
+    assert paths["codex_mcp"].read_text() == "# unchanged\n"
+    assert paths["claude_mcp"].read_text() == "{\"mcpServers\": {}}"
+    assert not paths["codex_skill"].exists()
+    assert not paths["claude_skill"].exists()
+    assert not paths["omp_skill"].exists()
+    assert not list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*"))
+
+
+def test_missing_bundled_source_preflight_prevents_writes(tmp_path, monkeypatch):
+    paths = _paths(tmp_path)
+    script = tmp_path / "mcp_server.py"
+    script.write_text("x")
+    monkeypatch.setattr(install, "default_paths", lambda: paths)
+    monkeypatch.setattr(install, "default_starter_path", lambda: tmp_path / "missing-starter.py")
+    monkeypatch.setattr(install, "default_skill_path", lambda: tmp_path / "missing-skill")
+    assert main(["--install", "--host", "all", str(script)]) == 1
+    assert not any(path.exists() for path in paths.values())
+
+
+def test_rollback_restores_latest_mcp_hook_and_skill_backups(tmp_path):
+    paths = _paths(tmp_path)
+    for key in ("codex_mcp", "codex_hooks"):
+        target = paths[key]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("new")
+        backup = backup_path(target, ts="20260803T010203")
+        backup.write_text("old")
+    target = paths["codex_skill"]
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text("new")
+    backup = backup_path(target, ts="20260803T010203")
+    backup.mkdir()
+    (backup / "SKILL.md").write_text("old")
+
+    logs = rollback(paths, host="codex")
+    assert paths["codex_mcp"].read_text() == "old"
+    assert paths["codex_hooks"].read_text() == "old"
+    assert (paths["codex_skill"] / "SKILL.md").read_text() == "old"
+    assert not list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*"))
+    assert len([line for line in logs if "已从" in line]) == 3
+
+
+def test_rollback_dry_run_is_parser_error():
+    with pytest.raises(SystemExit) as exc:
+        install.parse_args(["--rollback", "--dry-run"])
+    assert exc.value.code == 2

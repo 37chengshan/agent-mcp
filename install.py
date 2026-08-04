@@ -8,20 +8,23 @@
 - claude：~/.claude.json（或 --claude-config <path>）的 mcpServers 合并写入
 - omp：MCP client 配置格式未实测，只输出操作指引
 - --rollback：从最新备份恢复（恢复后删除备份）
-- --legacy-map：打印旧 9 工具 → 新 8 工具映射（breaking change 迁移表）
+- --legacy-map：打印旧 9 工具 → 新 9 工具映射（breaking change 迁移表）
 
 只做配置变更，不拷贝代码文件：默认假定 mcp_server.py 已在目标位置，
 或由用户自行拷贝整个项目目录。
 """
 from __future__ import annotations
-
 import argparse
+import copy
 import json
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +32,10 @@ SERVER_NAME = "agent-mcp"
 LEGACY_NAME = "grok-cli"
 BACKUP_SUFFIX = ".bak-agentmcp-"
 HOSTS = ("codex", "claude", "omp")
+STARTER_NAME = "start_agent_mcp.py"
+HOOK_MARKER = "# agent-mcp-session-start"
 
-# 旧 grok-cli 9 工具 → 新 8 工具映射（breaking change；旧 skill/提示词按此迁移）
+# 旧 grok-cli 9 工具 → 新 9 工具映射（breaking change；旧 skill/提示词按此迁移）
 LEGACY_TOOL_MAP: list[dict[str, str]] = [
     {"old": "list_grok_models", "new": "spawn_agent",
      "note": "模型枚举无直接等价：模型选择改为 spawn_agent 的 model 参数，未指定走 CLI 默认"},
@@ -89,16 +94,129 @@ def omp_registration(script_path: str) -> str:
         f"1. 在 omp 的 MCP client 配置中新增一个 server（名称 {SERVER_NAME}）；\n"
         f'2. 命令填 "python3"，参数填 ["{script_path}"]；\n'
         f"3. 如需超时设置，配置启动超时 30 秒；\n"
-        f"4. 重启 omp 会话使其生效，然后用 tools/list 确认 {SERVER_NAME} 的 8 个工具已加载。"
+        f"4. 重启 omp 会话使其生效，然后用 tools/list 确认 {SERVER_NAME} 的 9 个工具已加载。"
     )
+
+
+# --- Hook 与 skill 安装 ---
+
+
+def posix_session_start_command(starter_path: str,
+                                python_executable: str = sys.executable) -> str:
+    command = " ".join(("nohup", shlex.quote(python_executable),
+                        shlex.quote(starter_path), "--open"))
+    return f"{command} >/dev/null 2>&1 & {HOOK_MARKER}"
+
+
+def windows_session_start_command(starter_path: str,
+                                  python_executable: str = sys.executable) -> str:
+    command = subprocess.list2cmdline([python_executable, starter_path, "--open"])
+    return f'start "" /B {command} >NUL 2>&1 & REM agent-mcp-session-start'
+
+
+def claude_session_start_entry(starter_path: str, *, platform: str = os.name,
+                               python_executable: str = sys.executable) -> dict[str, Any]:
+    command = (windows_session_start_command(starter_path, python_executable)
+               if platform == "nt"
+               else posix_session_start_command(starter_path, python_executable))
+    return {"matcher": "startup|resume",
+            "hooks": [{"type": "command", "command": command, "timeout": 10}]}
+
+
+def codex_session_start_entry(starter_path: str, *,
+                              python_executable: str = sys.executable) -> dict[str, Any]:
+    return {"matcher": "startup|resume", "hooks": [{
+        "type": "command",
+        "command": posix_session_start_command(starter_path, python_executable),
+        "command_windows": windows_session_start_command(starter_path, python_executable),
+        "timeout": 10,
+    }]}
+
+
+def _replace_session_start_hook(config: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(config)
+    hooks = out.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    entries = hooks.get("SessionStart")
+    if not isinstance(entries, list):
+        entries = []
+    updated: list[Any] = []
+    replaced = False
+    for current in entries:
+        owned = "agent-mcp-session-start" in json.dumps(current, ensure_ascii=False)
+        if owned:
+            if not replaced:
+                updated.append(entry)
+                replaced = True
+            continue
+        updated.append(copy.deepcopy(current))
+    if not replaced:
+        updated.append(entry)
+    hooks["SessionStart"] = updated
+    out["hooks"] = hooks
+    return out
+
+
+def add_claude_session_start_hook(config: dict[str, Any], starter_path: str) -> dict[str, Any]:
+    return _replace_session_start_hook(config, claude_session_start_entry(starter_path))
+
+
+def add_codex_session_start_hook(config: dict[str, Any], starter_path: str) -> dict[str, Any]:
+    return _replace_session_start_hook(config, codex_session_start_entry(starter_path))
+
+
+def _file_manifest(root: Path) -> dict[str, bytes]:
+    if not root.is_dir():
+        return {}
+    return {str(path.relative_to(root)): path.read_bytes()
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def install_skill(source: Path, destination: Path, *, dry_run: bool = False) -> list[str]:
+    """Atomically replace one final agent-mcp skill directory."""
+    source = Path(source)
+    destination = Path(destination)
+    if _file_manifest(source) == _file_manifest(destination):
+        return [f"skill {destination} 内容相同，跳过"]
+    action = "更新" if destination.exists() else "创建"
+    if dry_run:
+        return [f"[dry-run] 将{action} skill {destination}；本次不会写入"]
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / f".{destination.name}.tmp-agentmcp-{uuid.uuid4().hex}"
+    backup: Path | None = None
+    try:
+        shutil.copytree(source, temporary)
+        if destination.exists():
+            backup = backup_path(destination)
+            destination.replace(backup)
+        temporary.replace(destination)
+    except Exception:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        if backup and backup.exists() and not destination.exists():
+            backup.replace(destination)
+        raise
+    logs = []
+    if backup:
+        logs.append(f"备份 → {backup}")
+    logs.append(f"已安装 skill → {destination}")
+    return logs
 
 
 # --- 备份 / 文件编辑（纯函数） ---
 
 def backup_path(target: Path, ts: str | None = None) -> Path:
-    """备份路径：<原名>.bak-agentmcp-<ts>。"""
+    """Return a non-colliding sibling backup path."""
     stamp = ts or time.strftime("%Y%m%dT%H%M%S")
-    return target.with_name(target.name + f"{BACKUP_SUFFIX}{stamp}")
+    base = target.with_name(target.name + f"{BACKUP_SUFFIX}{stamp}")
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}-{suffix}")
+        suffix += 1
+    return candidate
 
 
 def has_section(text: str, section: str) -> bool:
@@ -142,16 +260,23 @@ def apply_claude_install(config: dict[str, Any], script_path: str) -> dict[str, 
 # --- 安装执行 ---
 
 def default_paths() -> dict[str, Path]:
-    """各 host 的默认配置文件路径（claude 可用 --claude-config 覆盖）。"""
+    """Return the real MCP, hook, and final skill destinations."""
     home = Path.home()
+    codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex"))
+    omp_home = Path(os.environ.get("PI_CODING_AGENT_DIR", home / ".omp" / "agent"))
     return {
-        "codex": home / ".codex" / "config.toml",
-        "claude": home / ".claude.json",
+        "codex_mcp": codex_home / "config.toml",
+        "codex_hooks": codex_home / "hooks.json",
+        "claude_mcp": home / ".claude.json",
+        "claude_hooks": home / ".claude" / "settings.json",
+        "codex_skill": home / ".agents" / "skills" / SERVER_NAME,
+        "claude_skill": home / ".claude" / "skills" / SERVER_NAME,
+        "omp_skill": omp_home / "skills" / SERVER_NAME,
     }
 
 
-def _write_with_backup(cfg: Path, content: str) -> str:
-    """写文件前备份原文件，返回备份路径（原文件不存在则不备份）。"""
+def _write_with_backup(cfg: Path) -> str:
+    """Back up an existing file before its caller writes replacement content."""
     bak = backup_path(cfg)
     if cfg.exists():
         shutil.copy2(cfg, bak)
@@ -159,13 +284,44 @@ def _write_with_backup(cfg: Path, content: str) -> str:
     return ""
 
 
+def _load_json_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.exists():
+        return {}, None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return None, f"错误：无法解析 {path}（{error}），未做任何修改。"
+    if not isinstance(value, dict):
+        return None, f"错误：{path} 顶层不是 JSON 对象，未做任何修改。"
+    return value, None
+
+
+def _install_json_transform(path: Path, transform, *, dry_run: bool,
+                            description: str) -> list[str]:
+    config, error = _load_json_object(path)
+    if error:
+        return [error]
+    assert config is not None
+    updated = transform(config)
+    if updated == config:
+        return [f"{description} 已存在，跳过 {path}"]
+    rendered = json.dumps(updated, ensure_ascii=False, indent=2) + "\n"
+    if dry_run:
+        return [f"[dry-run] 将更新 {description} → {path}", rendered.rstrip()]
+    backup = _write_with_backup(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(rendered, encoding="utf-8")
+    logs = [f"备份 → {backup}"] if backup else []
+    logs.append(f"已写入 {path}")
+    return logs
+
+
 def _install_codex(cfg: Path, script_path: str, *, dry_run: bool,
                    remove_legacy: bool) -> list[str]:
     logs: list[str] = []
-    text = cfg.read_text() if cfg.exists() else ""
+    text = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
     snippet = codex_registration_toml(script_path)
     changed = False
-
     if find_legacy_section(text):
         logs.append(f"[deprecated] 检测到旧 [mcp_servers.{LEGACY_NAME}]（grok-cli MCP v1），"
                     f"工具已改名，建议删除；--remove-legacy 自动移除")
@@ -173,94 +329,114 @@ def _install_codex(cfg: Path, script_path: str, *, dry_run: bool,
             text = remove_legacy_section(text)
             logs.append(f"已移除 [mcp_servers.{LEGACY_NAME}]")
             changed = True
-
     new_text, action = apply_codex_install(text, snippet)
     if action == "append":
         logs.append(f"将追加 [mcp_servers.{SERVER_NAME}] 注册（command=python3, args=[{script_path}]）")
         changed = True
     else:
         logs.append(f"[mcp_servers.{SERVER_NAME}] 已存在，跳过注册（保留现配置）")
-
     if not changed:
-        return logs  # 无任何变更，不备份不写
+        return logs
     if dry_run:
         logs.append(f"[dry-run] 目标文件 {cfg}；本次不会写入")
         return logs
-
-    bak = _write_with_backup(cfg, new_text)
-    if bak:
-        logs.append(f"备份 → {bak}")
+    backup = _write_with_backup(cfg)
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(new_text)
+    cfg.write_text(new_text, encoding="utf-8")
+    if backup:
+        logs.append(f"备份 → {backup}")
     logs.append(f"已写入 {cfg}")
     return logs
 
 
 def _install_claude(cfg: Path, script_path: str, *, dry_run: bool) -> list[str]:
-    logs: list[str] = []
-    if cfg.exists():
-        try:
-            config = json.loads(cfg.read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            return [f"错误：无法解析 {cfg}（{e}），未做任何修改。"]
-        if not isinstance(config, dict):
-            return [f"错误：{cfg} 顶层不是 JSON 对象，未做任何修改。"]
-    else:
-        config = {}
+    config, error = _load_json_object(cfg)
+    if error:
+        return [error]
+    assert config is not None
     updated = apply_claude_install(config, script_path)
-
+    if updated == config:
+        return [f"mcpServers.{SERVER_NAME} 已存在且内容相同，跳过 {cfg}"]
+    rendered = json.dumps(updated, ensure_ascii=False, indent=2) + "\n"
     if dry_run:
-        logs.append(f"[dry-run] 将更新 {cfg} 的 mcpServers.{SERVER_NAME}")
-        logs.append(json.dumps(updated["mcpServers"][SERVER_NAME], ensure_ascii=False, indent=2))
-        return logs
-
-    bak = _write_with_backup(cfg, json.dumps(updated, ensure_ascii=False, indent=2) + "\n")
-    if bak:
-        logs.append(f"备份 → {bak}")
+        return [f"[dry-run] 将更新 {cfg} 的 mcpServers.{SERVER_NAME}",
+                json.dumps(updated["mcpServers"][SERVER_NAME], ensure_ascii=False, indent=2)]
+    backup = _write_with_backup(cfg)
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n")
+    cfg.write_text(rendered, encoding="utf-8")
+    logs = [f"备份 → {backup}"] if backup else []
     logs.append(f"已写入 {cfg}")
     return logs
 
 
-def install_host(host: str, script_path: str, paths: dict[str, Path],
-                 *, dry_run: bool = False, remove_legacy: bool = False) -> list[str]:
-    """注册到单个 host，返回操作日志行。dry_run 时不写任何文件。"""
+def install_host(host: str, script_path: str, starter_path: str, skill_source: Path,
+                 paths: dict[str, Path], *, dry_run: bool = False,
+                 remove_legacy: bool = False) -> list[str]:
+    """Install every supported surface for one host."""
+    logs: list[str] = []
     if host == "codex":
-        return _install_codex(paths["codex"], script_path, dry_run=dry_run,
-                              remove_legacy=remove_legacy)
+        logs.extend(_install_codex(paths["codex_mcp"], script_path, dry_run=dry_run,
+                                   remove_legacy=remove_legacy))
+        logs.extend(_install_json_transform(
+            paths["codex_hooks"],
+            lambda config: add_codex_session_start_hook(config, starter_path),
+            dry_run=dry_run,
+            description="Codex SessionStart hook",
+        ))
+        logs.extend(install_skill(skill_source, paths["codex_skill"], dry_run=dry_run))
+        return logs
     if host == "claude":
-        return _install_claude(paths["claude"], script_path, dry_run=dry_run)
+        logs.extend(_install_claude(paths["claude_mcp"], script_path, dry_run=dry_run))
+        logs.extend(_install_json_transform(
+            paths["claude_hooks"],
+            lambda config: add_claude_session_start_hook(config, starter_path),
+            dry_run=dry_run,
+            description="Claude SessionStart hook",
+        ))
+        logs.extend(install_skill(skill_source, paths["claude_skill"], dry_run=dry_run))
+        return logs
     if host == "omp":
-        return [omp_registration(script_path)]
+        logs.extend((omp_registration(script_path),
+                     "OMP 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。"))
+        logs.extend(install_skill(skill_source, paths["omp_skill"], dry_run=dry_run))
+        return logs
     raise ValueError(f"未知 host: {host}")
 
 
 # --- 回滚 ---
 
+_ROLLBACK_KEYS = {
+    "codex": ("codex_mcp", "codex_hooks", "codex_skill"),
+    "claude": ("claude_mcp", "claude_hooks", "claude_skill"),
+    "omp": ("omp_skill",),
+}
+
+
 def rollback(paths: dict[str, Path], host: str | None = None) -> list[str]:
-    """从最新备份恢复配置；恢复后删除备份。host=None 时恢复全部。"""
+    """Restore the newest backup for every selected managed artifact."""
     logs: list[str] = []
-    for h in HOSTS:
-        if h == "omp" or (host and h != host):
-            continue  # omp 无自动写入，无备份
-        cfg = paths[h]
-        backups = sorted(cfg.parent.glob(cfg.name + f"{BACKUP_SUFFIX}*"))
-        if not backups:
-            logs.append(f"[{h}] 未找到 {cfg.name}{BACKUP_SUFFIX}* 备份，跳过")
-            continue
-        latest = backups[-1]
-        cfg.write_text(latest.read_text())
-        logs.append(f"[{h}] 已从 {latest.name} 恢复 {cfg}")
-        latest.unlink()
-        logs.append(f"[{h}] 已删除备份 {latest.name}")
+    selected = HOSTS if host is None else (host,)
+    for current_host in selected:
+        for key in _ROLLBACK_KEYS[current_host]:
+            target = paths[key]
+            backups = sorted(target.parent.glob(target.name + f"{BACKUP_SUFFIX}*"))
+            if not backups:
+                logs.append(f"[{current_host}] 未找到 {target.name}{BACKUP_SUFFIX}* 备份，跳过")
+                continue
+            latest = backups[-1]
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+            latest.replace(target)
+            logs.append(f"[{current_host}] 已从 {latest.name} 恢复 {target}")
     return logs
 
 
 # --- 工具名映射表输出 ---
 
 def legacy_tool_map_text() -> str:
-    lines = ["旧 9 工具 → 新 8 工具映射（breaking change；旧 skill/提示词按此迁移）", ""]
+    lines = ["旧 9 工具 → 新 9 工具映射（breaking change；旧 skill/提示词按此迁移）", ""]
     for entry in LEGACY_TOOL_MAP:
         lines.append(f"{entry['old']:28s} → {entry['new']}")
         lines.append(f"{'':28s}    {entry['note']}")
@@ -273,6 +449,13 @@ def default_script_path() -> str:
     """默认 mcp_server.py：脚本所在目录。"""
     return str(Path(__file__).resolve().parent / "mcp_server.py")
 
+def default_starter_path() -> Path:
+    return Path(__file__).resolve().parent / STARTER_NAME
+
+
+def default_skill_path() -> Path:
+    return Path(__file__).resolve().parent / "skill"
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -282,11 +465,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--install", action="store_true",
-                      help="注册 mcp_server.py 到指定 host（默认 all）")
+                      help="注册 MCP、SessionStart hook 与共享 skill（默认 all）")
     mode.add_argument("--rollback", action="store_true",
                       help="从最新备份恢复配置（--host 过滤）")
     mode.add_argument("--legacy-map", action="store_true",
-                      help="打印旧 9 工具 → 新 8 工具映射表")
+                      help="打印旧 9 工具 → 新 9 工具映射表")
     parser.add_argument("script_path", nargs="?", default=None,
                         help="mcp_server.py 路径（默认：脚本所在目录）")
     parser.add_argument("--host", choices=[*HOSTS, "all"], default="all",
@@ -296,9 +479,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remove-legacy", action="store_true",
                         help="同时移除旧 [mcp_servers.grok-cli] 注册")
     parser.add_argument("--claude-config", default=None,
-                        help="claude 配置文件路径（默认 ~/.claude.json；"
-                             "也可指向项目 .mcp.json）")
-    return parser.parse_args(argv)
+                        help="仅覆盖 Claude MCP 配置文件（默认 ~/.claude.json）")
+    args = parser.parse_args(argv)
+    if args.rollback and args.dry_run:
+        parser.error("--rollback 不能与 --dry-run 同时使用")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -311,7 +496,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.rollback:
         paths = default_paths()
         if args.claude_config:
-            paths["claude"] = Path(args.claude_config)
+            paths["claude_mcp"] = Path(args.claude_config)
         print("\n".join(rollback(paths, host=None if args.host == "all" else args.host)))
         return 0
 
@@ -320,18 +505,41 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     script = Path(args.script_path or default_script_path()).resolve()
-    if not script.exists():
-        print(f"错误：{script} 不存在。", file=sys.stderr)
+    starter = default_starter_path().resolve()
+    skill_source = default_skill_path().resolve()
+    missing = []
+    if not script.is_file():
+        missing.append(f"错误：{script} 不存在。")
+    if not starter.is_file():
+        missing.append(f"错误：{starter} 不存在。")
+    if not (skill_source / "SKILL.md").is_file():
+        missing.append(f"错误：{skill_source / 'SKILL.md'} 不存在。")
+    if missing:
+        print("\n".join(missing), file=sys.stderr)
         return 1
 
     paths = default_paths()
     if args.claude_config:
-        paths["claude"] = Path(args.claude_config)
+        paths["claude_mcp"] = Path(args.claude_config)
     hosts: list[str] = list(HOSTS) if args.host == "all" else [args.host]
-    for h in hosts:
-        logs = install_host(h, str(script), paths,
+    json_keys: list[str] = []
+    if "codex" in hosts:
+        json_keys.append("codex_hooks")
+    if "claude" in hosts:
+        json_keys.extend(("claude_mcp", "claude_hooks"))
+    errors = []
+    for key in json_keys:
+        _config, error = _load_json_object(paths[key])
+        if error:
+            errors.append(error)
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+
+    for host in hosts:
+        logs = install_host(host, str(script), str(starter), skill_source, paths,
                             dry_run=args.dry_run, remove_legacy=args.remove_legacy)
-        print(f"== [{h}] ==")
+        print(f"== [{host}] ==")
         print("\n".join(logs))
     if args.dry_run:
         print("（dry-run：以上均为将要执行的变更，未写任何文件）")

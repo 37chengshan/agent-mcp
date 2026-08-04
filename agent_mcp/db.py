@@ -2,6 +2,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,15 +37,20 @@ CREATE TABLE IF NOT EXISTS messages (
 
 class DB:
     def __init__(self, path: Path | str, *, max_events: int = 100_000,
-                 retention_days: int = 7, max_messages_per_agent: int = 500):
+                 retention_days: int = 7, max_messages_per_agent: int = 500,
+                 retain_interval: float = 60.0):
         self.path = Path(path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # 跨进程写（daemon + worker ingest）锁等待：10s 而非 sqlite3 默认 5s
+        self._conn.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(SCHEMA)
         self.max_events = max_events
         self.retention_days = retention_days
         self.max_messages_per_agent = max_messages_per_agent
+        self.retain_interval = retain_interval
+        self._last_retain = 0.0
         if os.name != "nt":
             # WAL/SHM 与主库同敏感度，一并收紧为 0600（WAL 模式下由 executescript 创建）
             for p in (self.path, self.path.with_suffix(".db-wal"),
@@ -126,6 +132,32 @@ class DB:
             out.append(d)
         return out
 
+    def max_seq(self) -> int:
+        """事件表当前最大 seq；无事件时返回 0（SSE 断线回放固定上界用）。"""
+        row = self._conn.execute("SELECT MAX(seq) AS m FROM events").fetchone()
+        return int(row["m"]) if row and row["m"] is not None else 0
+
+    def events_by_agents(self, agent_ids: list[int], *, per_agent_limit: int = 60) -> list[dict[str, Any]]:
+        """每个 agent 取最近 per_agent_limit 条事件，按 seq 合并升序（快照详情用）。
+
+        避免 events_since 全局 limit 把后 spawn 的 agent 事件整体切掉。
+        """
+        out: list[dict[str, Any]] = []
+        for agent_id in agent_ids:
+            rows = self._conn.execute(
+                "SELECT seq, session_id, agent_id, type, payload, created_at FROM events"
+                " WHERE agent_id=? ORDER BY seq DESC LIMIT ?",
+                (agent_id, per_agent_limit)).fetchall()
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["payload"] = _json_loads(d["payload"])
+                except Exception:
+                    d["payload"] = {}
+                out.append(d)
+        out.sort(key=lambda e: e["seq"])
+        return out
+
     def upsert_usage(self, *, agent_id: int, model: str, input_tokens: int,
                      output_tokens: int, cache_creation: int, cache_read: int,
                      cost_usd: float) -> None:
@@ -166,6 +198,11 @@ class DB:
         return [dict(r) for r in rows]
 
     def _maybe_retain(self) -> None:
+        # 低频清理：retain_interval 秒内最多跑一次，避免每次 insert_event 全表 COUNT
+        now = time.monotonic()
+        if now - self._last_retain < self.retain_interval:
+            return
+        self._last_retain = now
         count = self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         if count > self.max_events:
             keep_seq = self._conn.execute(
