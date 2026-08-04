@@ -1,12 +1,11 @@
 ---
 name: agent-mcp
-description: Agent MCP 编排：把任务拆解、派发到多 CLI（claude/grok/opencode/omp/atomcode）执行并监控汇合。9 个工具（spawn_agent、send_message、steer_agent、followup_task、wait_agent、interrupt_agent、list_agents、get_agent_activity、get_token_usage）实现拆解→并行派发→监控→汇合→迭代审查工作流。
+description: Use when a task should be decomposed and dispatched across claude, grok, opencode, omp, or atomcode workers, especially for parallel execution, mid-run steering, durable follow-ups, task monitoring, or multi-CLI result synthesis.
 ---
 
 # Agent MCP 编排 Skill
 
-> 主 agent（编排者）把一个大任务拆成子任务、判断并行度，再用 MCP 工具派发给多个 CLI 子代理执行、监控、汇合。
-> **编排决策全部由主 agent 做；MCP 只是派发基础设施**（同 opencodex v2 spawn 面 / MCP Orchestrator-Worker 模式），不替你做拆解、不决定派谁、不解决文件冲突。
+主 agent 负责拆解、并行度、权限、模型和验收；Agent MCP 只提供可靠派发、监控、续接与终止基础设施。不要把拆解或文件冲突决策交给 MCP。
 
 ## 1. 编排五步（主 agent 的工作）
 
@@ -28,7 +27,7 @@ description: Agent MCP 编排：把任务拆解、派发到多 CLI（claude/grok
 - 并行多分支：`list_agents` / `get_agent_activity`（since_seq 增量）轮询
 - 顺序依赖处：`wait_agent`（短阻塞，timeout 可自定义，默认 30s、上限 600s）
 - 中途改向：`steer_agent`（运行中先终止当前 run，再在同一节点立即续接；稳定 session id 的 CLI 自动恢复原会话）
-- 网页操作台由 `start_agent_mcp.py --open` 打开：横向 Conversation graph + agent 详情，可中途插话 / 继续会话 / 停止；写授权只放在 URL fragment，页面读取后立即清除，不由 `/api/config` 暴露。
+- 网页操作台由 `start_agent_mcp.py --open` 打开：横向 Conversation Graph 显示 `agent.user_turn` 输入节点与本轮 agent/子代理；写授权只经 URL fragment 传入，页面读取后立即清除。
 
 **第五步：汇合与迭代**
 - 分支以 `FINAL_ANSWER:` 回传摘要；主 agent 综合核对、识别冲突、决定返工
@@ -47,7 +46,7 @@ description: Agent MCP 编排：把任务拆解、派发到多 CLI（claude/grok
 | interrupt_agent | 终止进程树（不可恢复，慎用） |
 | list_agents | 列 agent 树（状态/CLI/父 id/最近消息） |
 | get_agent_activity | 实时活动流（since_seq 增量） |
-| get_token_usage | token 统计（派发侧估算） |
+| get_token_usage | token 统计（派发侧估算；AtomCode 从 `-v` 的 `[tokens] prompt=… completion=… cached=…` 解析） |
 
 **协议**：兼容 legacy MCP 2025-03-26 与 modern 2026-07-28。modern 客户端声明
 `io.modelcontextprotocol/tasks` 扩展时，spawn_agent 返回持久 task 句柄；tasks/get 轮询状态、
@@ -65,9 +64,10 @@ tasks/update 把接受的 input response 作为 steer 内容、tasks/cancel 中�
 ## 4. 关键约定
 
 - 分支只回传 `FINAL_ANSWER:` 摘要，不收全文
-- `cwd` 必填；任务间避免写同一批文件（文件冲突由主 agent 分配，不是 MCP 的事）
-- `timeout_seconds`（spawn_agent / followup_task，1–1800）：任务级超时，daemon 透传 worker，超时终止进程树并标记 `incomplete`（stop_reason=timeout，可 resume/重派）；`wait_agent` 的 timeout 只是轮询阻塞上限，两者不同
-- usage 为派发侧估算，对账以 CLI 侧为准
+- `cwd` 必填；任务间避免写同一批文件
+- `session_id` 是所有 agent ID 操作的所有权边界；宿主调用自动注入，不能用另一会话的 agent ID
+- `timeout_seconds`（spawn/followup，1–1800）是任务级超时：终止进程树并标记 `incomplete/timeout`；`wait_agent.timeout` 只是轮询阻塞上限
+- usage 为派发侧估算；AtomCode 的 verbose token 行会被解析为 `agent.usage`，不会污染最终消息
 
 ## 5. 错误恢复
 

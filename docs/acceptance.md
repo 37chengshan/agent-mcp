@@ -22,10 +22,10 @@
 |---|---|---|
 | codex | ✅ | `python3 install.py --install --dry-run <abs>/mcp_server.py`：**实测检测到 `~/.codex/config.toml` 中旧 `[mcp_servers.grok-cli]` 注册并提示废弃**（`--remove-legacy` 可自动移除）；将追加 `[mcp_servers.agent-mcp]`（command=python3 + 脚本路径）|
 | claude | ✅ | dry-run 输出 `~/.claude.json` 的 `mcpServers.agent-mcp` 合并 JSON 片段（command/args）；`--claude-config` 可指定路径 |
-| omp | ⚠️ | 注册格式未实测，dry-run 输出手动操作指引（新增 server agent-mcp + 命令 + 超时 30s + 重启会话后 tools/list 确认 9 工具）；skill 自动分发到 `~/.omp/agent/skills/agent-mcp` |
+| omp | ✅ | 自动合并 `~/.omp/agent/mcp.json` 的 `mcpServers.agent-mcp`（stdio、30s timeout、number request IDs），保留其他 server；skill 分发到 `~/.omp/agent/skills/agent-mcp`；二次安装幂等 |
 | host 识别 | ✅ | `test_mcp_stdio_end_to_end`（真实 stdio）：initialize `clientInfo.name=codex` → 会话隔离 `codex-*` 生效；`host_from_client_info` 单测覆盖 codex/claude/omp/unknown 四分支 |
 
-**结论**：codex/claude 注册片段实测生效（dry-run）；omp 有待格式实测；host 识别端到端验证。
+**结论**：codex、claude、omp 三主载体均可由 `install.py --install --host all` 完整注册 MCP 并安装配套 skill；OMP 无 Claude-style SessionStart，使用 MCP 懒启动。
 
 ## 3. 监控网页达标
 
@@ -88,7 +88,7 @@
 |---|---|---|---|
 | 1 | grok 真实 CLI 冒烟 | 首启模型发现 >120s + 登录态，未纳入本次预算 | 首次启动预热后补跑；spawn timeout 预算需预留 |
 | 2 | opencode 真实 CLI 冒烟 | 默认 provider key 401，需指定 opencodex 模型 | 配置 opencodex 模型后补跑 |
-| 3 | omp MCP 注册格式 | `~/.omp/agent/` MCP client 配置格式未实测 | 人工按 dry-run 指引注册后 tools/list 确认 |
+| 3 | omp MCP 注册 | 已实测写入 `~/.omp/agent/mcp.json`，二次安装幂等 | 新会话启动后由 OMP 载入 9 工具 |
 | 4 | omp resume | `--resume` flag 待实测（capability-matrix ⏳） | 补实测后更新适配器 |
 | 5 | Windows 平台 | 三处跨平台分支（进程树/拉起/控制台）未在真实 Windows 验证 | 双平台 CI 冒烟 |
 | 6 | 网页浏览器渲染 | 本次仅静态结构 + SSE 直播流断言；impl-t11 已交付渲染验证 | 人工复核 `http://127.0.0.1:8765/` |

@@ -19,6 +19,11 @@ def test_skill_docs_exist_and_complete():
     for cli in ("claude", "grok", "opencode", "omp", "atomcode"):
         assert cli in skill
     assert "deepseek-v4-flash" in skill  # AtomCode task-only one-shot 指引
+    assert "description: Use when" in skill
+    assert "agent.user_turn" in skill
+    assert "URL fragment" in skill
+    assert "[tokens]" in skill
+    assert "session_id" in skill
 
 
 def test_builtin_agents_exist():

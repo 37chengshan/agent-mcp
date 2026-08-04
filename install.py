@@ -6,7 +6,8 @@
 - codex：~/.codex/config.toml 末尾追加 [mcp_servers.agent-mcp]；检测旧 [mcp_servers.grok-cli]
   并提示废弃，--remove-legacy 自动移除
 - claude：~/.claude.json（或 --claude-config <path>）的 mcpServers 合并写入
-- omp：MCP client 配置格式未实测，只输出操作指引
+- omp：~/.omp/agent/mcp.json 的 mcpServers 合并写入
+- 三者均安装共享 skill；Codex/Claude 另安装 SessionStart launcher hook
 - --rollback：从最新备份恢复（恢复后删除备份）
 - --legacy-map：打印旧 9 工具 → 新 9 工具映射（breaking change 迁移表）
 
@@ -87,15 +88,16 @@ def claude_registration_json(script_path: str) -> dict[str, Any]:
     }
 
 
-def omp_registration(script_path: str) -> str:
-    """omp 的 MCP client 配置格式未实测，返回操作指引文本。"""
-    return (
-        f"omp MCP client 配置格式尚未实测，无法自动写入。请手动添加：\n"
-        f"1. 在 omp 的 MCP client 配置中新增一个 server（名称 {SERVER_NAME}）；\n"
-        f'2. 命令填 "python3"，参数填 ["{script_path}"]；\n'
-        f"3. 如需超时设置，配置启动超时 30 秒；\n"
-        f"4. 重启 omp 会话使其生效，然后用 tools/list 确认 {SERVER_NAME} 的 9 个工具已加载。"
-    )
+def omp_registration_json(script_path: str) -> dict[str, Any]:
+    """生成 OMP `~/.omp/agent/mcp.json` 的 stdio server 片段。"""
+    return {"mcpServers": {SERVER_NAME: {
+        "type": "stdio",
+        "command": "python3",
+        "args": [script_path],
+        "timeout": 30_000,
+        "requestIdFormat": "number",
+        "enabled": True,
+    }}}
 
 
 # --- Hook 与 skill 安装 ---
@@ -256,6 +258,14 @@ def apply_claude_install(config: dict[str, Any], script_path: str) -> dict[str, 
     out["mcpServers"] = servers
     return out
 
+def apply_omp_install(config: dict[str, Any], script_path: str) -> dict[str, Any]:
+    """合并 agent-mcp 注册进 OMP mcp.json，保留其他服务器和顶层设置。"""
+    servers = dict(config.get("mcpServers", {}))
+    servers[SERVER_NAME] = omp_registration_json(script_path)["mcpServers"][SERVER_NAME]
+    out = dict(config)
+    out["mcpServers"] = servers
+    return out
+
 
 # --- 安装执行 ---
 
@@ -269,6 +279,7 @@ def default_paths() -> dict[str, Path]:
         "codex_hooks": codex_home / "hooks.json",
         "claude_mcp": home / ".claude.json",
         "claude_hooks": home / ".claude" / "settings.json",
+        "omp_mcp": omp_home / "mcp.json",
         "codex_skill": home / ".agents" / "skills" / SERVER_NAME,
         "claude_skill": home / ".claude" / "skills" / SERVER_NAME,
         "omp_skill": omp_home / "skills" / SERVER_NAME,
@@ -396,8 +407,10 @@ def install_host(host: str, script_path: str, starter_path: str, skill_source: P
         logs.extend(install_skill(skill_source, paths["claude_skill"], dry_run=dry_run))
         return logs
     if host == "omp":
-        logs.extend((omp_registration(script_path),
-                     "OMP 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。"))
+        logs.extend(_install_json_transform(
+            paths["omp_mcp"], lambda config: apply_omp_install(config, script_path),
+            dry_run=dry_run, description="OMP mcpServers.agent-mcp"))
+        logs.append("OMP 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。")
         logs.extend(install_skill(skill_source, paths["omp_skill"], dry_run=dry_run))
         return logs
     raise ValueError(f"未知 host: {host}")
@@ -408,7 +421,7 @@ def install_host(host: str, script_path: str, starter_path: str, skill_source: P
 _ROLLBACK_KEYS = {
     "codex": ("codex_mcp", "codex_hooks", "codex_skill"),
     "claude": ("claude_mcp", "claude_hooks", "claude_skill"),
-    "omp": ("omp_skill",),
+    "omp": ("omp_mcp", "omp_skill"),
 }
 
 
@@ -460,7 +473,7 @@ def default_skill_path() -> Path:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="install.py",
-        description="Agent MCP 安装/迁移：三主载体（codex/claude/omp）注册 mcp_server.py。"
+        description="Agent MCP 安装/迁移：为 codex/claude/omp 注册 mcp_server.py 并安装配套 skill。"
                     "写配置前自动备份（*.bak-agentmcp-<ts>），--rollback 可恢复。",
     )
     mode = parser.add_mutually_exclusive_group()
@@ -527,7 +540,9 @@ def main(argv: list[str] | None = None) -> int:
         json_keys.append("codex_hooks")
     if "claude" in hosts:
         json_keys.extend(("claude_mcp", "claude_hooks"))
-    errors = []
+    if "omp" in hosts:
+        json_keys.append("omp_mcp")
+    errors: list[str] = []
     for key in json_keys:
         _config, error = _load_json_object(paths[key])
         if error:

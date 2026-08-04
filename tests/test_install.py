@@ -24,7 +24,7 @@ from install import (
     install_skill,
     legacy_tool_map_text,
     main,
-    omp_registration,
+    omp_registration_json,
     posix_session_start_command,
     remove_legacy_section,
     rollback,
@@ -52,6 +52,7 @@ def _paths(tmp_path):
         "codex_skill": tmp_path / "agents" / "skills" / "agent-mcp",
         "claude_skill": tmp_path / "claude" / "skills" / "agent-mcp",
         "omp_skill": tmp_path / "omp" / "skills" / "agent-mcp",
+        "omp_mcp": tmp_path / "omp" / "mcp.json",
     }
 
 
@@ -67,7 +68,9 @@ def test_registration_snippets():
     entry = claude_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
     assert entry["command"].endswith("python3")
     assert entry["args"] == [SCRIPT]
-    assert "omp" in omp_registration(SCRIPT).lower()
+    omp_entry = omp_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
+    assert omp_entry == {"type": "stdio", "command": "python3", "args": [SCRIPT],
+                         "timeout": 30000, "requestIdFormat": "number", "enabled": True}
 
 
 def test_backup_and_toml_helpers():
@@ -233,14 +236,16 @@ def test_complete_host_install_and_second_run_noop(tmp_path, host, mcp_key, hook
     assert len(list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*"))) == backup_count
 
 
-def test_omp_installs_skill_without_hook_or_config(tmp_path):
+def test_omp_installs_mcp_config_and_skill_without_hook(tmp_path):
     paths = _paths(tmp_path)
+    paths["omp_mcp"].parent.mkdir(parents=True)
+    paths["omp_mcp"].write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}))
     logs = install_host("omp", SCRIPT, STARTER, _skill_source(tmp_path), paths)
+    config = json.loads(paths["omp_mcp"].read_text())
+    assert config["mcpServers"]["other"] == {"command": "x"}
+    assert config["mcpServers"]["agent-mcp"] == omp_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
     assert (paths["omp_skill"] / "SKILL.md").read_text() == "agent-mcp"
     assert any("SessionStart" in line and "不支持" in line for line in logs)
-    assert any("mcp_server.py" in line for line in logs)
-    assert not (tmp_path / "omp" / "config.yml").exists()
-    assert not (tmp_path / "omp" / "mcp.json").exists()
 
 
 def test_install_unknown_host_raises(tmp_path):
@@ -292,6 +297,7 @@ def test_main_all_installs_every_supported_surface(tmp_path, monkeypatch):
     assert main(["--install", "--host", "all", str(script)]) == 0
     assert "agent-mcp" in paths["codex_mcp"].read_text()
     assert "agent-mcp" in json.loads(paths["claude_mcp"].read_text())["mcpServers"]
+    assert "agent-mcp" in json.loads(paths["omp_mcp"].read_text())["mcpServers"]
     assert len(_owned(json.loads(paths["codex_hooks"].read_text())["hooks"]["SessionStart"])) == 1
     assert len(_owned(json.loads(paths["claude_hooks"].read_text())["hooks"]["SessionStart"])) == 1
     for key in ("codex_skill", "claude_skill", "omp_skill"):
