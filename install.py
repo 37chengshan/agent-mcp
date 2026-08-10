@@ -35,6 +35,12 @@ BACKUP_SUFFIX = ".bak-agentmcp-"
 HOSTS = ("codex", "claude", "omp")
 STARTER_NAME = "start_agent_mcp.py"
 HOOK_MARKER = "# agent-mcp-session-start"
+# SessionStart hook 注入主代理的评判纪律：stdout 会被宿主（Claude Code）注入上下文。
+# 文本避免 shell 元字符（& < > | 等），保证 posix/win 两平台 echo 均安全。
+MAIN_AGENT_REMINDER = (
+    "Agent MCP: 派发结果返回后按三查评判——对目标、查证据、判返工；"
+    "不盲目采信，也不无谓重审。"
+)
 
 # 旧 grok-cli 9 工具 → 新 9 工具映射（breaking change；旧 skill/提示词按此迁移）
 LEGACY_TOOL_MAP: list[dict[str, str]] = [
@@ -107,13 +113,17 @@ def posix_session_start_command(starter_path: str,
                                 python_executable: str = sys.executable) -> str:
     command = " ".join(("nohup", shlex.quote(python_executable),
                         shlex.quote(starter_path), "--open"))
-    return f"{command} >/dev/null 2>&1 & {HOOK_MARKER}"
+    # echo 在前台输出（Claude Code 将 SessionStart stdout 注入上下文），
+    # 网页启动放后台并丢弃输出，避免 daemon JSON 污染提醒。
+    return (f"echo {shlex.quote(MAIN_AGENT_REMINDER)}; "
+            f"{command} >/dev/null 2>&1 & {HOOK_MARKER}")
 
 
 def windows_session_start_command(starter_path: str,
                                   python_executable: str = sys.executable) -> str:
     command = subprocess.list2cmdline([python_executable, starter_path, "--open"])
-    return f'start "" /B {command} >NUL 2>&1 & REM agent-mcp-session-start'
+    return (f'echo "{MAIN_AGENT_REMINDER}" & '
+            f'start "" /B {command} >NUL 2>&1 & REM agent-mcp-session-start')
 
 
 def claude_session_start_entry(starter_path: str, *, platform: str = os.name,
@@ -175,6 +185,41 @@ def _file_manifest(root: Path) -> dict[str, bytes]:
             for path in sorted(root.rglob("*")) if path.is_file()}
 
 
+def skill_backup_root(destination: Path) -> Path:
+    """skill 备份根目录：放 skills 扫描目录之外（上一级 /skill-backups），
+    避免被宿主（codex 等）把备份目录误扫成独立 skill。"""
+    return destination.parent.parent / "skill-backups"
+
+
+def _skill_backup_path(destination: Path, ts: str | None = None) -> Path:
+    """生成 skill 备份路径（含防碰撞），并确保备份根目录存在。"""
+    stamp = ts or time.strftime("%Y%m%dT%H%M%S")
+    root = skill_backup_root(destination)
+    root.mkdir(parents=True, exist_ok=True)
+    base = root / f"{destination.name}{BACKUP_SUFFIX}{stamp}"
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}-{suffix}")
+        suffix += 1
+    return candidate
+
+
+def _prune_skill_backups(destination: Path, keep: Path) -> list[str]:
+    """只保留最新备份：删除该 skill 的其他备份目录，返回清理日志。"""
+    root = skill_backup_root(destination)
+    removed = []
+    for candidate in sorted(root.glob(destination.name + f"{BACKUP_SUFFIX}*")):
+        if candidate == keep:
+            continue
+        if candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=True)
+        else:
+            candidate.unlink(missing_ok=True)
+        removed.append(candidate.name)
+    return removed
+
+
 def install_skill(source: Path, destination: Path, *, dry_run: bool = False) -> list[str]:
     """Atomically replace one final agent-mcp skill directory."""
     source = Path(source)
@@ -191,7 +236,7 @@ def install_skill(source: Path, destination: Path, *, dry_run: bool = False) -> 
     try:
         shutil.copytree(source, temporary)
         if destination.exists():
-            backup = backup_path(destination)
+            backup = _skill_backup_path(destination)
             destination.replace(backup)
         temporary.replace(destination)
     except Exception:
@@ -203,6 +248,8 @@ def install_skill(source: Path, destination: Path, *, dry_run: bool = False) -> 
     logs = []
     if backup:
         logs.append(f"备份 → {backup}")
+        for name in _prune_skill_backups(destination, keep=backup):
+            logs.append(f"清理旧备份 → {name}")
     logs.append(f"已安装 skill → {destination}")
     return logs
 
@@ -432,7 +479,13 @@ def rollback(paths: dict[str, Path], host: str | None = None) -> list[str]:
     for current_host in selected:
         for key in _ROLLBACK_KEYS[current_host]:
             target = paths[key]
-            backups = sorted(target.parent.glob(target.name + f"{BACKUP_SUFFIX}*"))
+            if key.endswith("_skill"):
+                # skill 备份已移出扫描目录（skill_backup_root）
+                backups = sorted(skill_backup_root(target).glob(
+                    target.name + f"{BACKUP_SUFFIX}*"))
+            else:
+                backups = sorted(target.parent.glob(
+                    target.name + f"{BACKUP_SUFFIX}*"))
             if not backups:
                 logs.append(f"[{current_host}] 未找到 {target.name}{BACKUP_SUFFIX}* 备份，跳过")
                 continue

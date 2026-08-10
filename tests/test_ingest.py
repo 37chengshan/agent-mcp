@@ -167,3 +167,67 @@ def test_wait_ingests_events_end_to_end(tmp_path):
         assert db.usage_total(a["agent_id"])["input_tokens"] == 100
     finally:
         d.stop()
+
+
+def test_tail_progress_heartbeat_and_delta_broadcast(tmp_path):
+    """运行中增量 tail：新字节 → 心跳 + delta 广播（不落库权威事件）。"""
+    import time as _time
+
+    d, db, bc = _make(tmp_path)
+    listener = _listen(bc)
+    db.insert_agent(parent_id=None, session_id="s1", task_name="t",
+                    cli="atomcode", model=None, cwd=str(tmp_path))
+    db.set_status(1, "running", pid=123)
+    state_path = tmp_path / "w.json"
+    state_path.write_text(json.dumps({"status": "running"}))
+    out_path = tmp_path / "w.out.log"
+    err_path = tmp_path / "w.err.log"
+    out_path.write_text("", encoding="utf-8")
+    err_path.write_text("", encoding="utf-8")
+    d._workers[1] = {"worker_pid": 123, "state_path": str(state_path),
+                     "out_path": str(out_path), "err_path": str(err_path)}
+    # 无新内容 → 无心跳、无广播
+    before = db.get_agent(1)["updated_at"]
+    d._tail_progress(1)
+    assert db.get_agent(1)["updated_at"] == before
+    assert "agent.message_delta" not in "".join(listener["buffer"])
+    # 新内容（atomcode stderr 文本行）→ 心跳 + delta 广播（不落库）
+    _time.sleep(0.01)
+    err_path.write_text("[thinking] analyzing...\n[tool→ bash]\n", encoding="utf-8")
+    d._tail_progress(1)
+    assert db.get_agent(1)["updated_at"] > before  # 心跳已更新
+    assert db.events_since(0) == []  # delta 不落库
+    text = "".join(listener["buffer"])
+    assert "agent.message_delta" in text and "analyzing" in text
+    # JSON 行（claude/omp stream）不广播
+    out_path.write_text('{"type":"assistant","message":{"id":"m1","content":"hi"}}\n',
+                        encoding="utf-8")
+    d._tail_progress(1)
+    assert '"content":"hi"' not in "".join(listener["buffer"])
+
+
+def test_tail_progress_resumes_after_log_truncation(tmp_path):
+    """日志被截断（size 回退）→ offset 重置，心跳与 delta 恢复。"""
+    d, db, bc = _make(tmp_path)
+    listener = _listen(bc)
+    db.insert_agent(parent_id=None, session_id="s1", task_name="t",
+                    cli="atomcode", model=None, cwd=str(tmp_path))
+    db.set_status(1, "running", pid=123)
+    state_path = tmp_path / "w.json"
+    state_path.write_text(json.dumps({"status": "running"}))
+    out_path = tmp_path / "w.out.log"
+    err_path = tmp_path / "w.err.log"
+    out_path.write_text("", encoding="utf-8")
+    err_path.write_text("", encoding="utf-8")
+    d._workers[1] = {"worker_pid": 123, "state_path": str(state_path),
+                     "out_path": str(out_path), "err_path": str(err_path)}
+    err_path.write_text("[thinking] first pass\n", encoding="utf-8")
+    d._tail_progress(1)
+    assert "first pass" in "".join(listener["buffer"])
+    # 模拟外部截断：文件变小（size < 已 tail offset）
+    err_path.write_text("", encoding="utf-8")
+    out_path.write_text("", encoding="utf-8")
+    d._tail_progress(1)  # 不抛错，offset 重置
+    err_path.write_text("[thinking] after truncation\n", encoding="utf-8")
+    d._tail_progress(1)
+    assert "after truncation" in "".join(listener["buffer"])  # 心跳/delta 恢复

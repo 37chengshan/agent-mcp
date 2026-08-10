@@ -25,7 +25,8 @@ def test_launcher_default_state_dir_falls_back_to_codex_home_dir(monkeypatch):
     assert start_agent_mcp.default_state_dir() == Path.home() / ".codex" / "agent-mcp"
 
 
-def test_launcher_open_does_not_print_write_token(monkeypatch, tmp_path, capsys):
+def test_launcher_open_skips_browser_when_already_running(monkeypatch, tmp_path, capsys):
+    """Daemon already running + --open → 不打开浏览器，token 通过 URL fragment 传递。"""
     token = "sensitive-write-token"
     opened = []
     monkeypatch.setattr(start_agent_mcp, "start_daemon", lambda *_args: False)
@@ -48,8 +49,40 @@ def test_launcher_open_does_not_print_write_token(monkeypatch, tmp_path, capsys)
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
         "status": "already_running",
+        "url": "http://127.0.0.1:9876/#token=sensitive-write-token",
+        "write_auth": "url_fragment",
+    }
+    assert token in json.dumps(payload)  # token in URL fragment, not in browser
+    assert len(opened) == 0  # browser was NOT opened
+
+
+def test_launcher_open_opens_browser_when_started(monkeypatch, tmp_path, capsys):
+    """Daemon freshly started + --open → 打开浏览器，token 不打印到 stdout。"""
+    token = "sensitive-write-token"
+    opened = []
+    monkeypatch.setattr(start_agent_mcp, "start_daemon", lambda *_args: True)
+    monkeypatch.setattr(start_agent_mcp, "read_token", lambda _state_dir: token)
+    monkeypatch.setattr(start_agent_mcp, "is_healthy", lambda *_args: True)
+    monkeypatch.setattr(
+        start_agent_mcp.subprocess,
+        "Popen",
+        lambda command, **_kwargs: opened.append(command),
+    )
+
+    assert start_agent_mcp.main([
+        "--state-dir",
+        str(tmp_path),
+        "--port",
+        "9876",
+        "--open",
+    ]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": "started",
         "url": "http://127.0.0.1:9876/",
         "write_auth": "opened_in_browser",
     }
     assert token not in json.dumps(payload)
+    assert len(opened) == 1
     assert token in opened[0][-1]

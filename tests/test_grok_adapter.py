@@ -84,7 +84,9 @@ def test_grok_parse_tolerates_malformed_lines():
     a = get_adapter("grok")
     lines = ["", "not-json{", '["a"]', "null", '{"type":"assistant","message":']
     events, usage = a.parse_stream(lines)
-    assert events == [] and usage == {}
+    assert events == []  # 无事件
+    # 畸形/空输入不产生伪 usage：与 claude 同语义返回 {}（daemon `if usage:` 跳过）
+    assert usage == {}
 
 def test_unknown_cli_rejected():
     with pytest.raises(ValueError):

@@ -107,7 +107,8 @@ def test_atomcode_verbose_usage_is_parsed_without_polluting_message():
     ])
     assert events == [{"type": "agent.message", "payload": {"text": "最终回答"}},
                       {"type": "agent.usage", "payload": usage}]
-    assert usage == {"input_tokens": 16573, "output_tokens": 2,
+    # cached 修后 input_tokens 含 cached（16573+6144=22717），cache_read 仍 6144
+    assert usage == {"input_tokens": 22717, "output_tokens": 2,
                      "cache_creation": 0, "cache_read": 6144, "cost_usd": 0.0}
 
 

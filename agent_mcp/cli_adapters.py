@@ -89,6 +89,7 @@ class ClaudeAdapter(BaseAdapter):
                     events.append({"type": "agent.terminated",
                                    "payload": {"stop_reason": res.get("stop_reason", "end_turn"),
                                                "session_id": sid}})
+        usage = _normalize_usage(usage)  # P6: 统一口径
         return events, usage
 
 
@@ -149,6 +150,7 @@ class GrokAdapter(ClaudeAdapter):
                     events.append({"type": "agent.terminated",
                                    "payload": {"stop_reason": res.get("stop_reason", "end_turn"),
                                                "session_id": sid}})
+        usage = _normalize_usage(usage)  # P6: 统一口径
         return events, usage
     def extract_session_id(self, raw: dict) -> str | None:
         # system init / assistant / result 行均带顶层 session_id（实测）
@@ -177,9 +179,13 @@ class OpencodeAdapter(ClaudeAdapter):
     def parse_stream(self, lines) -> tuple[list[dict], dict]:
         # opencode run --format json 实测（1.14.51）：事件仅
         # step_start/text/tool_use/step_finish；usage 在 step_finish.part.tokens。
-        # 无 agent.terminated 为有意设计，终止判定由 dispatch 层 exit code 兜底
+        # 无 agent.terminated 为有意设计，终止判定由 dispatch 层 exit code 兜底；
+        # 但为让 daemon 回填 cli_session_id（resume 用），从事件顶层 sessionID
+        # 收集会话 id，在末尾产出一条仅带 session_id 的 terminated（daemon
+        # _ingest_output 只回填不落库不广播，不影响状态机）。
         events: list[dict] = []
         usage: dict[str, Any] = {}
+        session_id: str | None = None
         for line in lines:
             line = line.strip()
             if not line:
@@ -190,6 +196,9 @@ class OpencodeAdapter(ClaudeAdapter):
                 continue
             if not isinstance(raw, dict):
                 continue
+            sid = raw.get("sessionID")
+            if isinstance(sid, str) and sid and session_id is None:
+                session_id = sid
             typ = raw.get("type")
             part = raw.get("part") if isinstance(raw.get("part"), dict) else {}
             if typ == "text":
@@ -215,6 +224,10 @@ class OpencodeAdapter(ClaudeAdapter):
                     "cost_usd": _num(part.get("cost")),
                 })
                 events.append({"type": "agent.usage", "payload": dict(usage)})
+        if session_id:
+            events.append({"type": "agent.terminated",
+                           "payload": {"session_id": session_id}})
+        usage = _normalize_usage(usage)  # P6: 统一口径
         return events, usage
     def extract_session_id(self, raw: dict) -> str | None:
         # 实测：所有事件带顶层 sessionID（camelCase）
@@ -296,6 +309,7 @@ class OmpAdapter(ClaudeAdapter):
                 events.append({"type": "agent.terminated",
                                "payload": {"stop_reason": stop,
                                            "session_id": session_id}})
+        usage = _normalize_usage(usage)  # P6: 统一口径
         return events, usage
     def extract_session_id(self, raw: dict) -> str | None:
         # 实测：session 事件顶层 id
@@ -340,7 +354,8 @@ class AtomCodeAdapter(BaseAdapter):
                 r"\[tokens\]\s+prompt=(\d+)\s+completion=(\d+)\s+cached=(\d+)",
                 line.strip())
             if match:
-                usage = {"input_tokens": int(match.group(1)),
+                # cached 应计入 cache_read 且加进 input_tokens（原实现漏算 input）
+                usage = {"input_tokens": int(match.group(1)) + int(match.group(3)),
                          "output_tokens": int(match.group(2)),
                          "cache_creation": 0, "cache_read": int(match.group(3)),
                          "cost_usd": 0.0}
@@ -353,6 +368,7 @@ class AtomCodeAdapter(BaseAdapter):
         if text:
             events.append({"type": "agent.message", "payload": {"text": text}})
         if usage:
+            usage = _normalize_usage(usage)
             events.append({"type": "agent.usage", "payload": dict(usage)})
         return events, usage
 
@@ -394,9 +410,44 @@ def _assistant_event(events, usage, seen_ids, msg) -> dict:
 
 
 def _merge_usage(base: dict, add: dict) -> dict:
+    """累加所有 usage 字段（含 cache_creation/cache_read/cost_usd）。
+    各 adapter 私有解析不动，归一化由 _normalize_usage 在返回前统一字段名。"""
     out = dict(base)
     for k, v in add.items():
         out[k] = out.get(k, 0) + _num(v)
+    return out
+
+
+def _normalize_usage(raw: dict) -> dict:
+    """归一化各 adapter 私有 usage 字段名到统一 5 元组：
+    {input_tokens, output_tokens, cache_creation, cache_read, cost_usd}。
+    额外保留 reasoning_tokens（omp/grok 有，claude 无）——下游可选用，不丢数据。
+    空输入保持 {}（畸形/无用量行不产生伪 0 元组，与既有语义一致）。
+
+    各 adapter 私有解析不动，只在此层做字段名映射 + AtomCode cached 漏算修正
+    （cached 应计入 cache_read 并加进 input_tokens，原实现只塞 cache_read 不算 input）。
+    """
+    if not raw:
+        return {}
+    out = {
+        "input_tokens": _num(raw.get("input_tokens")),
+        "output_tokens": _num(raw.get("output_tokens")),
+        "cache_creation": _num(raw.get("cache_creation")),
+        "cache_read": _num(raw.get("cache_read")),
+        "cost_usd": float(raw.get("cost_usd") or 0),
+    }
+    # reasoning_tokens 透传（omp camelCase、opencode reasoning、grok/claude 无此字段）
+    rt = raw.get("reasoning_tokens")
+    if rt is not None:
+        out["reasoning_tokens"] = _num(rt)
+    elif raw.get("reasoningTokens") is not None:
+        out["reasoning_tokens"] = _num(raw.get("reasoningTokens"))
+    elif raw.get("reasoning") is not None:
+        out["reasoning_tokens"] = _num(raw.get("reasoning"))
+    # omp camelCase 兜底
+    for src, dst in (("cacheRead", "cache_read"), ("cacheWrite", "cache_creation")):
+        if raw.get(src) is not None:
+            out[dst] = _num(raw.get(src))
     return out
 
 

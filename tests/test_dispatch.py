@@ -10,17 +10,18 @@ from agent_mcp.dispatch import (SlotScheduler, build_worker_command,
                                 spawn_cli_worker, spawn_detached)
 
 def test_slot_scheduler_fifo():
-    s = SlotScheduler(max_concurrent=2)
-    assert s.acquire("a") and s.acquire("b")
-    assert not s.acquire("c")  # 满，入队
+    # 分池后默认 read_pool_max=6/write_pool_max=2；用小池测 FIFO
+    s = SlotScheduler(read_pool_max=1, write_pool_max=1)
+    assert s.acquire("a") and s.acquire("b", is_write=True)
+    assert not s.acquire("c")  # 读池满，入队
     assert s.queued() == ["c"]
-    assert s.release("a") == "c"  # 释放时 FIFO 自动补位
+    assert s.release("a") == "c"  # 释放读槽时 FIFO 自动补位
     assert s.acquire("c") is False  # 已被补位激活，不可重复入队
     s.release("b")
-    assert s.acquire("d")  # 有空位后可入
+    assert s.acquire("d", is_write=True)  # 写槽空后可入
 
 def test_slot_scheduler_release_promotes_queued():
-    s = SlotScheduler(max_concurrent=1)
+    s = SlotScheduler(read_pool_max=1, write_pool_max=1)
     assert s.acquire("a")
     assert not s.acquire("b")  # 入队
     nxt = s.release("a")
@@ -87,6 +88,33 @@ def test_worker_command_includes_timeout_seconds(tmp_path):
                                timeout_seconds=60)
     assert cmd[-2] == "60"  # timeout 在 command json 之前（json 保持末位）
     assert json.loads(cmd[-1]) == ["claude", "-p", "hi"]
+
+def test_build_worker_command_appends_env_without_changing_legacy_shape(tmp_path):
+    command = ["claude", "-p", "hi"]
+    legacy = build_worker_command(state_path=tmp_path / "s.json",
+                                  out_path=tmp_path / "o.log",
+                                  err_path=tmp_path / "e.log",
+                                  cwd=str(tmp_path), cli_command=command,
+                                  timeout_seconds=60)
+    assert json.loads(legacy[-1]) == command
+    with_env = build_worker_command(state_path=tmp_path / "s.json",
+                                    out_path=tmp_path / "o.log",
+                                    err_path=tmp_path / "e.log",
+                                    cwd=str(tmp_path), cli_command=command,
+                                    timeout_seconds=60, env={"A": "1"})
+    assert json.loads(with_env[-2]) == command
+    assert json.loads(with_env[-1]) == {"A": "1"}
+
+
+def test_dispatch_worker_passes_env_to_cli(tmp_path):
+    import dispatch_worker
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"status": "starting"}))
+    command = [sys.executable, "-c", "import os; print(os.environ['A'])"]
+    rc = dispatch_worker.dispatch_worker(state, tmp_path / "o.log", tmp_path / "e.log",
+                                         command, tmp_path, env={"A": "1"})
+    assert rc == 0
+    assert (tmp_path / "o.log").read_text().strip() == "1"
 
 
 def test_dispatch_worker_timeout_terminates_tree(tmp_path):

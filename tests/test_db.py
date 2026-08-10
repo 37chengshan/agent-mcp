@@ -64,7 +64,8 @@ def test_events_by_agents_per_agent_limit(tmp_path):
 
 def test_busy_timeout_pragma_set(tmp_path):
     db = DB(tmp_path / "test.db")
-    assert db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 10000
+    # F2 threading.local 后初始连接是 _init_conn；busy_timeout 应在其上设置
+    assert db._init_conn.execute("PRAGMA busy_timeout").fetchone()[0] == 10000
 
 
 def test_retention_cleanup_is_low_frequency(tmp_path):
@@ -108,3 +109,15 @@ def test_shared_connection_serializes_concurrent_reads_and_writes(tmp_path):
             future.result(timeout=10)
 
     assert db.max_seq() == 400
+
+
+def test_touch_activity_updates_updated_at_without_status(tmp_path):
+    db = DB(tmp_path / "test.db")
+    aid = db.insert_agent(parent_id=None, session_id="s1", task_name="/root",
+                          cli="claude", model="x", cwd=str(tmp_path))
+    db.set_status(aid, "running")
+    before = db.get_agent(aid)
+    db.touch_activity(aid)
+    after = db.get_agent(aid)
+    assert after["status"] == "running"  # 状态机不动
+    assert after["updated_at"] >= before["updated_at"]

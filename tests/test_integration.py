@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+import mcp_server
 from agent_mcp.cli_adapters import ClaudeAdapter
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,9 +36,9 @@ SHORT_PROMPT = "回复 OK"
 NO_CLAUDE = ClaudeAdapter().binary() is None
 NO_CLAUDE_REASON = "claude CLI not installed"
 
-MCP_TOOL_NAMES = ["spawn_agent", "send_message", "followup_task", "wait_agent",
-                  "interrupt_agent", "list_agents", "get_agent_activity",
-                  "get_token_usage"]
+MCP_TOOL_NAMES = ["spawn_agent", "send_message", "steer_agent", "followup_task",
+                  "wait_agent", "interrupt_agent", "list_agents",
+                  "get_agent_activity", "get_token_usage"]
 
 
 # ---- 工具函数 ----

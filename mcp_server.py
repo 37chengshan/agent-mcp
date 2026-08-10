@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -22,6 +23,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
+
+from agent_mcp import SESSION_MISMATCH_MARK
 
 SERVER_VERSION = "2.1.0"
 LEGACY_PROTOCOL_VERSION = "2025-03-26"
@@ -42,6 +45,10 @@ def state_dir_from_env() -> Path:
 
 STATE_DIR = state_dir_from_env()
 DAEMON_JSON = STATE_DIR / "daemon.json"
+SESSION_ID_PREFIX = STATE_DIR / "session-id"
+# 宿主注入的稳定会话标识（同对话 resume 不变）优先；缺失时按 host 持久化兜底
+_HOST_SESSION_ENV_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
+                          "CODEX_THREAD_ID", "CODEX_SESSION_ID")
 DAEMON_SCRIPT = Path(__file__).resolve().parent / "agent_mcp" / "daemon_main.py"
 _PROBE_ATTEMPTS = 10
 _PROBE_INTERVAL = 0.5
@@ -90,11 +97,32 @@ TOOLS = [
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800},
                 "parent_agent_id": {"type": "integer", "description": "父 agent（同会话）。"},
                 "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
+                "context_mode": {"type": "string", "enum": ["full", "compact", "none"],
+                                 "default": "compact",
+                                 "description": "上下文注入模式（默认 compact：压缩父摘要）。"},
+                "summary_chars": {"type": "integer", "minimum": 100, "maximum": 8000,
+                                  "default": 600,
+                                  "description": "wait_agent terminated 摘要截断字符数（默认 600）。"},
+                "return_ref": {"type": "boolean", "default": False,
+                               "description": "terminated 时是否返回 ref 引用（含 out_path，默认 false）。"},
+                "cache_ttl": {"type": "integer", "minimum": 0, "maximum": 86400,
+                              "default": 0,
+                              "description": "spawn 缓存存活秒数（0=禁用缓存，默认 0）。"},
+                "token_budget": {"type": "integer", "minimum": 0,
+                                 "default": 0,
+                                 "description": "token 预算上限（0=不限，默认 0）。"},
+                "verify_command": {"type": "string",
+                                   "description": "完成后验证命令（空=不验证，默认空）。"},
+                "max_fix_attempts": {"type": "integer", "minimum": 0, "maximum": 10,
+                                     "default": 0,
+                                     "description": "验证失败后自动修复尝试次数（默认 0=不修）。"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"},
+                        "description": "注入 CLI 子进程的环境变量（merge 到现有环境，同名覆盖）。"},
             },
             "required": ["target_cli", "prompt", "cwd"],
             "additionalProperties": False,
         },
-        "annotations": {"destructiveHint": True},
+        "annotations": {"destructiveHint": False},
     },
     {
         "name": "send_message",
@@ -138,6 +166,8 @@ TOOLS = [
                 "prompt": {"type": "string", "description": "新任务提示词。"},
                 "interrupt": {"type": "boolean", "default": False,
                               "description": "先终止运行中的 agent 再重派。"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"},
+                        "description": "注入 CLI 子进程的环境变量（merge 到现有环境，同名覆盖）。"},
             },
             "required": ["agent_id", "prompt"],
             "additionalProperties": False,
@@ -145,16 +175,24 @@ TOOLS = [
     },
     {
         "name": "wait_agent",
-        "description": "短阻塞等待 agent 进入终止态（terminated/error/cancelled/incomplete），"
-                       f"timeout 可自定义（上限 {MAX_WAIT_SECONDS:.0f} 秒）。terminated 返回最新输出摘要（截断）；"
-                       "error 返回错误信息；超时返回当前状态 + hint 轮询指引。",
+        "description": "单次短阻塞等待 agent 进入终止态（terminated/error/cancelled/incomplete），"
+                       f"默认等待 25 秒（不超过 MCP 客户端 ~30s 截断上限）；timeout 上限 {MAX_WAIT_SECONDS:.0f} 秒。"
+                       "terminated 返回最新输出摘要（截断）；error 返回错误信息；"
+                       "超时返回当前状态 + 存活证据 hint。"
+                       "agent 未完成时**循环调用本工具**（每次 timeout 25s）直到终止，"
+                       "不要调用 list_agents/get_agent_activity 轮询。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent_id": {"type": "integer", "description": "spawn_agent 返回的 agent_id。"},
                 "timeout": {"type": "integer", "minimum": 1,
-                            "maximum": int(MAX_WAIT_SECONDS), "default": 30,
-                            "description": f"阻塞秒数（≤{MAX_WAIT_SECONDS:.0f}，默认 30）。"},
+                            "maximum": int(MAX_WAIT_SECONDS), "default": 25,
+                            "description": f"单次阻塞秒数（默认 25，≤{MAX_WAIT_SECONDS:.0f}）。"},
+                "summary_chars": {"type": "integer", "minimum": 100, "maximum": 8000,
+                                  "default": 600,
+                                  "description": "terminated 摘要截断字符数（默认 600）。"},
+                "return_ref": {"type": "boolean", "default": False,
+                               "description": "terminated 时是否返回 ref 引用（默认 false）。"},
             },
             "required": ["agent_id"],
             "additionalProperties": False,
@@ -176,11 +214,16 @@ TOOLS = [
     {
         "name": "list_agents",
         "description": "列出 agent 树：id/parent_id/task_name/cli/model/status/stop_reason/updated_at。"
-                       "缺省返回当前宿主会话。",
+                       "缺省返回当前宿主会话；include_other_sessions=true 时列出所有会话的 agent"
+                       "（宿主 MCP 连接重启后找回旧 agent 状态用）。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "会话过滤；缺省当前会话。"},
+                "include_other_sessions": {"type": "boolean", "default": False,
+                                           "description": "列出所有会话的 agent（含旧会话）。"},
+                "fields": {"type": "string", "enum": ["default", "all"], "default": "default",
+                           "description": "返回字段裁剪（default=轻量四字段，all=全量）。"},
             },
             "additionalProperties": False,
         },
@@ -196,6 +239,8 @@ TOOLS = [
                 "agent_id": {"type": "integer"},
                 "since_seq": {"type": "integer", "minimum": 0, "default": 0,
                               "description": "只返回 seq 更大的事件。"},
+                "include": {"type": "string", "enum": ["default", "verbose"], "default": "default",
+                            "description": "default=压缩已消费 payload，verbose=返全量。"},
             },
             "required": ["agent_id"],
             "additionalProperties": False,
@@ -216,12 +261,117 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True},
     },
+    {
+        "name": "estimate_complexity",
+        "title": "Estimate task complexity",
+        "description": "复杂度分级门（本地直算，零 token，不 spawn）：把任务判为 S/M/L 三级并给理由。"
+                       "S（单文件/≤2 处/无并行价值）→ 主 agent 直接做不派发；"
+                       "M（跨 2-3 文件、顺序依赖）→ 至多 1 个子任务；"
+                       "L（>3 文件/可并行/需专精角色/上下文超窗）→ 走完整编排。"
+                       "依据：文件数 + 文本信号（并行/重构/架构/安全/迁移等关键词 + 强依赖特征）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "任务描述（一句话目标或完整需求）。"},
+                "files": {"type": "array", "items": {"type": "string"},
+                          "description": "预计涉及的文件路径清单；缺省时从 task 文本提取文件特征。"},
+            },
+            "required": ["task"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
 ]
 
 
 def send(message: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+
+
+# ---- 本地直算工具（零 token、不走 daemon、不 spawn）----
+
+# 复杂度分级信号（与 skill/SKILL.md 第零步分级门同口径）
+_L_COMPLEXITY_HINTS = ("并行", "parallel", "重构", "refactor", "架构", "architect",
+                       "安全审查", "security review", "迁移", "migrat", "全库",
+                       "跨模块", "多文件", "audit")
+_S_COMPLEXITY_HINTS = ("快速问答", "小改", "一行", "quick fix", "简单修复", "单文件",
+                       "微调", "tweak")
+_FILE_RE = re.compile(r"(?:^|[\s,，、/])([\w./\\-]+\.(?:py|ts|js|go|rs|java|md|json))")
+_L_HINT_RE = re.compile("|".join(map(re.escape, _L_COMPLEXITY_HINTS)), re.IGNORECASE)
+_S_HINT_RE = re.compile("|".join(map(re.escape, _S_COMPLEXITY_HINTS)), re.IGNORECASE)
+
+
+def _estimate_complexity(arguments: dict[str, Any]) -> dict[str, Any]:
+    """复杂度分级门：把任务判为 S/M/L 并给理由与建议。
+
+    判据（确定性，不调 LLM）：
+    - 显式 files 数量 >3 → L；2–3 个 → M；≤1 个 → 看文本信号
+    - 文本信号：L 关键词（并行/重构/架构/安全/迁移/全库…）→ L；
+      S 关键词（快速问答/小改/一行/单文件…）→ S；
+      文件路径特征计数兜底
+    """
+    task = str(arguments.get("task") or "").strip()
+    raw_files = arguments.get("files")
+    files: list[str] = []
+    if isinstance(raw_files, list):
+        files = [str(f) for f in raw_files if str(f).strip()]
+    elif isinstance(raw_files, str):
+        files = [f.strip() for f in raw_files.replace("，", ",").split(",") if f.strip()]
+
+    signals: list[str] = []
+    n_files = len(files)
+    if n_files > 3:
+        signals.append(f"显式文件数 {n_files} > 3（跨文件改动）")
+    elif n_files >= 2:
+        signals.append(f"显式文件数 {n_files}（2–3 个，中等规模）")
+    elif n_files == 1:
+        signals.append("单文件改动")
+
+    if not signals:
+        # 无显式 files：从任务文本提取文件路径特征兜底
+        text_files = sorted(set(_FILE_RE.findall(task)))
+        n_files = max(n_files, len(text_files))
+        if text_files:
+            signals.append(f"文本提到 {len(text_files)} 个文件路径特征")
+
+    l_hits = sorted(set(_L_HINT_RE.findall(task)))
+    s_hits = sorted(set(_S_HINT_RE.findall(task)))
+    if l_hits:
+        signals.append(f"L 信号: {'/'.join(l_hits)}")
+    if s_hits:
+        signals.append(f"S 信号: {'/'.join(s_hits)}")
+
+    if n_files > 3 or l_hits:
+        level = "L"
+        suggestion = ("走完整编排五步：可并行分支/需专精角色（架构、安全审查）/上下文超窗时才拆；"
+                      "否则按依赖串行，避免为拆而拆")
+        delegate = n_files > 3 or any(k in l_hits for k in ("并行", "parallel", "audit", "安全审查"))
+    elif n_files <= 1 and (s_hits or not l_hits):
+        level = "S"
+        suggestion = "主 agent 直接做，不 spawn（子代理启动/简报/汇合开销 > 实现收益）"
+        delegate = False
+    else:
+        level = "M"
+        suggestion = ("至多拆 1 个子任务（读密集探索可拆，写密集尽量自做）；"
+                      "需要同一心智模型的步骤合并，不硬拆")
+        delegate = n_files >= 2
+
+    rationale = "；".join(signals) if signals else "无显著信号（按最小路径处理）"
+    return {
+        "level": level,
+        "rationale": rationale,
+        "signals": signals,
+        "files": files,
+        "delegate": delegate,
+        "suggestion": suggestion,
+    }
+
+
+# 本地工具注册表：name → (实现, 是否常驻保留)
+_LOCAL_TOOLS: dict[str, Any] = {
+    "estimate_complexity": _estimate_complexity,
+}
 
 
 def result(request_id: Any, payload: dict[str, Any], *, is_error: bool = False,
@@ -254,6 +404,38 @@ def _request_protocol(request: dict[str, Any]) -> str | None:
 def _modern_meta() -> dict[str, Any]:
     return {"io.modelcontextprotocol/serverInfo": {
         "name": "agent-mcp", "version": SERVER_VERSION}}
+
+
+# D5 静态裁剪保留集：永不下裁的通用工具，主 agent 任何场景都可能用
+_TOOL_PRUNE_KEEP = {"spawn_agent", "wait_agent", "interrupt_agent", "estimate_complexity"}
+
+
+def _pruned_tools(request: dict[str, Any]) -> list[dict[str, Any]]:
+    """按 modern client capability 静态裁 tools/list：保留通用三件 + client 声明用过的。
+    不建表不记历史，纯按 handshake capability 决定，省主 agent 每回合 schema overhead。"""
+    params = request.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    caps = (meta.get("io.modelcontextprotocol/clientCapabilities")
+            if isinstance(meta, dict) else None)
+    exts = caps.get("extensions") if isinstance(caps, dict) else None
+    # client 声明用过的工具名（custom capability extension 约定）
+    declared = set()
+    if isinstance(exts, dict):
+        for key in ("io.modelcontextprotocol/agent-mcp.tools",
+                    "io.modelcontextprotocol/tools"):
+            v = exts.get(key)
+            if isinstance(v, dict):
+                names = v.get("used") or v.get("names")
+                if isinstance(names, list):
+                    declared.update(str(n) for n in names)
+    kept = []
+    for tool in TOOLS:
+        name = tool.get("name")
+        if name in _TOOL_PRUNE_KEEP or name in declared:
+            kept.append(tool)
+    # 兜底也只返通用三件（spawn/wait/interrupt），不返全量 TOOLS，
+    # 省 legacy/未声明 client 每回合 schema overhead
+    return kept or [t for t in TOOLS if t.get("name") in _TOOL_PRUNE_KEEP]
 
 
 def _modern_discover() -> dict[str, Any]:
@@ -456,11 +638,71 @@ def ensure_daemon() -> tuple[str, str]:
                            f"{_PROBE_ATTEMPTS * _PROBE_INTERVAL:.0f}s")
 
 
+def _host_session_key() -> str | None:
+    """宿主注入的稳定会话标识（claude/codex resume 时保持同一值）；无则 None。"""
+    for var in _HOST_SESSION_ENV_VARS:
+        value = os.environ.get(var)
+        if value:
+            return value
+    return None
+
+
+def _session_id_file() -> Path:
+    """按 host 分文件的持久化 session 文件（session-id-<host>）：不同宿主互不共享。"""
+    return Path(f"{SESSION_ID_PREFIX}-{_HOST}")
+
+
+def _persisted_session_key() -> str:
+    """无宿主标识时按 host 持久化兜底：同一 host 的 MCP 进程共享同一 session id（重启不变）。"""
+    path = _session_id_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        value = path.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    value = uuid.uuid4().hex
+    path.write_text(value, encoding="utf-8")
+    return value
+
+
 def _session_id() -> str:
     global _SESSION_ID
     if _SESSION_ID is None:
-        _SESSION_ID = f"{_HOST}-{uuid.uuid4().hex}"
+        key = _host_session_key() or _persisted_session_key()
+        _SESSION_ID = f"{_HOST}-{key}"
     return _SESSION_ID
+
+
+def _http_error_payload(code: int, detail: str) -> dict[str, Any]:
+    """daemon 的 HTTP 错误 → 结构化错误；session 不匹配给出可执行指引，
+    避免宿主拿到通用 hint 后无路可走（echo 空转）。
+    P5: error_type 字段映射，便主 agent 自动化错误分流。"""
+    hint = detail
+    try:
+        hint = json.loads(detail).get("error") or detail
+    except json.JSONDecodeError:
+        pass
+    # P5: error_type 映射
+    error_type = "daemon_error"
+    next_actions = ["check the arguments and the daemon log"]
+    if SESSION_MISMATCH_MARK in hint:
+        error_type = "session_mismatch"
+        next_actions = ["the agent belongs to another session (host MCP connection "
+                        "restarted); do NOT reuse this agent_id — spawn a NEW agent "
+                        "in the current session and pass the prior context in the prompt"]
+    elif "daemon unreachable" in hint or "connection refused" in hint.lower():
+        error_type = "daemon_unreachable"
+        next_actions = ["the daemon is not running or not responding; "
+                        "wait for auto-restart or manually start it "
+                        "(python agent_mcp/daemon_main.py)"]
+    elif "port" in hint.lower() and ("conflict" in hint.lower() or "in use" in hint.lower()):
+        error_type = "port_conflict"
+        next_actions = ["the daemon port is already in use; stop the conflicting "
+                        "process or remove the stale socket/port lock"]
+    return {"status": "error", "summary": f"daemon returned HTTP {code}: {hint}",
+            "error_type": error_type,
+            "root_cause_hint": detail or None,
+            "next_actions": next_actions}
 
 
 def _post_once(base: str, token: str, path: str, payload: dict[str, Any],
@@ -477,14 +719,7 @@ def _post_once(base: str, token: str, path: str, payload: dict[str, Any],
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:400]
-        hint = detail
-        try:
-            hint = json.loads(detail).get("error") or detail
-        except json.JSONDecodeError:
-            pass
-        return {"status": "error", "summary": f"daemon returned HTTP {exc.code}: {hint}",
-                "root_cause_hint": detail or None,
-                "next_actions": ["check the arguments and the daemon log"]}
+        return _http_error_payload(exc.code, detail)
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
 
@@ -529,16 +764,25 @@ def _daemon_post(path: str, payload: dict[str, Any],
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    # 本地直算工具（零 token、不 spawn、不走 daemon）：estimate_complexity 等
+    local = _LOCAL_TOOLS.get(name)
+    if local is not None:
+        return local(arguments)
     path = _DAEMON_PATHS.get(name)
     if path is None:
         raise ValueError(f"unknown tool: {name}")
     payload = dict(arguments)
-    payload.setdefault("session_id", _session_id())
+    if name == "list_agents" and payload.pop("include_other_sessions", False):
+        # 跨会话找回：session_id 置 None → daemon 返回所有会话的 agent
+        payload["session_id"] = None
+    else:
+        payload.setdefault("session_id", _session_id())
     # wait_agent 阻塞时长可自定义（上限 MAX_WAIT_SECONDS）：HTTP 层超时同步叠加余量，
     # 避免 daemon 仍在等待时 MCP→daemon 请求先被 _HTTP_TIMEOUT 掐断。
     http_timeout: float | None = None
     if name == "wait_agent":
-        wait = min(max(float(payload.get("timeout") or 30), 1), MAX_WAIT_SECONDS)
+        # 默认 25s（≤ MCP 客户端 ~30s 截断上限），避免长轮询被宿主截断
+        wait = min(max(float(payload.get("timeout") or 25), 1), MAX_WAIT_SECONDS)
         http_timeout = _HTTP_TIMEOUT + wait
     return _daemon_post(path, payload, http_timeout=http_timeout)
 
@@ -565,11 +809,16 @@ def handle(request: dict[str, Any], *, emit=send) -> None:
             "capabilities": {"tools": {"listChanged": False}}},
         })
     elif method == "tools/list":
-        listed: dict[str, Any] = {"tools": TOOLS}
+        # legacy 时 request 无 capability meta，_pruned_tools 返三通用兜底
+        listed: dict[str, Any] = {"tools": _pruned_tools(request)}
         if modern:
             listed.update({"resultType": "complete", "ttlMs": 300_000,
                            "cacheScope": "public", "_meta": _modern_meta()})
         emit({"jsonrpc": "2.0", "id": request_id, "result": listed})
+    elif method == "notifications/progress" and request_id is None:
+        # E1 progress 到 MCP：子代理 message_delta 通过此通道推给 client spinner
+        # 请求无 id（通知），不需返响应；legacy 静默不报错
+        return
     elif method == "tools/call":
         params = request.get("params")
         if not isinstance(params, dict) or not isinstance(params.get("arguments", {}), dict):
@@ -577,7 +826,7 @@ def handle(request: dict[str, Any], *, emit=send) -> None:
             return
         name = params.get("name")
         arguments = params.get("arguments", {})
-        if name not in _DAEMON_PATHS:
+        if name not in _DAEMON_PATHS and name not in _LOCAL_TOOLS:
             emit(rpc_error(request_id, -32602, "Unknown tool"))
             return
         payload = call_tool(name, arguments)

@@ -2,17 +2,24 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
 import uuid
+import hashlib
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import psutil
 
 # 脚本直接启动（python agent_mcp/daemon_main.py 或 spawn_detached 拉起）时，
 # sys.path[0] 是脚本目录而非项目根，需手动补项目根才能 import agent_mcp 包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from agent_mcp import SESSION_MISMATCH_MARK
 from agent_mcp.cli_adapters import ResumeUnsupportedError, get_adapter
 from agent_mcp.daemon_http import DaemonHTTPServer, EventBroadcaster, HEARTBEAT_SECONDS
 from agent_mcp.db import DB
@@ -26,6 +33,46 @@ MAX_CONTEXT_CHARS = 200_000
 MAX_MESSAGE_CHARS = 20_000
 # wait_agent 单次阻塞上限：默认 600s（10 分钟），可用环境变量 AGENT_MCP_MAX_WAIT 调整
 MAX_WAIT_SECONDS = float(os.environ.get("AGENT_MCP_MAX_WAIT", "600"))
+# context_mode=compact 的截断阈值：超过此字符才 head+tail 截中间
+CONTEXT_COMPACT_THRESHOLD = 8_000
+# P7: CLI 首启耗时矩阵（秒）——spawn 返 min_expected_seconds 便主 agent 规划等待节奏
+_CLI_FIRST_START_SECONDS = {"claude": 3, "grok": 120, "omp": 5, "atomcode": 8}
+# 子代理"完成前自审"提醒：spawn 首次追加全文；followup 不重复全文，改追加短标记
+SELF_CHECK_REMINDER = (
+    "\n\n[完成前自审] 回传 FINAL_ANSWER 前必须自证目标达成："
+    "核对产出是否真实可验证（测试输出/文件/自查结果）；"
+    "未达成不得报完成，回传 BLOCKED 并列出已尝试项。"
+)
+SELF_CHECK_FOLLOWUP_TAG = "\n（续，自审同前）"
+
+# token_budget 超额自动降档映射（claude/grok/omp/atomcode 各降一档，不连降）
+MODEL_DOWNGRADE = {
+    "claude-opus-4-6": "claude-sonnet-4-6",
+    "claude-sonnet-4-6": "claude-haiku-4-5",
+    "grok-4.5": "grok-luna",
+    "grok-luna": "grok-terra",
+    "deepseek-v4-pro": "deepseek-v4-flash",
+}
+# verify_command 失败回投的固定指令（修根因，不删测试/弱化断言）
+VERIFY_FIX_INSTRUCTION = (
+    "\n\n[verify failed] 上面是验证命令的失败输出。"
+    "修根因而非删测试或弱化断言；保留 reproduce 路径。"
+)
+
+
+def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[bool, str]:
+    """daemon 自跑 verify_command，返回 (ok, output)。超时计失败。"""
+    try:
+        proc = subprocess.run(verify_command, shell=True, cwd=cwd,
+                              capture_output=True, text=True, timeout=timeout)
+        output = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode == 0, output
+    except subprocess.TimeoutExpired as exc:
+        out = (exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout or "") \
+            + (exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr or "")
+        return False, f"[verify timed out after {timeout}s]\n{out}"
+    except Exception as exc:
+        return False, f"[verify run error: {exc}]"
 
 
 def default_state_dir() -> Path:
@@ -77,6 +124,18 @@ def _tail(path: Path | str, limit: int = 800) -> str:
         return ""
 
 
+def _progress_lines(text: str, limit: int = 600) -> str:
+    """从增量文本提取可读进度行：跳过 JSON 事件行（claude/omp stream），
+    保留 atomcode 的 [thinking]/[tool→] 等文本行；截断防广播膨胀。"""
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("{"):
+            continue
+        out.append(s)
+    return "\n".join(out)[-limit:]
+
+
 def _merge_pending(prompt: str, pending: list[dict]) -> str:
     """followup：把挂起的 user 消息合并进新 prompt（daemon 消息队列语义）。"""
     lines = [f"<user message {i + 1}>: {m['content']}"
@@ -98,6 +157,119 @@ def _coerce_timeout_seconds(value: Any) -> float | None:
     return timeout
 
 
+def _compact_context(context: str, mode: str) -> str:
+    """按 context_mode 压缩 context，裁子代理 prompt 体积。
+
+    full=不压；compact=超阈值 head+tail 截中间放 marker；tail=只保留末尾。
+    """
+    if not context or mode == "full":
+        return context
+    if mode == "tail":
+        return context[-CONTEXT_COMPACT_THRESHOLD:]
+    # compact（默认）
+    if len(context) <= CONTEXT_COMPACT_THRESHOLD:
+        return context
+    head = context[:CONTEXT_COMPACT_THRESHOLD // 2]
+    tail = context[-CONTEXT_COMPACT_THRESHOLD // 2:]
+    return f"{head}\n\n[... context compacted: {len(context)} chars total ...]\n\n{tail}"
+
+
+def _estimate_tokens(text: str) -> int:
+    """粗估 token 数（chars/4，近似英文 token 化）。"""
+    return len(text) // 4
+
+
+def _spawn_cache_key(body: dict, prompt: str) -> str:
+    """hash(prompt+cwd+model+target_cli+context_mode) 作缓存键。
+    timeout/role_path 等不影响结果的不进键。"""
+    raw = "|".join([
+        body.get("target_cli") or "",
+        body.get("cwd") or "",
+        body.get("model") or "",
+        body.get("context_mode") or "compact",
+        prompt,
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _extract_final_answer(out_text: str, summary_chars: int = 600) -> str:
+    """从 worker stdout 提 FINAL_ANSWER: 后摘要并按 summary_chars 裁剪。
+
+    找不到标记 → 回退 _tail(out_text) 末尾截断；主 agent 拿到的是摘要不是末尾。
+    """
+    marker = "FINAL_ANSWER:"
+    pos = out_text.rfind(marker)
+    if pos >= 0:
+        snippet = out_text[pos + len(marker):].strip()
+        # 截到下一个 BLOCKED/NEEDS_CONTEXT 标记或文末
+        for end_marker in ("\nBLOCKED:", "\nNEEDS_CONTEXT:", "\nNEEDS_DECISION:"):
+            epos = snippet.find(end_marker)
+            if epos >= 0:
+                snippet = snippet[:epos].strip()
+                break
+        return snippet[:summary_chars]
+    return out_text[-summary_chars:]
+
+
+# 角色预设 frontmatter 解析缓存：path -> frontmatter dict
+_ROLE_FRONTmatter_CACHE: dict[str, dict] = {}
+
+
+def _load_role_frontmatter(role_path: str | None) -> dict:
+    """解析角色预设 .md 的 YAML frontmatter（name/default_cli/default_model/
+    default_permission/default_summary_chars/default_context_mode/critical_path）。
+
+    非角色预设文件（无 frontmatter 或解析失败）返回 {}，spawn 不强制。
+    frontmatter 的 default_* 仅作默认值，spawn 显式参数永远优先。
+    """
+    if not role_path:
+        return {}
+    path = Path(role_path)
+    if not path.is_file():
+        return {}
+    cached = _ROLE_FRONTmatter_CACHE.get(str(path))
+    if cached is not None:
+        return cached
+    text = path.read_text(encoding="utf-8", errors="replace")
+    fm: dict = {}
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end > 0:
+            for line in text[3:end].splitlines():
+                if ":" not in line:
+                    continue
+                k, _, v = line.partition(":")
+                k = k.strip()
+                v = v.strip()
+                if v.lower() in ("true", "false"):
+                    fm[k] = v.lower() == "true"
+                elif v.isdigit():
+                    fm[k] = int(v)
+                elif v:
+                    fm[k] = v
+    _ROLE_FRONTmatter_CACHE[str(path)] = fm
+    return fm
+
+
+def _apply_role_defaults(body: dict) -> dict:
+    """spawn body 未显式传的字段从 role frontmatter 取默认值。
+
+    critical_path=true 自动升 context_mode=full（关键路径不压缩丢信息）。
+    """
+    role_path = body.get("role_path")
+    fm = _load_role_frontmatter(role_path)
+    if not fm:
+        return body
+    for key in ("target_cli", "model", "permission_mode", "summary_chars",
+                "context_mode"):
+        fm_key = f"default_{key}" if key not in ("target_cli",) else "default_cli"
+        if body.get(key) is None and fm.get(fm_key) is not None:
+            body[key] = fm[fm_key]
+    if fm.get("critical_path") and body.get("context_mode") is None:
+        body["context_mode"] = "full"
+    return body
+
+
 class Dispatcher:
     """CLI 任务派发执行器：spawn/send_message/followup/wait/interrupt/
     list_agents/activity/usage 八操作 + 完成检测监控线程。
@@ -117,31 +289,101 @@ class Dispatcher:
         self._monitor_interval = monitor_interval
         self._workers: dict[int, dict[str, Any]] = {}   # agent_id -> spawn info
         self._pending: dict[int, tuple[str, str, str, dict]] = {}  # 排队中的 spawn 参数
+        self._offsets: dict[int, dict[str, int]] = {}  # agent_id -> {path: 已 tail 字节数}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # F1: 每个 agent_id 配一个 threading.Event；worker 终态时 set，wait 阻塞不轮询
+        self._events: dict[int, threading.Event] = {}
+        # F6: worker watcher 线程注册（proc.wait 阻塞等退出，不轮询）
+        self._watchers: dict[int, threading.Thread] = {}
+        # F4: 低频心跳线程（1s/touch_activity 更 updated_at）作存活证据源
+        self._hb_stop = threading.Event()
+        self._hb_thread: threading.Thread | None = None
 
     # ---- 生命周期 ----
 
     def start(self) -> None:
+        # D2: 启动前扫 DB 所有 running 状态的 agent，worker_pid 不存活则标 incomplete
+        self._recover_orphans()
         if self._thread is None:
             self._thread = threading.Thread(target=self._monitor, daemon=True,
                                             name="dispatcher-monitor")
             self._thread.start()
+        # F4: 启低频心跳线程（1s/touch_activity 更 updated_at）作存活证据源
+        if self._hb_thread is None:
+            self._hb_stop.clear()
+            self._hb_thread = threading.Thread(target=self._heartbeat_loop,
+                                               daemon=True,
+                                               name="dispatcher-heartbeat")
+            self._hb_thread.start()
+
+    def _recover_orphans(self) -> None:
+        """D2: 扫 DB 所有 running 状态的 agent，worker_pid 不存活（daemon 崩溃后孤儿）
+        则标 incomplete + 孤儿日志事件。"""
+        try:
+            agents = self.db.agents_by_session(None)
+        except Exception:
+            return
+        for agent in agents:
+            if agent.get("status") != "running":
+                continue
+            pid = agent.get("pid")
+            if is_pid_running(pid):
+                continue  # worker 仍活，不回收
+            agent_id = agent["id"]
+            self._set_status(agent_id, "incomplete", stop_reason="orphaned")
+            self._broadcast("agent.orphaned", {
+                "agent_id": agent_id, "worker_pid": pid,
+                "message": "daemon restarted; worker_pid no longer alive"
+            }, agent_id)
 
     def stop(self) -> None:
         self._stop.set()
+        self._hb_stop.set()
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=2)
+            self._hb_thread = None
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
 
+    def _heartbeat_loop(self) -> None:
+        """F4: 低频心跳线程——1s/touch_activity 更 updated_at，作存活证据源；
+        空闲 daemon CPU≈0（仅 sleep+轻量 UPDATE）。"""
+        while not self._hb_stop.wait(1.0):
+            with self._lock:
+                ids = list(self._workers)
+            for agent_id in ids:
+                try:
+                    self.db.touch_activity(agent_id)
+                except Exception:
+                    pass  # 心跳失败不致命，下一轮重试
+
     def _monitor(self) -> None:
+        # F6: worker 终态由 _worker_watcher（proc.wait 阜塞）驱动，不再轮询 _check_worker；
+        # monitor 仅做运行中增量 tail 进度广播（仍需周期扫新字节）。空闲时 CPU≈0。
+        # 孤儿扫兜底：watcher 葡一次就退后，若 state 被外部改到 running 且 pid 已死，
+        # watcher 已不再触发 _check_worker——monitor 周期补扫孤儿态防漏。
         while not self._stop.wait(self._monitor_interval):
             with self._lock:
                 ids = list(self._workers)
             for agent_id in ids:
                 try:
-                    self._check_worker(agent_id)
+                    self._tail_progress(agent_id)
+                    # 终态兜底：watcher 葡一次就退后，若 state 被外部改到 finished/running+pid死，
+                    # watcher 已不再触发 _check_worker——monitor 周期补扫防漏。
+                    # 幂等守卫：_check_worker 处理终态后会 pop _workers，这里取 info 后再判一次是否还在，
+                    # 避免对已终态 agent 重复触发二次补位。
+                    with self._lock:
+                        info = self._workers.get(agent_id)
+                        if info is None:
+                            continue
+                        st = _read_json(info["state_path"])
+                    if st.get("status") == "finished":
+                        self._check_worker(agent_id)
+                    elif st.get("status") == "running" and not is_pid_running(info.get("worker_pid")):
+                        self._check_worker(agent_id)
                 except Exception as exc:
                     print(f"[dispatcher] monitor error for agent {agent_id}: {exc}",
                           file=sys.stderr)
@@ -149,6 +391,7 @@ class Dispatcher:
     # ---- 八操作 ----
 
     def spawn(self, body: dict) -> dict:
+        body = _apply_role_defaults(body)
         target_cli = body.get("target_cli")
         prompt = body.get("prompt")
         cwd = body.get("cwd")
@@ -156,13 +399,27 @@ class Dispatcher:
             raise ValueError("target_cli, prompt and cwd are required")
         timeout_seconds = _coerce_timeout_seconds(body.get("timeout_seconds"))
         body = {**body, "timeout_seconds": timeout_seconds}
-        context = body.get("context") or ""
-        if len(context) > MAX_CONTEXT_CHARS:
+        context_mode = body.get("context_mode") or "compact"
+        context = _compact_context(body.get("context") or "", context_mode)
+        if len(body.get("context") or "") > MAX_CONTEXT_CHARS:
             raise ValueError(f"context exceeds {MAX_CONTEXT_CHARS} chars")
         if context:
             prompt = f"{context}\n\n{prompt}"
+        prompt += SELF_CHECK_REMINDER
         if len(prompt) > MAX_PROMPT_CHARS:
             raise ValueError(f"prompt exceeds {MAX_PROMPT_CHARS} chars")
+        # spawn 结果缓存：读密集任务相同请求在 TTL 内直接返缓存，0 token
+        cache_ttl = float(body.get("cache_ttl") or 0)
+        if cache_ttl > 0:
+            cache_key = _spawn_cache_key(body, prompt)
+            hit = self.db.spawn_cache_get(cache_key)
+            if hit is not None:
+                res = dict(hit["result"])
+                res["cached"] = True
+                res["prompt_chars"] = len(prompt)
+                res["estimated_tokens"] = _estimate_tokens(prompt)
+                res["min_expected_seconds"] = _CLI_FIRST_START_SECONDS.get(target_cli, 10)
+                return res
         agent_id = self.db.insert_agent(
             parent_id=body.get("parent_agent_id"),
             session_id=body.get("session_id") or "default",
@@ -170,17 +427,33 @@ class Dispatcher:
             cli=target_cli, model=body.get("model"), cwd=cwd,
             permission_mode=body.get("permission_mode") or "plan",
             command_summary=None)
+        # F1: 给此 agent_id 建一个 threading.Event，终态时 set 唤醒 wait
+        with self._lock:
+            self._events[agent_id] = threading.Event()
         self._broadcast("agent.spawned", {"agent_id": agent_id}, agent_id)
         self._broadcast("agent.user_turn", {"text": prompt, "kind": "spawn"}, agent_id)
         # 先写 pending 再 acquire：避免补位时 pending 未就绪导致任务永久滞留
         params = (target_cli, prompt, cwd, body)
         with self._lock:
             self._pending[agent_id] = params
-        if self._scheduler.acquire(str(agent_id)):
+        is_write = (body.get("permission_mode") or "plan") in ("acceptEdits", "fullAccess")
+        if self._scheduler.acquire(str(agent_id), is_write=is_write):
             with self._lock:
                 self._pending.pop(agent_id, None)
-            return self._run_worker(agent_id, *params)
-        return self._agent_result(agent_id, status="queued", pid=None)
+            res = self._run_worker(agent_id, *params)
+        else:
+            res = self._agent_result(agent_id, status="queued", pid=None)
+        res["prompt_chars"] = len(prompt)
+        res["estimated_tokens"] = _estimate_tokens(prompt)
+        res["min_expected_seconds"] = _CLI_FIRST_START_SECONDS.get(target_cli, 10)
+        # 完成态结果存缓存（terminated 才存，error/incomplete 不存）
+        if cache_ttl > 0 and res.get("status") == "terminated":
+            try:
+                self.db.spawn_cache_put(cache_key, agent_id, res, cache_ttl)
+            except Exception as exc:
+                print(f"[dispatcher] spawn cache put failed for agent {agent_id}: {exc}",
+                      file=sys.stderr)
+        return res
 
     def send_message(self, body: dict) -> dict:
         agent_id = self._require_id(body)
@@ -217,6 +490,7 @@ class Dispatcher:
             agent = self.db.get_agent(agent_id)
         pending_msgs = self.db.messages_for(agent_id)
         merged = _merge_pending(prompt, pending_msgs)
+        merged += SELF_CHECK_FOLLOWUP_TAG  # followup 不重复全文，追加短标记
         if len(merged) > MAX_PROMPT_CHARS:
             # 合并挂起消息后超限：在写 pending/启动前拒绝
             raise ValueError(f"prompt exceeds {MAX_PROMPT_CHARS} chars")
@@ -235,18 +509,25 @@ class Dispatcher:
             "resume": resume,
         }
         params = (agent["cli"], merged, agent["cwd"], body)
+        # L3: expected_end_seconds——按当前 run 的 timeout_seconds 推估结束时间戳
+        expected_end = (time.time() + timeout_seconds) if timeout_seconds else None
         with self._lock:
             self._pending[agent_id] = params
+        # 终态 agent 续跑：先释放旧槽位（watcher 退出时可能未清），否则 acquire 返 False 误 queued
+        self._scheduler.remove(str(agent_id))
         if self._scheduler.acquire(str(agent_id)):
             with self._lock:
                 self._pending.pop(agent_id, None)
             res = self._run_worker(agent_id, *params)
             res["merged_messages"] = len(pending_msgs)
             res["resumed_session_id"] = resume
+            if expected_end is not None:
+                res["expected_end_seconds"] = expected_end
             return res
         return self._agent_result(agent_id, status="queued", pid=None,
                                   merged_messages=len(pending_msgs),
-                                  resumed_session_id=resume)
+                                  resumed_session_id=resume,
+                                  expected_end_seconds=expected_end)
 
     def steer(self, body: dict) -> dict:
         """中断当前 run 并在同一节点立即开始下一 turn；支持的 CLI 自动 resume。"""
@@ -268,11 +549,52 @@ class Dispatcher:
         return result
 
     def wait(self, body: dict) -> dict:
-        """短阻塞轮询（默认 30s，上限 MAX_WAIT_SECONDS 可自定义）；完成后返回摘要 + 结构化结果，超时给轮询指引。"""
+        """短阻塞等待（默认 25s，上限 MAX_WAIT_SECONDS 可自定义）；完成后返回摘要 + 结构化结果，超时给存活证据。
+
+        F1: 事件驱动——阻塞在 threading.Event.wait(timeout) 不轮询；终态时 _set_status set 唤醒。
+        超时兜底仍走一次原轮询路径查 state 防漏（state 文件先于 DB 写入的窗口）。"""
         agent_id = self._require_id(body)
-        timeout = min(max(float(body.get("timeout") or 30), 0.1), MAX_WAIT_SECONDS)
+        timeout = min(max(float(body.get("timeout") or 25), 0.1), MAX_WAIT_SECONDS)
         deadline = time.monotonic() + timeout
+        summary_chars = int(body.get("summary_chars") or 600)
+        return_ref = bool(body.get("return_ref"))
+        with self._lock:
+            ev = self._events.setdefault(agent_id, threading.Event())
+        # fast-path：进入阻塞前先查一次 DB 终态——已终态 agent（无 worker/event 唤醒）
+        # 直接返回，避免 wait_agent 脚本对已完成任务白等一个 interval
+        agent = self.db.get_agent(agent_id)
+        if agent is None:
+            raise ValueError(f"agent {agent_id} not found")
+        self._require_session(body, agent)
+        if agent["status"] in _TERMINAL or agent["status"] == "needs_advisor":
+            return self._wait_result(agent, "", summary_chars=summary_chars,
+                                     return_ref=return_ref)
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # 超时兜底：走一次原轮询路径查 state 防漏（state 先于 DB 写入的窗口）
+                with self._lock:
+                    info = self._workers.get(agent_id)
+                if info and _read_json(info["state_path"]).get("status") == "finished":
+                    self._check_worker(agent_id)
+                agent = self.db.get_agent(agent_id)
+                if agent is None:
+                    raise ValueError(f"agent {agent_id} not found")
+                self._require_session(body, agent)
+                if agent["status"] in _TERMINAL:
+                    return self._wait_result(agent, "", summary_chars=summary_chars,
+                                             return_ref=return_ref)
+                # L2: 超时返 liveness 结构化字段（worker_pid_alive/log_growing/healthy）
+                liveness = self._liveness_struct(agent_id, info)
+                return self._agent_result(
+                    agent_id, status=agent["status"],
+                    hint="still running; call wait_agent again (timeout 25s) "
+                         "to keep waiting; do not poll list_agents/activity",
+                    liveness=liveness)
+            # F1: 阻塞在 Event 上不轮询；终态时 _set_status set 唤醒
+            ev.wait(timeout=remaining)
+            ev.clear()  # 清后重查，防 spurious wakeup；若有新终态会再 set
+            # 唤醒后查一次 state（state 先于 DB）+ DB 终态
             with self._lock:
                 info = self._workers.get(agent_id)
             if info and _read_json(info["state_path"]).get("status") == "finished":
@@ -282,19 +604,16 @@ class Dispatcher:
                 if agent is None:
                     raise ValueError(f"agent {agent_id} not found")
                 self._require_session(body, agent)
-                return self._wait_result(agent, summary)
+                return self._wait_result(agent, summary, summary_chars=summary_chars,
+                                         return_ref=return_ref)
             agent = self.db.get_agent(agent_id)
             if agent is None:
                 raise ValueError(f"agent {agent_id} not found")
             self._require_session(body, agent)
-            if agent["status"] in _TERMINAL:
-                return self._wait_result(agent, "")
-            if time.monotonic() >= deadline:
-                return self._agent_result(
-                    agent_id, status=agent["status"],
-                    hint="still running; poll list_agents/activity or "
-                         f"wait again (timeout <= {MAX_WAIT_SECONDS:.0f}s)")
-            time.sleep(0.2)
+            if agent["status"] in _TERMINAL or agent["status"] == "needs_advisor":
+                return self._wait_result(agent, "", summary_chars=summary_chars,
+                                         return_ref=return_ref)
+            # 非终态唤醒（spurious/中间态）→ 继续阻塞至 deadline
 
     def interrupt(self, body: dict) -> dict:
         agent_id = self._require_id(body)
@@ -322,10 +641,12 @@ class Dispatcher:
                                   stop_reason="interrupted", usage_incomplete=True)
 
     def list_agents(self, body: dict) -> dict:
+        # F3: agents_by_session 已 LEFT JOIN 返 last_message，无需逐行 messages_for
         agents = self.db.agents_by_session(body.get("session_id"))
-        for a in agents:
-            msgs = self.db.messages_for(a["id"], size=1)
-            a["last_message"] = msgs[-1]["content"] if msgs else ""
+        # P3: fields 裁剪——默认只返轻量字段，fields=all 返全量
+        if body.get("fields") != "all":
+            _KEEP = {"id", "task_name", "status", "stop_reason"}
+            agents = [{k: a[k] for k in _KEEP if k in a} for a in agents]
         return {"agents": agents}
 
     def activity(self, body: dict) -> dict:
@@ -338,7 +659,11 @@ class Dispatcher:
                 raise ValueError(f"agent {agent_id} not found")
             self._require_session(body, agent)
             session_id = agent["session_id"]
-        events = self.db.events_since(since_seq, session_id=session_id)
+        # P4: 默认压缩已消费 tool_use/result payload，include=verbose 才返全量
+        compress = body.get("include") != "verbose"
+        events = self.db.events_since(
+            since_seq, session_id=session_id,
+            compress_consumed=compress, keep_recent=5)
         if agent_id is not None:
             events = [e for e in events if e.get("agent_id") == int(agent_id)]
         return {"events": events,
@@ -366,12 +691,19 @@ class Dispatcher:
     def _run_worker(self, agent_id: int, target_cli: str, prompt: str,
                     cwd: str, body: dict) -> dict:
         try:
-            info = self._spawn_fn(
-                target_cli, prompt=prompt, cwd=cwd,
-                permission_mode=body.get("permission_mode") or "plan",
-                model=body.get("model"), max_turns=body.get("max_turns", 8),
-                resume=body.get("resume"), state_dir=self.state_dir,
-                timeout_seconds=body.get("timeout_seconds"))
+            worker_options = {
+                "prompt": prompt,
+                "cwd": cwd,
+                "permission_mode": body.get("permission_mode") or "plan",
+                "model": body.get("model"),
+                "max_turns": body.get("max_turns", 8),
+                "resume": body.get("resume"),
+                "state_dir": self.state_dir,
+                "timeout_seconds": body.get("timeout_seconds"),
+            }
+            if body.get("env") is not None:
+                worker_options["env"] = body["env"]
+            info = self._spawn_fn(target_cli, **worker_options)
         except ResumeUnsupportedError as exc:
             self._fail(agent_id, stop_reason="resume_unsupported", message=str(exc))
             return self._agent_result(agent_id, status="error", error=str(exc))
@@ -383,7 +715,42 @@ class Dispatcher:
         self._set_status(agent_id, "running", pid=info["worker_pid"])
         self._broadcast("agent.running", {"agent_id": agent_id,
                                           "pid": info["worker_pid"]}, agent_id)
+        # F6: 启 watcher 线程阻塞等 worker 进程退出（proc.wait），退出后调 _check_worker；
+        # 不再由 _monitor 轮询扫所有 worker 查 state，空闲 daemon CPU≈0。
+        t = threading.Thread(target=self._worker_watcher,
+                             args=(agent_id,), daemon=True,
+                             name=f"worker-watch-{agent_id}")
+        with self._lock:
+            self._watchers[agent_id] = t
+        t.start()
         return self._agent_result(agent_id, status="running", pid=info["worker_pid"])
+
+    def _worker_watcher(self, agent_id: int) -> None:
+        """F6: 阻塞等 worker 进程退出（psutil.Process.wait），退出后调 _check_worker。
+        proc.wait 阻塞不轮询，空闲 daemon CPU≈0%；state 文件 finished 仍由 _check_worker 检测。
+        注意：_check_worker 可能触发 followup 重 spawn 同 agent_id 的新 watcher；
+        finally 仅在自身仍是已注册 watcher 时才 pop，避免误删新 watcher。"""
+        pid = None
+        my_thread = threading.current_thread()
+        try:
+            with self._lock:
+                info = self._workers.get(agent_id)
+                pid = info.get("worker_pid") if info else None
+            if pid:
+                try:
+                    proc = psutil.Process(pid)
+                    proc.wait(timeout=None)  # 阻塞至进程退出
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass  # 进程已退出或不可访问 → 直接检查 state
+            # 进程已退出 → 检查 state 文件终态（finished/孤儿）
+            self._check_worker(agent_id)
+        except Exception as exc:
+            print(f"[dispatcher] watcher error for agent {agent_id}: {exc}",
+                  file=sys.stderr)
+        finally:
+            with self._lock:
+                if self._watchers.get(agent_id) is my_thread:
+                    self._watchers.pop(agent_id, None)
 
     def _set_status(self, agent_id: int, status: str, *, stop_reason: str | None = None,
                     pid: int | None = None, cli_session_id: str | None = None) -> None:
@@ -402,49 +769,256 @@ class Dispatcher:
                 transition(current, status)
         self.db.set_status(agent_id, status, stop_reason=stop_reason, pid=pid,
                            cli_session_id=cli_session_id)
+        # F1: 进入终态（或 needs_advisor）时 set 唤醒阻塞的 wait；followup 重启时重置 Event
+        with self._lock:
+            ev = self._events.get(agent_id)
+            if ev is not None:
+                if status in _TERMINAL or status == "needs_advisor":
+                    ev.set()
+                else:
+                    ev.clear()  # running/queued：新 run 进行中，重置供下次 wait 阻塞
 
-    def _fail(self, agent_id: int, *, stop_reason: str, message: str) -> None:
+    def _fail(self, agent_id: int, *, stop_reason: str, message: str,
+              error_type: str | None = None, hint: str | None = None) -> None:
         self._release_and_promote(str(agent_id))
         self._set_status(agent_id, "error", stop_reason=stop_reason)
-        self._broadcast("agent.error", {"agent_id": agent_id,
-                                        "stop_reason": stop_reason,
-                                        "message": message}, agent_id)
+        payload = {"agent_id": agent_id, "stop_reason": stop_reason,
+                   "message": message}
+        if error_type:
+            payload["error_type"] = error_type
+        if hint:
+            payload["hint"] = hint
+        self._broadcast("agent.error", payload, agent_id)
 
     def _check_worker(self, agent_id: int) -> None:
-        """state 文件 finished → 状态迁移 + 广播 + 槽位释放补位。幂等（pop 保护）。"""
+        """state 文件 finished → 状态迁移 + 广播 + 槽位释放补位。幂等（pop 保护）。
+        孤儿检测：state 已写 running 且 worker 进程已死 → _fail worker_died。"""
+        orphan_info: dict | None = None
+        finished = False
         with self._lock:
             info = self._workers.get(agent_id)
             if info is None:
                 return
             state = _read_json(info["state_path"])
-            if state.get("status") != "finished":
-                return
-            self._workers.pop(agent_id, None)
-            rc = state.get("process_status", 0)
-            timed_out = bool(state.get("timed_out"))
-            summary = _tail(info["out_path"])
+            if state.get("status") == "finished":
+                self._workers.pop(agent_id, None)
+                self._offsets.pop(agent_id, None)
+                rc = state.get("process_status", 0)
+                timed_out = bool(state.get("timed_out"))
+                summary = _tail(info["out_path"])
+                finished = True
+            elif state.get("status") == "running" and not is_pid_running(info.get("worker_pid")):
+                # 孤儿检测：仅当 worker 已确认进入 running 态（state 写 running）
+                # 却进程已死（崩溃/被外部 kill）才判孤儿；starting/空 state 不判，
+                # 避免 worker 启动窗口与 fake-worker 测试误杀
+                self._workers.pop(agent_id, None)
+                self._offsets.pop(agent_id, None)
+                orphan_info = info
+        if orphan_info is not None:
+            self._fail(agent_id, stop_reason="worker_died",
+                       message=f"worker pid {orphan_info.get('worker_pid')} "
+                               f"died without finishing",
+                       error_type="worker_died",
+                       hint="respawn the agent with context from the last run; "
+                            "check out/err logs for the crash reason")
+            self._maybe_chain(agent_id)  # 排队中的 followup 仍须串联，勿静默丢弃
+            return
+        if not finished:
+            return
         agent = self.db.get_agent(agent_id)
         if agent is not None:
             self._ingest_output(agent_id, agent["cli"], info["out_path"],
                                 agent["session_id"])
+        # C4 verify_command 内嵌：完成态后 daemon 自跑 verify，失败 resume/重 spawn 带失败输出回投
+        body = info.get("body") or {}
+        verify_command = body.get("verify_command")
+        max_fix_attempts = int(body.get("max_fix_attempts") or 0)
+        attempts_used = int(info.get("verify_attempts", 0))
+        if verify_command and rc == 0 and attempts_used < max_fix_attempts:
+            verify_cwd = agent["cwd"] if agent else (body.get("cwd") or "")
+            ok, vout = _run_verify(verify_command, verify_cwd,
+                                   timeout=float(body.get("verify_timeout_sec") or 300))
+            if not ok:
+                info["verify_attempts"] = attempts_used + 1
+                fix_prompt = (f"上一轮实现的 verify 失败（attempt {attempts_used + 1}/"
+                              f"{max_fix_attempts}）。\n{vout}{VERIFY_FIX_INSTRUCTION}")
+                # resume 支持的 CLI 走 resume；不支持的走重 spawn 带 context
+                resume = body.get("resume") or (agent or {}).get("cli_session_id")
+                self._broadcast("agent.verify_failed",
+                                {"agent_id": agent_id, "attempt": attempts_used + 1,
+                                 "output": vout[-2000:]}, agent_id)
+                self.followup({"agent_id": agent_id, "prompt": fix_prompt,
+                               "session_id": (agent or {}).get("session_id"),
+                               "resume": resume, "interrupt": False,
+                               "verify_command": verify_command,
+                               "max_fix_attempts": max_fix_attempts,
+                               "_verify_attempts": attempts_used + 1})
+                return  # verify 回投接管，不进下面的终态迁移
+            self._broadcast("agent.verify_passed", {"agent_id": agent_id}, agent_id)
         if timed_out:
             # 超时 → incomplete（可 resume/重派），事件沿用 agent.terminated + stop_reason
+            # P5: 带 error_type=timeout + hint，结构化错误便主 agent 自动化处理
             self._set_status(agent_id, "incomplete", stop_reason="timeout")
             self._broadcast("agent.terminated", {"agent_id": agent_id,
                                                  "stop_reason": "timeout",
+                                                 "error_type": "timeout",
+                                                 "hint": "task timed out; "
+                                                         "resume with followup_task "
+                                                         "(resume=true) or re-spawn "
+                                                         "with context from last run",
                                                  "summary": summary}, agent_id)
         elif rc == 0:
-            self._set_status(agent_id, "terminated", stop_reason="end_turn")
-            self._broadcast("agent.terminated", {"agent_id": agent_id,
-                                                 "stop_reason": "end_turn",
-                                                 "summary": summary}, agent_id)
+            # E2 needs_advisor：子代理回 NEEDS_DECISION: + 理由 → 标 needs_advisor，主 agent wait 收到此态才介入
+            needs_advisor_match = re.search(r"NEEDS_DECISION:\s*(.+?)(?:\n|$)",
+                                            summary, re.DOTALL)
+            if needs_advisor_match and "why" in summary.lower():
+                self._set_status(agent_id, "needs_advisor",
+                                stop_reason="needs_decision")
+                self._broadcast("agent.needs_advisor",
+                                {"agent_id": agent_id,
+                                 "question": needs_advisor_match.group(1).strip()[:1000]},
+                                agent_id)
+            else:
+                self._set_status(agent_id, "terminated", stop_reason="end_turn")
+                self._broadcast("agent.terminated", {"agent_id": agent_id,
+                                                    "stop_reason": "end_turn",
+                                                    "summary": summary}, agent_id)
+                # C3 token_budget 降档：完成态后判超额，触发 followup 用低档 model 重跑（不运行中换）
+                self._maybe_downgrade_on_budget(agent_id, agent, body)
         else:
             self._set_status(agent_id, "error", stop_reason="cli_exit_nonzero")
             self._broadcast("agent.error", {"agent_id": agent_id,
                                             "stop_reason": "cli_exit_nonzero",
-                                            "message": f"cli exited {rc}"}, agent_id)
+                                            "error_type": "cli_exit_nonzero",
+                                            "message": f"cli exited {rc}",
+                                            "hint": "read out/err logs for the CLI error; "
+                                                    "respawn with adjusted prompt or permission_mode"},
+                                            agent_id)
         self._release_and_promote(str(agent_id))
         self._maybe_chain(agent_id)
+
+    def _maybe_downgrade_on_budget(self, agent_id: int, agent: dict | None,
+                                    body: dict) -> None:
+        """token_budget 超额 → 触发一次 followup 用低档 model 重跑（只降一档不连降）。
+        当前 run 不动，完成态后判，避免运行中换 model 不支持的 CLI。"""
+        budget = float(body.get("token_budget") or 0)
+        if budget <= 0 or agent is None:
+            return
+        totals = self.db.usage_total(agent_id)
+        used = int(totals.get("input_tokens", 0)) + int(totals.get("output_tokens", 0))
+        if used <= budget:
+            return
+        if agent.get("status") != "terminated":  # 只对成功态降档重跑
+            return
+        current_model = agent.get("model") or body.get("model")
+        downgraded = MODEL_DOWNGRADE.get(current_model or "")
+        if not downgraded:
+            return  # 已在最低档或无映射，不连降
+        self._broadcast("agent.budget_downgrade",
+                        {"agent_id": agent_id, "from": current_model,
+                         "to": downgraded, "used_tokens": used,
+                         "budget": budget}, agent_id)
+
+    def _tail_progress(self, agent_id: int) -> None:
+        """运行中增量 tail：新字节 → touch_activity 心跳 + 轻量 delta 广播。
+
+        只读 out/err 的新增字节（offset 幂等），提取可读进度行（atomcode 的
+        [thinking]/[tool→] 等）→ agent.message_delta 广播；权威事件
+        （message/usage/terminated）仍由完成态 _ingest_output 一次性产出，
+        这里不落库权威事件（db.insert_event 对 message_delta 本就返回 None）。
+        """
+        with self._lock:
+            info = self._workers.get(agent_id)
+            if info is None:
+                return
+            offsets = self._offsets.setdefault(agent_id, {})
+        new_text = ""
+        for key in ("out_path", "err_path"):
+            path = Path(info[key])
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            start = offsets.get(key, 0)
+            if size == start:
+                continue
+            if size < start:
+                # 日志被截断/轮转（size 回退）→ 重置 offset 从头读，恢复心跳与 delta
+                offsets[key] = 0
+                start = 0
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as f:
+                    f.seek(start)
+                    chunk = f.read(size - start)
+            except OSError:
+                continue
+            offsets[key] = size
+            new_text += chunk
+        if not new_text.strip():
+            return
+        self.db.touch_activity(agent_id)
+        visible = _progress_lines(new_text)
+        if visible:
+            # delta 只广播不落库；直接 publish（_broadcast 对 delta 不广播）
+            self.broadcaster.publish({"type": "agent.message_delta",
+                                      "agent_id": agent_id,
+                                      "payload": {"delta": visible},
+                                      "seq": None}, seq=None)
+
+    def _liveness_evidence(self, agent_id: int, info: dict | None) -> str:
+        """F4: 存活证据改读 updated_at 与当前差值判断健康（心跳线程 1s 更新），
+        不每次 stat pid + log mtime。updated_at 秒级活→healthy；超阈值给补充证据。"""
+        agent = self.db.get_agent(agent_id)
+        if agent is None:
+            return "agent not found"
+        updated = agent.get("updated_at")
+        if not updated:
+            return "no updated_at (stale record)"
+        try:
+            ts = datetime.fromisoformat(updated)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+        except (ValueError, TypeError):
+            return f"updated_at={updated} (unparseable)"
+        if age <= 3.0:
+            return f"updated_at {age:.1f}s ago (alive, heartbeat healthy)"
+        # 超 3s 无心跳更新：给补充证据（worker pid + 日志大小，低频 stat）
+        parts = [f"updated_at {age:.1f}s ago (stale heartbeat)"]
+        if info:
+            pid = info.get("worker_pid")
+            parts.append(f"worker_pid={pid} alive={bool(is_pid_running(pid))}")
+        else:
+            parts.append("no worker info (queued)")
+        return "; ".join(parts)
+
+    def _liveness_struct(self, agent_id: int, info: dict | None) -> dict[str, bool]:
+        """L2: 结构化存活证据——worker_pid_alive/log_growing/healthy 三布尔。
+        healthy = updated_at 秒级活（心跳 1s 更新）即 ≤3s。"""
+        agent = self.db.get_agent(agent_id)
+        result: dict[str, bool] = {"worker_pid_alive": False,
+                                   "log_growing": False, "healthy": False}
+        if agent is None:
+            return result
+        pid = info.get("worker_pid") if info else None
+        result["worker_pid_alive"] = is_pid_running(pid) if pid else False
+        # log_growing：out_path 大小 >0 即有输出增长
+        if info and "out_path" in info:
+            try:
+                result["log_growing"] = Path(info["out_path"]).stat().st_size > 0
+            except OSError:
+                pass
+        updated = agent.get("updated_at")
+        if updated:
+            try:
+                ts = datetime.fromisoformat(updated)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - ts).total_seconds()
+                result["healthy"] = age <= 3.0
+            except (ValueError, TypeError):
+                pass
+        return result
 
     def _maybe_chain(self, agent_id: int) -> None:
         """该 agent 有排队中的 followup → 重新占槽运行（同 id run 串联）。
@@ -478,21 +1052,53 @@ class Dispatcher:
             return
         self._run_worker(int(key), *params)
 
-    def _wait_result(self, agent: dict, summary: str) -> dict:
+    def _wait_result(self, agent: dict, summary: str,
+                     summary_chars: int = 600, return_ref: bool = False) -> dict:
         if agent["status"] == "terminated":
             # summary 兜底：与 monitor 竞争时从已落库的 terminated 事件取
             if not summary:
                 summary = self._last_event_payload(agent["id"], "agent.terminated").get("summary", "")
-            return self._agent_result(agent["id"], status="terminated",
-                                      stop_reason=agent["stop_reason"], summary=summary)
+            final = _extract_final_answer(summary, summary_chars)
+            # P2: 结构化返回——usage 五元组摘要 + events 压缩
+            usage = self.db.usage_total(agent["id"])
+            usage_summary = {
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "cache_read": int(usage.get("cache_read") or 0),
+                "cache_creation": int(usage.get("cache_creation") or 0),
+                "cost_usd": round(float(usage.get("cost_usd") or 0), 4),
+            }
+            raw_events = self.db.events_since(
+                0, session_id=agent["session_id"],
+                compress_consumed=True, keep_recent=5)
+            events = [e for e in raw_events if e.get("agent_id") == agent["id"]]
+            if return_ref:
+                return self._agent_result(
+                    agent["id"], status="terminated",
+                    stop_reason=agent["stop_reason"],
+                    summary=final,
+                    usage=usage_summary,
+                    events_compressed=True,
+                    events=events,
+                    ref={"agent_id": agent["id"],
+                         "out_path": summary},
+                    summary_preview=final[:200])
+            return self._agent_result(
+                agent["id"], status="terminated",
+                stop_reason=agent["stop_reason"], summary=final,
+                usage=usage_summary, events_compressed=True,
+                events=events)
         if agent["status"] == "error":
+            msg = summary.strip() or agent.get("stop_reason", "")
+            msg = _extract_final_answer(msg, summary_chars)
             return self._agent_result(
                 agent["id"], status="error", stop_reason=agent["stop_reason"],
-                message=summary.strip() or agent.get("stop_reason", ""))
+                message=msg)
         return self._agent_result(agent["id"], status=agent["status"],
                                   stop_reason=agent["stop_reason"])
 
-    def _agent_result(self, agent_id: int, **payload: Any) -> dict[str, Any]:
+    def _agent_result(self, agent_id: int, *, compress_events: bool = False,
+                     since_seq: int = 0, **payload: Any) -> dict[str, Any]:
         agent = self.db.get_agent(agent_id)
         result = {"agent_id": agent_id, **payload}
         if agent:
@@ -501,6 +1107,11 @@ class Dispatcher:
                 "created_at": agent["created_at"],
                 "updated_at": agent["updated_at"],
             })
+        if compress_events and agent:
+            events = self.db.events_since(since_seq, session_id=agent["session_id"],
+                                          compress_consumed=True)
+            result["events"] = [e for e in events if e.get("agent_id") == agent_id]
+            result["next_seq"] = events[-1]["seq"] if events else since_seq
         return result
 
     def _last_event_payload(self, agent_id: int, type_: str) -> dict:
@@ -541,8 +1152,12 @@ class Dispatcher:
                         self.db.set_status(agent_id, agent["status"],
                                            cli_session_id=str(sid))
                 continue
+            # D4 事件分层：tool_use/tool_result payload 超 2KB 落 verbose 层，其余 authority
+            ev_tier = "verbose" if (typ in ("agent.tool_use", "agent.tool_result")
+                                    and len(json.dumps(payload, ensure_ascii=False)) > 2048) else "authority"
             seq = self.db.insert_event(agent_id=agent_id, type=typ,
-                                       payload=payload, session_id=session_id)
+                                       payload=payload, session_id=session_id,
+                                       tier=ev_tier)
             self.broadcaster.publish({"type": typ, "agent_id": agent_id,
                                       "payload": payload, "seq": seq}, seq=seq)
         if usage:
@@ -552,6 +1167,21 @@ class Dispatcher:
                                  cache_creation=usage.get("cache_creation", 0),
                                  cache_read=usage.get("cache_read", 0),
                                  cost_usd=usage.get("cost_usd", 0.0) or 0.0)
+            # D2 per-call usage jsonl：每 worker run 一行落盘，Daily Auditor 数据基础
+            try:
+                usage_dir = self.state_dir / "usage"
+                usage_dir.mkdir(parents=True, exist_ok=True)
+                if os.name != "nt":
+                    os.chmod(usage_dir, 0o700)
+                record = {"agent_id": agent_id, "session_id": session_id,
+                          "cli": cli, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                           time.gmtime()),
+                          **usage}
+                with (usage_dir / f"{agent_id}.jsonl").open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                print(f"[dispatcher] usage jsonl write failed for agent {agent_id}: {exc}",
+                      file=sys.stderr)
 
     def _broadcast(self, type_: str, payload: dict, agent_id: int) -> None:
         agent = self.db.get_agent(agent_id)
@@ -566,7 +1196,11 @@ class Dispatcher:
     def _require_session(body: dict, agent: dict) -> None:
         requested = body.get("session_id")
         if requested and requested != agent.get("session_id"):
-            raise ValueError(f"agent {agent['id']} does not belong to session {requested}")
+            raise ValueError(
+                f"agent {agent['id']} {SESSION_MISMATCH_MARK} {requested} "
+                f"(belongs to session {agent.get('session_id')}); cross-session "
+                f"operations are not allowed — respawn the agent in the current "
+                f"session instead of reusing its agent_id")
 
     @staticmethod
     def _require_id(body: dict) -> int:
@@ -612,10 +1246,38 @@ def main() -> int:
 
     token = _load_or_create_token(state_dir)
     db = DB(state_dir / "daemon.db")
+    # D3+D4: 启动时主动清理过期 spawn_cache + 7 天前 events，并启动 6h 循环 Timer
+    for purge in (db.purge_spawn_cache, db.purge_events):
+        try:
+            purge()
+        except Exception:
+            pass  # 启动清理失败不致命
+    def _purge_cycle() -> None:
+        """D3+D4: 每 6h 清一次 spawn_cache + events，循环 Timer 链。"""
+        for purge in (db.purge_spawn_cache, db.purge_events):
+            try:
+                purge()
+            except Exception:
+                pass
+        threading.Timer(6 * 3600, _purge_cycle).start()
+    threading.Timer(6 * 3600, _purge_cycle).start()
+
     broadcaster = EventBroadcaster()
     dispatcher = Dispatcher(db=db, broadcaster=broadcaster, state_dir=state_dir)
-    srv = DaemonHTTPServer(("127.0.0.1", args.port), args.web_root, token=token,
+    try:
+        srv = DaemonHTTPServer(("127.0.0.1", args.port), args.web_root, token=token,
                            db=db, dispatcher=dispatcher, broadcaster=broadcaster)
+    except OSError as exc:
+        # D6: bind 失败明确报 port conflict 而非通用错误
+        import errno
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            print(f"daemon startup failed: port conflict on {args.port}"
+                  f" (another process already listening)", file=sys.stderr)
+        else:
+            print(f"daemon startup failed: bind error on port {args.port}: {exc}",
+                  file=sys.stderr)
+        dispatcher.stop()
+        return 1
 
     lock_data = {"pid": os.getpid(), "ts": time.time()}
     if lock_handle is not None:
@@ -625,6 +1287,9 @@ def main() -> int:
         lock_handle.flush()
     else:
         _write_private(lock_path, lock_data)
+    # F8 配合 mcp_server.ensure_daemon 的拉起锁：锁文件在 dispatcher.start 前就写好，
+    # 让 ensure_daemon spawn 后释放 _STARTUP_LOCK，其他客户端可凭 pid 探测发现 daemon；
+    # HTTP 套接字已 bind（srv 构造时），serve_forever 立即接 accept，探测零等待。
     dispatcher.start()
 
     def _heartbeat() -> None:

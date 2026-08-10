@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -14,45 +15,95 @@ from agent_mcp.cli_adapters import get_adapter
 
 
 class SlotScheduler:
-    """FIFO 并发槽位（Codex V2 AgentExecutionLimiter 的本地版）。"""
-    def __init__(self, max_concurrent: int = 4):
-        self.max = max_concurrent
-        self._active: set[str] = set()
-        self._queue: list[str] = []
+    """分池并槽位：read_pool（读密集，默认上限 6）/write_pool（写密集，默认上限 2）。
+    写池占用不饿死读任务；followup（同 agent_id 续跑）优先于新 spawn 补位。"""
+    def __init__(self, max_concurrent: int = 4, read_pool_max: int = 6,
+                 write_pool_max: int = 2,
+                 on_stuck_callback: Any = None):
+        # 兼容旧调用：max_concurrent 仍作总并发兜底
+        self.read_pool_max = read_pool_max
+        self.write_pool_max = write_pool_max
+        self._active_read: set[str] = set()
+        self._active_write: set[str] = set()
+        # queue 元素：(key, is_write, enqueue_ts) —— followup 续跑（is_write=False）补位优先
+        self._queue: list[tuple[str, bool, float]] = []
         self._lock = threading.Lock()
+        self._on_stuck_callback = on_stuck_callback
+        # D1: watchdog 线程——每 30s 扫队列，排队 >60s 的任务调 on_stuck_callback(key)
+        self._wd_stop = threading.Event()
+        self._wd_thread: threading.Thread | None = None
+        if on_stuck_callback is not None:
+            self._wd_thread = threading.Thread(target=self._watchdog_loop,
+                                               daemon=True,
+                                               name="slot-watchdog")
+            self._wd_thread.start()
 
-    def acquire(self, agent_key: str) -> bool:
+    def _pool_of(self, agent_key: str) -> tuple[set[str], int]:
+        """同 agent_id 已在某池则归那池；否则按 caller 标注判定。
+        队列项的 is_write 标注决定新 key 归池。"""
+        if agent_key in self._active_read or agent_key in self._active_write:
+            return (self._active_read if agent_key in self._active_read
+                    else self._active_write, 0)
+        return (self._active_read, 0)  # 默认读池，is_write 由 acquire 调用方决
+
+    def acquire(self, agent_key: str, *, is_write: bool = False) -> bool:
         with self._lock:
-            if agent_key in self._active or agent_key in self._queue:
+            active = self._active_read | self._active_write
+            if agent_key in active or any(k == agent_key for k, _, _ in self._queue):
                 return False
-            if len(self._active) < self.max:
-                self._active.add(agent_key)
+            target = self._active_write if is_write else self._active_read
+            limit = self.write_pool_max if is_write else self.read_pool_max
+            if len(target) < limit:
+                target.add(agent_key)
                 return True
-            self._queue.append(agent_key)
+            self._queue.append((agent_key, is_write, time.monotonic()))
             return False
 
     def release(self, agent_key: str) -> str | None:
-        """释放槽位，返回可补位的排队 key（若有）。"""
+        """释放槽位，返回可补位的排队 key（若有）。followup 续跑优先于新 spawn。"""
         with self._lock:
-            if agent_key not in self._active:
-                return None  # 防重复 release 过度激活
-            self._active.discard(agent_key)
-            while self._queue:
-                nxt = self._queue.pop(0)
-                if nxt not in self._active:
-                    self._active.add(nxt)
-                    return nxt
+            self._active_read.discard(agent_key)
+            self._active_write.discard(agent_key)
+            if not self._queue:
+                return None
+            # 先扫续跑（is_write=False）的排队 key，按 FIFO 首个可补
+            for order in (False, True):
+                for i, (k, w, _) in enumerate(self._queue):
+                    if w != order:
+                        continue
+                    target = self._active_write if w else self._active_read
+                    limit = self.write_pool_max if w else self.read_pool_max
+                    if len(target) < limit and k not in (self._active_read | self._active_write):
+                        target.add(k)
+                        self._queue.pop(i)
+                        return k
             return None
 
     def queued(self) -> list[str]:
         with self._lock:
-            return list(self._queue)
+            return [k for k, _, _ in self._queue]
 
     def remove(self, agent_key: str) -> None:
         """从队列/活动中移除（中断排队任务用），不触发补位。"""
         with self._lock:
-            self._active.discard(agent_key)
-            self._queue = [k for k in self._queue if k != agent_key]
+            self._active_read.discard(agent_key)
+            self._active_write.discard(agent_key)
+            self._queue = [(k, w, ts) for k, w, ts in self._queue if k != agent_key]
+
+    def _watchdog_loop(self) -> None:
+        """D1: 每 30s 扫队列，排队 >60s 的任务调 on_stuck_callback(key) 告警。"""
+        while not self._wd_stop.wait(30.0):
+            now = time.monotonic()
+            stuck: list[str] = []
+            with self._lock:
+                for k, _, ts in self._queue:
+                    if now - ts > 60.0:
+                        stuck.append(k)
+            for key in stuck:
+                try:
+                    self._on_stuck_callback(key)
+                except Exception:
+                    pass  # 告警失败不致命
 
 
 def terminate_process_tree(pid: int, *, timeout: float = 5.0) -> bool:
@@ -94,14 +145,19 @@ def is_pid_running(pid: int | None) -> bool:
 
 def build_worker_command(*, state_path: Path, out_path: Path, err_path: Path,
                          cwd: str, cli_command: list[str],
-                         timeout_seconds: float | None = None) -> list[str]:
+                         timeout_seconds: float | None = None,
+                         env: dict[str, str] | None = None) -> list[str]:
     """分离 worker：本脚本 --dispatch-worker 模式（与现有 grok MCP 同构）。
 
-    timeout_seconds 置于 command json 之前（保持 json 末位，向后兼容旧 argv）。"""
+    timeout_seconds 置于 command json 之前；非空 env 追加为最后一个 JSON
+    参数，未传 env 时保持旧命令格式兼容。"""
     worker = Path(__file__).resolve().parent.parent / "dispatch_worker.py"
-    return [sys.executable, str(worker), str(state_path), str(out_path),
-            str(err_path), cwd, str(timeout_seconds or 0),
-            json.dumps(cli_command, ensure_ascii=False)]
+    command = [sys.executable, str(worker), str(state_path), str(out_path),
+               str(err_path), cwd, str(timeout_seconds or 0),
+               json.dumps(cli_command, ensure_ascii=False)]
+    if env:
+        command.append(json.dumps(env, ensure_ascii=False))
+    return command
 
 
 def spawn_detached(command: list[str], *, env: dict[str, str] | None = None) -> subprocess.Popen:
@@ -120,7 +176,8 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
                      permission_mode: str = "plan", model: str | None = None,
                      max_turns: int = 8, resume: str | None = None,
                      state_dir: Path,
-                     timeout_seconds: float | None = None) -> dict[str, Any]:
+                     timeout_seconds: float | None = None,
+                     env: dict[str, str] | None = None) -> dict[str, Any]:
     """spawn 一个 CLI 任务 worker（T9 daemon 用）。
 
     流程：get_adapter → binary() 检查（缺失抛结构化 ValueError）→
@@ -147,7 +204,7 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
     err_path = state_dir / f"{tag}.err.log"
     worker_cmd = build_worker_command(state_path=state_path, out_path=out_path,
                                       err_path=err_path, cwd=cwd, cli_command=cli_cmd,
-                                      timeout_seconds=timeout_seconds)
+                                      timeout_seconds=timeout_seconds, env=env)
     proc = spawn_detached(worker_cmd)
     return {"worker_pid": proc.pid, "command_summary": " ".join(cli_cmd),
             "state_path": str(state_path), "out_path": str(out_path),

@@ -1,5 +1,6 @@
 """Isolated contracts for Agent MCP host installation and rollback."""
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from install import (
     BACKUP_SUFFIX,
     HOOK_MARKER,
     LEGACY_TOOL_MAP,
+    _skill_backup_path,
     add_claude_session_start_hook,
     add_codex_session_start_hook,
     apply_claude_install,
@@ -28,6 +30,7 @@ from install import (
     posix_session_start_command,
     remove_legacy_section,
     rollback,
+    skill_backup_root,
     windows_session_start_command,
 )
 
@@ -117,12 +120,13 @@ def test_apply_claude_install_is_pure_and_preserves_other_servers():
 
 def test_session_commands_quote_paths_and_keep_owned_marker():
     posix = posix_session_start_command(STARTER, python_executable="/tmp/Python 3")
-    assert posix == (
-        "nohup '/tmp/Python 3' '/tmp/agent mcp/start_agent_mcp.py' --open "
-        ">/dev/null 2>&1 & # agent-mcp-session-start"
-    )
+    # echo 提醒在前台输出（SessionStart stdout 注入上下文），网页启动放后台丢弃输出
+    assert posix.startswith(f"echo {shlex.quote(install.MAIN_AGENT_REMINDER)}; ")
+    assert "nohup '/tmp/Python 3' '/tmp/agent mcp/start_agent_mcp.py' --open" in posix
+    assert posix.endswith(">/dev/null 2>&1 & # agent-mcp-session-start")
     windows = windows_session_start_command(STARTER, python_executable=r"C:\Python 3\python.exe")
-    assert windows.startswith('start "" /B ')
+    assert windows.startswith(f'echo "{install.MAIN_AGENT_REMINDER}" & ')
+    assert 'start "" /B ' in windows
     assert '"C:\\Python 3\\python.exe"' in windows
     assert '"/tmp/agent mcp/start_agent_mcp.py"' in windows
     assert windows.endswith(">NUL 2>&1 & REM agent-mcp-session-start")
@@ -187,13 +191,17 @@ def test_install_skill_replaces_atomically_and_is_idempotent(tmp_path):
     assert (destination / "agents" / "planner.md").read_text() == "planner"
     assert not (destination / "stale.txt").exists()
     assert (sibling / "SKILL.md").read_text() == "keep"
-    backups = list(destination.parent.glob(destination.name + BACKUP_SUFFIX + "*"))
+    # 备份移出扫描目录：skills/ 内不再残留，备份落在 skill-backups/ 根
+    backups = list(skill_backup_root(destination).glob(
+        destination.name + BACKUP_SUFFIX + "*"))
     assert len(backups) == 1 and (backups[0] / "SKILL.md").read_text() == "old"
+    assert not list(destination.parent.glob(destination.name + BACKUP_SUFFIX + "*"))
     assert any("备份" in line for line in logs)
 
     second = install_skill(source, destination)
     assert any("跳过" in line for line in second)
-    assert len(list(destination.parent.glob(destination.name + BACKUP_SUFFIX + "*"))) == 1
+    assert len(list(skill_backup_root(destination).glob(
+        destination.name + BACKUP_SUFFIX + "*"))) == 1
 
 
 def test_install_skill_dry_run_is_non_mutating(tmp_path):
@@ -226,8 +234,11 @@ def test_complete_host_install_and_second_run_noop(tmp_path, host, mcp_key, hook
     assert hook_config["hooks"]["SessionStart"][0]["matcher"] == "keep"
     assert len(_owned(hook_config["hooks"]["SessionStart"])) == 1
     assert (paths[skill_key] / "agents" / "planner.md").read_text() == "planner"
-    for target in (paths[mcp_key], paths[hook_key], paths[skill_key]):
+    for target in (paths[mcp_key], paths[hook_key]):
         assert list(target.parent.glob(target.name + BACKUP_SUFFIX + "*"))
+    skill_target = paths[skill_key]
+    assert list(skill_backup_root(skill_target).glob(
+        skill_target.name + BACKUP_SUFFIX + "*"))
     backup_count = len(list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*")))
     assert any("已写入" in line or "已安装" in line for line in logs)
 
@@ -352,7 +363,8 @@ def test_rollback_restores_latest_mcp_hook_and_skill_backups(tmp_path):
     target = paths["codex_skill"]
     target.mkdir(parents=True)
     (target / "SKILL.md").write_text("new")
-    backup = backup_path(target, ts="20260803T010203")
+    # skill 备份落在 skill-backups/ 根（扫描目录之外）
+    backup = _skill_backup_path(target, ts="20260803T010203")
     backup.mkdir()
     (backup / "SKILL.md").write_text("old")
 

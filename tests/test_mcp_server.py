@@ -12,11 +12,14 @@ import mcp_server
 
 
 @pytest.fixture(autouse=True)
-def _reset_state(monkeypatch):
-    """重置模块级会话变量，避免测试间串扰。"""
+def _reset_state(monkeypatch, tmp_path):
+    """重置模块级会话变量，避免测试间串扰；session 持久化文件隔离到临时目录。"""
     monkeypatch.setattr(mcp_server, "_SESSION_ID", None)
     monkeypatch.setattr(mcp_server, "_HOST", "unknown")
     monkeypatch.setattr(mcp_server, "_DAEMON", None)
+    monkeypatch.setattr(mcp_server, "SESSION_ID_PREFIX", tmp_path / "session-id")
+    for var in mcp_server._HOST_SESSION_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 # ---- initialize / tools/list / host ----
@@ -32,11 +35,11 @@ def test_initialize_returns_server_info():
     assert mcp_server._HOST == "codex"
 
 
-def test_tools_list_has_nine_tools_in_order():
+def test_tools_list_has_ten_tools_in_order():
     names = [t["name"] for t in mcp_server.TOOLS]
     assert names == ["spawn_agent", "send_message", "steer_agent", "followup_task",
                      "wait_agent", "interrupt_agent", "list_agents",
-                     "get_agent_activity", "get_token_usage"]
+                     "get_agent_activity", "get_token_usage", "estimate_complexity"]
 
 
 def test_spawn_schema_requires_cwd():
@@ -53,14 +56,14 @@ def test_spawn_schema_lists_atomcode_task_cli():
 
 
 def test_wait_agent_schema_timeout_custom_cap():
-    """wait_agent 单次等待上限可自定义：schema maximum 跟随 MAX_WAIT_SECONDS（>30），默认仍 30。"""
+    """wait_agent 单次等待上限可自定义：schema maximum 跟随 MAX_WAIT_SECONDS（>30），默认短阻塞 25（≤客户端截断上限）。"""
     tool = next(t for t in mcp_server.TOOLS if t["name"] == "wait_agent")
     schema = tool["inputSchema"]
     prop = schema["properties"]["timeout"]
     assert prop["minimum"] == 1
-    assert prop["default"] == 30
+    assert prop["default"] == 25  # 单次短阻塞：≤ MCP 客户端 ~30s 截断上限
     assert prop["maximum"] == int(mcp_server.MAX_WAIT_SECONDS)
-    assert prop["maximum"] > 30  # 不再硬编码 30s 上限
+    assert prop["maximum"] > 30  # 上限可放宽（长等待由多次循环调用覆盖）
     cap = f"{mcp_server.MAX_WAIT_SECONDS:.0f}"
     assert cap in tool["description"] or cap in prop["description"]
 
@@ -273,6 +276,43 @@ def test_session_id_persists_across_calls(monkeypatch):
                       emit=lambda m: None)
     assert captured[0]["session_id"].startswith("codex-")
     assert captured[0]["session_id"] == captured[1]["session_id"]
+
+
+def test_session_id_uses_host_env_var_when_present(monkeypatch):
+    """宿主注入稳定会话标识时优先使用：同一对话 resume 后 session_id 不变。"""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "conv-abc-123")
+    mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"clientInfo": {"name": "claude"}}}, emit=lambda m: None)
+    assert mcp_server._session_id() == "claude-conv-abc-123"
+    # 模拟进程重启：清掉缓存后仍得同一 id（env 由宿主注入，重启不变）
+    mcp_server._SESSION_ID = None
+    assert mcp_server._session_id() == "claude-conv-abc-123"
+
+
+def test_session_id_persisted_fallback_across_restarts(monkeypatch):
+    """无宿主标识时持久化兜底：进程重启后仍取同一 session_id。"""
+    first = mcp_server._session_id()
+    assert first.startswith("unknown-")
+    # 模拟 MCP 进程重启（新进程新内存）：仅持久化文件保留
+    monkeypatch.setattr(mcp_server, "_SESSION_ID", None)
+    second = mcp_server._session_id()
+    assert second == first
+
+
+def test_list_agents_include_other_sessions_passes_none(monkeypatch):
+    """include_other_sessions=true 时 session_id 置 None（daemon 返回所有会话）；缺省注入当前会话。"""
+    captured = []
+
+    def fake_post(path, payload, http_timeout=None):
+        captured.append(payload)
+        return {"status": "ok", "agents": []}
+
+    monkeypatch.setattr(mcp_server, "_daemon_post", fake_post)
+    mcp_server.call_tool("list_agents", {"include_other_sessions": True})
+    assert captured[0]["session_id"] is None
+    assert "include_other_sessions" not in captured[0]
+    mcp_server.call_tool("list_agents", {})
+    assert captured[1]["session_id"] is not None
 
 
 def test_daemon_structured_error_marks_is_error(monkeypatch):
@@ -567,6 +607,27 @@ def test_daemon_post_http_error_structured(monkeypatch):
     monkeypatch.setattr(mcp_server, "ensure_daemon", lambda: ("http://x", "t"))
     out = mcp_server._daemon_post("/api/agents/spawn", {})
     assert out["status"] == "error"
+
+
+def test_http_error_payload_gives_respawn_guidance_for_session_mismatch():
+    # fixture 来自 daemon 真实错误消息（_require_session 抛出的 ValueError），
+    # 锁住 daemon 文案 ↔ MCP 检测的双端契约，防任一侧改写后静默失效。
+    from agent_mcp.daemon_main import Dispatcher
+
+    with pytest.raises(ValueError) as exc_info:
+        Dispatcher._require_session({"session_id": "codex-new"},
+                                    {"id": 119, "session_id": "codex-old"})
+    out = mcp_server._http_error_payload(
+        400, json.dumps({"error": str(exc_info.value)}))
+    assert out["status"] == "error"
+    assert mcp_server.SESSION_MISMATCH_MARK in out["summary"]
+    assert "spawn a NEW agent" in " ".join(out["next_actions"])
+    assert "reuse this agent_id" in " ".join(out["next_actions"])
+
+
+def test_http_error_payload_generic_for_other_errors():
+    out = mcp_server._http_error_payload(500, '{"error": "boom"}')
+    assert out["next_actions"] == ["check the arguments and the daemon log"]
 
 
 def test_main_reads_stdin_lines(monkeypatch, capsys):

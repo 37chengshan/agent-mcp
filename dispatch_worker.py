@@ -78,11 +78,12 @@ def terminate_tree(pid: int) -> None:
 
 
 def dispatch_worker(state_path: Path, stdout_path: Path, stderr_path: Path,
-                    command: list[str], cwd: Path, timeout: float = 0.0) -> int:
+                    command: list[str], cwd: Path, timeout: float = 0.0,
+                    env: dict[str, str] | None = None) -> int:
     """读 state → 标 running（worker_pid）→ 运行 CLI → 标 finished（process_status）。
 
     timeout>0 时超限则终止 CLI 进程树，state 写 timed_out=true（daemon 映射 incomplete）。
-    """
+    env 非空时 merge 到 worker 继承的环境中。"""
     state = read_json(state_path)
     state.update({"worker_pid": os.getpid(), "status": "running", "updated_at": utc_now()})
     write_json(state_path, state)
@@ -100,7 +101,12 @@ def dispatch_worker(state_path: Path, stdout_path: Path, stderr_path: Path,
                 spawn_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 spawn_kwargs["start_new_session"] = True
-            proc = subprocess.Popen(command, cwd=cwd, stdout=out, stderr=err, **spawn_kwargs)
+            # stdin 显式 DEVNULL：CLI 读 stdin（如 opencode run 的 Bun.stdin.text()）
+            # 只会拿到空串而不会误读继承输入；prompt 必须走 flag/位置参数。
+            popen_kwargs = dict(cwd=cwd, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
+            if env:
+                popen_kwargs["env"] = {**os.environ, **env}
+            proc = subprocess.Popen(command, **popen_kwargs, **spawn_kwargs)
             try:
                 rc = proc.wait(timeout=timeout if timeout > 0 else None)
             except subprocess.TimeoutExpired:
@@ -130,14 +136,25 @@ def dispatch_worker(state_path: Path, stdout_path: Path, stderr_path: Path,
 
 
 def main() -> int:
-    if len(sys.argv) not in (6, 7):
+    if len(sys.argv) not in (6, 7, 8):
         print(__doc__, file=sys.stderr)
         return 2
     state_path = Path(sys.argv[1])
     stdout_path = Path(sys.argv[2])
     stderr_path = Path(sys.argv[3])
     cwd = Path(sys.argv[4]).resolve()
-    if len(sys.argv) == 7:
+    env: dict[str, str] | None = None
+    if len(sys.argv) == 8:
+        try:
+            env_value = json.loads(sys.argv[7])
+        except json.JSONDecodeError:
+            return 2
+        if not isinstance(env_value, dict) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in env_value.items()):
+            return 2
+        env = env_value
+    if len(sys.argv) in (7, 8):
         try:
             timeout = float(sys.argv[5])
         except ValueError:
@@ -152,7 +169,7 @@ def main() -> int:
         return 2
     if not isinstance(command, list) or not all(isinstance(i, str) for i in command):
         return 2
-    return dispatch_worker(state_path, stdout_path, stderr_path, command, cwd, timeout)
+    return dispatch_worker(state_path, stdout_path, stderr_path, command, cwd, timeout, env)
 
 
 if __name__ == "__main__":

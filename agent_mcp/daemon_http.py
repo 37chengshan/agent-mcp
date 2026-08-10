@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
-MAX_SSE_CLIENTS = 32
+MAX_SSE_CLIENTS = 128
 MAX_JSON_BYTES = 1_000_000
 HEARTBEAT_SECONDS = 15.0
 SNAPSHOT_EVENTS_PER_AGENT = 60
@@ -187,18 +187,29 @@ class Handler(BaseHTTPRequestHandler):
         # 事件被整体截断，导致详情面板（当前工具/消息流/最近事件）空白。
         events = db.events_by_agents([a["id"] for a in agents],
                                      per_agent_limit=SNAPSHOT_EVENTS_PER_AGENT)
+        # D1: gantt 字段——created_at 原样返；finished_at 缺失（running 态）用 updated_at 兜底 null。
+        # D2: anomalies 预计算（daemon 侧聚合，免前端扫全事件流）。
         keep = ("id", "parent_id", "task_name", "cli", "model",
-                "status", "stop_reason", "updated_at", "session_id")
+                "status", "stop_reason", "updated_at", "created_at",
+                "finished_at", "session_id")
         totals = {"input_tokens": 0, "output_tokens": 0, "cache_creation": 0,
                   "cache_read": 0, "cost_usd": 0.0}
         per_agent = []
+        agent_out = []
         for a in agents:
             u = db.usage_total(a["id"])
             per_agent.append({"agent_id": a["id"], **u})
             for k in totals:
                 totals[k] = totals.get(k, 0) + u.get(k, 0)
+            row = {k: a.get(k) for k in keep}
+            # D1 兜底：running 态无 finished_at，用 updated_at null 化（前端 Gantt pulsing 判 running）
+            if row.get("finished_at") is None and row.get("status") == "running":
+                row["finished_at"] = None
+            # D2 预计算异常 badge（免前端再扫全事件流）
+            row["anomalies"] = db.agent_anomalies(a["id"])
+            agent_out.append(row)
         self._send_json(200, {
-            "agents": [{k: a[k] for k in keep} for a in agents],
+            "agents": agent_out,
             "events": events,
             "usage": {"totals": totals, "per_agent": per_agent},
             "last_seq": events[-1]["seq"] if events else 0,

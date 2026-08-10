@@ -89,7 +89,9 @@ def test_omp_parse_tolerates_malformed_lines():
     a = get_adapter("omp")
     lines = ["", "not-json{", '["a"]', "null", '{"type":"message_end","message":']
     events, usage = a.parse_stream(lines)
-    assert events == [] and usage == {}
+    assert events == []  # 无事件
+    # 畸形/空输入不产生伪 usage：与 claude 同语义返回 {}（daemon `if usage:` 跳过）
+    assert usage == {}
 
 def test_omp_parse_terminated():
     a = get_adapter("omp")

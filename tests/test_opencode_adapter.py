@@ -76,11 +76,32 @@ def test_opencode_session_extracted():
     a = get_adapter("opencode")
     assert a.extract_session_id(OPC_TEXT) == "ses_1"
 
+
+def test_opencode_terminated_carries_session_id():
+    """P1/P5: parse_stream 末尾产出一条带 session_id 的 terminated，
+    daemon _ingest_output 据此回填 cli_session_id（opencode resume 链路）。"""
+    a = get_adapter("opencode")
+    lines = [json.dumps(OPC_STEP_START), json.dumps(OPC_TEXT),
+             json.dumps(OPC_STEP_FINISH)]
+    events, _ = a.parse_stream(lines)
+    terminated = [e for e in events if e["type"] == "agent.terminated"]
+    assert len(terminated) == 1
+    assert terminated[0]["payload"]["session_id"] == "ses_1"
+
+
+def test_opencode_no_terminated_without_session():
+    """无 sessionID 事件时（畸形/空输出）不产伪 terminated。"""
+    a = get_adapter("opencode")
+    events, _ = a.parse_stream(["", "not-json{"])
+    assert not any(e["type"] == "agent.terminated" for e in events)
+
 def test_opencode_parse_tolerates_malformed_lines():
     a = get_adapter("opencode")
     lines = ["", "not-json{", '["a"]', "null", '{"type":"text","part":']
     events, usage = a.parse_stream(lines)
-    assert events == [] and usage == {}
+    assert events == []  # 无事件
+    # 畸形/空输入不产生伪 usage：与 claude 同语义返回 {}（daemon `if usage:` 跳过）
+    assert usage == {}
 
 def test_unknown_cli_rejected():
     with pytest.raises(ValueError):

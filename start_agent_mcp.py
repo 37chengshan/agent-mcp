@@ -107,17 +107,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "error", "summary": "Agent MCP daemon did not become healthy."}))
         return 1
     url = f"{base_url}/#token={urllib.parse.quote(token, safe='')}"
-    if args.open:
+    # Only open the browser when the daemon was actually started this call.
+    # If the daemon was already running, the monitoring page is already open
+    # (or was opened by the first start), so skip to avoid stacking tabs.
+    open_browser = args.open and started
+    if open_browser:
         subprocess.Popen(browser_command(url), stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
     # When the browser is opened for the user, the write token has already
     # been delivered through the local URL fragment.  Do not duplicate it in
     # stdout, where terminal capture or automation logs may persist it.
-    reported_url = f"{base_url}/" if args.open else url
+    reported_url = f"{base_url}/" if open_browser else url
     print(json.dumps({
         "status": "started" if started else "already_running",
         "url": reported_url,
-        "write_auth": "opened_in_browser" if args.open else "url_fragment",
+        "write_auth": "opened_in_browser" if open_browser else "url_fragment",
     }))
     return 0
 
