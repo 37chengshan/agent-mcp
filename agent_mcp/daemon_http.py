@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hashlib
+import hmac
 import json
 import threading
 import time
@@ -108,7 +109,8 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _check_token(self) -> bool:
-        if self.headers.get("X-Auth-Token") == self.server.token:
+        supplied = self.headers.get("X-Auth-Token") or ""
+        if hmac.compare_digest(supplied, self.server.token):
             return True
         self.send_error(401, "unauthorized")
         return False

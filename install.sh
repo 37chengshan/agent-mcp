@@ -41,17 +41,21 @@ else
     git clone --depth 1 "https://github.com/${GITHUB_REPO}.git" "$INSTALL_DIR" >/dev/null 2>&1 \
       || die "git clone 失败。"
   else
-    # 无 git 时退回 curl 下载 tarball
+    # 无 git 时退回 curl 下载 tarball（codeload 才是归档端点，raw 只服务单文件）
     command -v curl >/dev/null 2>&1 || die "需要 git 或 curl。"
     tmp="$(mktemp -d)"
-    curl -fsSL "${GITHUB_RAW}.tar.gz" -o "$tmp/repo.tar.gz" || die "下载失败。"
-    tar -xzf "$tmp/repo.tar.gz" -C "$tmp"
-    shopt -s nullglob dotglob
-    src=("$tmp"/*)
-    shopt -u nullglob dotglob
-    [ -d "${src[0]}" ] || die "解压失败。"
-    mv "${src[0]}"/* "$INSTALL_DIR"/ 2>/dev/null || true
-    mv "${src[0]}"/.* "$INSTALL_DIR"/ 2>/dev/null || true
+    curl -fsSL "https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/heads/main" \
+      -o "$tmp/repo.tar.gz" || die "下载失败。"
+    tar -xzf "$tmp/repo.tar.gz" -C "$tmp" || die "解压失败。"
+    # POSIX sh：解压顶层应为唯一目录（<repo>-<ref>），取第一个
+    found=""
+    for d in "$tmp"/*/; do
+      [ -d "$d" ] || continue
+      found="$d"
+      break
+    done
+    [ -n "$found" ] || die "解压失败。"
+    cp -R "$found/." "$INSTALL_DIR"/ || die "拷贝项目文件失败。"
     rm -rf "$tmp"
   fi
   [ -f "$INSTALL_DIR/install.py" ] || die "项目文件不完整，请重试。"

@@ -502,9 +502,11 @@ function layoutTree(g){
   const WRAP_W=(maxDepth+1)*COL_W+GAP_ROOT;
   const pos=new Map();let maxX=0;
   for(const [k,n]of g.nodes){
-    const span=spans.get(k),depth=depths.get(k)||0,center=(span.first+span.last)/2;
-    const page=depth===0?Math.floor(span.first/MAX_ROWS):Math.floor(center/MAX_ROWS);
-    const row=Math.min(MAX_ROWS-1,Math.floor(center)%MAX_ROWS);
+    const span=spans.get(k),depth=depths.get(k)||0;
+    // 页/行按第一个叶子定位：父节点与至少第一个子节点同页，跨 MAX_ROWS 的
+    // 大子树不再出现"父在上一页、子被甩到下一页"的视觉断开
+    const page=Math.floor(span.first/MAX_ROWS);
+    const row=Math.min(MAX_ROWS-1,span.first%MAX_ROWS);
     const x=depth*COL_W+page*WRAP_W,y=row*ROW_H+(ROW_H-NH[n.type])/2;
     pos.set(k,{x,y});maxX=Math.max(maxX,x+NW[n.type]);
   }

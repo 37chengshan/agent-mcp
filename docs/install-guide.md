@@ -36,6 +36,7 @@ Agent MCP 是一个 **MCP 服务器 + 编排 Skill**：
 # 先拿到项目文件（任意一种）：
 #   方式 A：git clone git@github.com:37chengshan/agent-mcp.git && cd agent-mcp
 #   方式 B：curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.sh | bash
+#           ⚠️ 管道执行以当前用户权限运行远程脚本，建议先审阅 install.sh；或用 git clone
 
 # 安装到指定 host（host 取上面表格的 name）：
 python3 install.py --install --host claude
