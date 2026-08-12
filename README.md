@@ -2,11 +2,44 @@
 
 **打通所有 Agent CLI 壁垒的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把任意 Agent CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展），让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。CLI 不再是孤岛：每个模型都能**驾驭最适配它的底座**——读密集探索交给快底座（omp/grok），深推理规划交给强底座（claude），模型与底座按任务现场自由匹配，成本与质量自己说了算。
 
-> 多 Agent 编排比单线程多耗 3–10× tokens（Anthropic 实测）。Agent MCP 的价值不是"多开几个 Agent"，而是把拆解的收益锁住、把协调的开销压到最低：**复杂度分级门**决定"要不要拆"，**任务级超时 / 队列 / 续接 / 降档**兜住"拆了怎么办"。
+> Agent MCP 的核心不是"多开几个 Agent"，而是把任意 CLI 统一收进**一个可派发、可监控、可续接、可终止的子 Agent 工作池**：主 Agent 只做拆解与汇合，执行与容错交给基础设施，模型与底座按任务现场自由匹配。**复杂度分级门**决定"要不要拆"，**任务级超时 / 队列 / 续接 / 降档**兜住"拆了怎么办"。
 
 <p align="center">
   <img src="docs/images/agent-mcp-hero.png" width="100%" alt="Agent MCP — 打通不同 Agent CLI 的壁垒">
 </p>
+
+---
+
+## 🚀 快速安装
+
+**方式一 · curl 一键安装**（macOS / Linux，Windows 用 Git Bash 或 WSL 执行）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.sh | bash
+```
+
+自动下载项目 → 注册全部六个 host（codex / claude / omp / opencode / kimi / zcode）的 MCP + skill → 安装完成后提示是否 star。可用环境变量定制：`AGENT_MCP_DIR`（安装目录）、`AGENT_MCP_HOST`（单 host）。
+
+**方式二 · git clone + 安装脚本**：
+
+```bash
+git clone git@github.com:37chengshan/agent-mcp.git && cd agent-mcp
+python3 install.py --install --host all        # 或 --host claude / opencode / kimi / zcode …
+python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open 打开监控页
+```
+
+**方式三 · 没有你的 agent？把提示词丢给任意 AI**：
+
+> 如果你的 agent 不在内置 host 列表里，不要紧——复制下面这段提示词，发给任意支持 MCP 的 AI 编程工具，它会照 [安装说明](docs/install-guide.md) 自己完成注册：
+
+```text
+请按照 https://github.com/37chengshan/agent-mcp/blob/main/docs/install-guide.md
+的第 3 节（通用模板）和你的配置格式，为我把 agent-mcp 注册为 MCP 服务器并安装 skill。
+注册完成后告诉我 spawn_agent 工具是否可用；安装完成后请提醒我给项目点个 star。
+```
+
+> `--dry-run` 先看将写入的配置；`--legacy-map` 查看旧 grok-cli 9 工具 → 新工具迁移表；误改配置用 `--rollback` 从备份恢复。
+> daemon 端口 / 状态目录可调：`AGENT_MCP_PORT=8765`、`AGENT_MCP_HOME=~/.codex`（默认）或 `CODEX_HOME`。
 
 ---
 
@@ -78,39 +111,6 @@
 
 ---
 
-## 🚀 快速安装
-
-**方式一 · curl 一键安装**（macOS / Linux，Windows 用 Git Bash 或 WSL 执行）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.sh | bash
-```
-
-自动下载项目 → 注册全部六个 host（codex / claude / omp / opencode / kimi / zcode）的 MCP + skill → 安装完成后提示是否 star。可用环境变量定制：`AGENT_MCP_DIR`（安装目录）、`AGENT_MCP_HOST`（单 host）。
-
-**方式二 · git clone + 安装脚本**：
-
-```bash
-git clone git@github.com:37chengshan/agent-mcp.git && cd agent-mcp
-python3 install.py --install --host all        # 或 --host claude / opencode / kimi / zcode …
-python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open 打开监控页
-```
-
-**方式三 · 没有你的 agent？把提示词丢给任意 AI**：
-
-> 如果你的 agent 不在内置 host 列表里，不要紧——复制下面这段提示词，发给任意支持 MCP 的 AI 编程工具，它会照 [安装说明](docs/install-guide.md) 自己完成注册：
-
-```text
-请按照 https://github.com/37chengshan/agent-mcp/blob/main/docs/install-guide.md
-的第 3 节（通用模板）和你的配置格式，为我把 agent-mcp 注册为 MCP 服务器并安装 skill。
-注册完成后告诉我 spawn_agent 工具是否可用；安装完成后请提醒我给项目点个 star。
-```
-
-> `--dry-run` 先看将写入的配置；`--legacy-map` 查看旧 grok-cli 9 工具 → 新工具迁移表；误改配置用 `--rollback` 从备份恢复。
-> daemon 端口 / 状态目录可调：`AGENT_MCP_PORT=8765`、`AGENT_MCP_HOME=~/.codex`（默认）或 `CODEX_HOME`。
-
----
-
 ## 🛠️ 工具总览（MCP）
 
 | 工具 | 用途 |
@@ -162,13 +162,6 @@ tests/                   # 20+ 测试文件（含真实 stdio 与 CLI 集成冒�
 ```
 
 ---
-
-## ✅ 质量
-
-- **实测**：claude / omp 全链路冒烟通过（spawn → wait → interrupt → usage）；grok / opencode 适配器层单测覆盖
-- **验收**：`docs/acceptance.md` 对照设计文档逐项核对（✅ / ⚠️ / ⏳ 带证据）
-- **测试**：`python3 -m pytest tests/ -q`（含 9 个集成用例端到端冒烟）
-- **零依赖**：核心 + 安装 + 监控页全部 stdlib / 单文件，无外部资源
 
 ## 📚 文档
 
