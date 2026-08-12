@@ -137,15 +137,18 @@
 
 | 场景 | target_cli | model 现场决策 | 备注 |
 |---|---|---|---|
-| 读密集 fan-out | omp / grok / opencode | smol / 快档 | 并行上限按 SKILL.md 分级门 |
+| 读密集 fan-out | omp / grok / opencode / pi | smol / 快档 | 并行上限按 SKILL.md 分级门 |
 | 深推理规划 | claude / omp(slow) / grok | opus 级 / slow | 先 plan 再执行 |
 | 写密集落地 | claude / codex | 首档默认 | permission_mode 升 acceptEdits/fullAccess |
 | 视频→代码 | kimi | 默认 | 附视频路径 |
 | 长任务持续 | zcode / kimi | 默认 | 配 timeout_seconds 与 resume |
 | CI/自动化 | codex / copilot | headless | verify_command 自跑验证 |
+| GitHub 生态 / 跨 IDE | copilot | 默认 | 与 GitHub Actions/PR 流集成 |
+| 终端轻量 harness | pi | 默认 | 扩展/skill 可自建，`--mode json` 事件流 |
 
-> 首启耗时参考（SKILL.md 同口径）：claude ~3s、omp ~5s、atomcode ~8s、grok >120s（首次模型发现，需预热/预留超时）。
+> 首启耗时参考（SKILL.md 同口径）：claude ~3s、omp ~5s、atomcode ~8s、grok >120s（首次模型发现，需预热/预留超时）；codex/kimi/copilot/pi/zcode/cline 按 10s 保守估计（⏳ 待实测）。
 > 模型名传**纯 API 名**（如 `deepseek-v4-flash`），别带 provider 前缀；AtomCode 仅作任务目标（task-only、one-shot）。
+> 新增 CLI：除内置适配器外，任意 CLI 可通过 `docs/custom-cli.md` 的 JSON 配置接入（`<state_dir>/custom-clis/*.json`，无需改代码）。
 
 ---
 

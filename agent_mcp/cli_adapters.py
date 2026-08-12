@@ -2,6 +2,7 @@ from __future__ import annotations
 import re
 import json
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -374,6 +375,359 @@ class AtomCodeAdapter(BaseAdapter):
 
     def extract_session_id(self, raw: dict) -> str | None:
         return None
+
+
+class CodexAdapter(BaseAdapter):
+    """OpenAI Codex CLI（openai/codex，Apache-2.0）。
+
+    headless：`codex exec --json "prompt"` → stdout 为 JSONL 事件流
+    （thread.started/turn.started/item.started/item.completed/turn.completed/
+    turn.failed/error）。usage 权威值在 turn.completed.usage：
+    input_tokens / cached_input_tokens（→ cache_read）/ output_tokens /
+    reasoning_output_tokens（→ reasoning_tokens）。会话 id 取 thread.started.thread_id
+    顶层字段。字段名有版本漂移（item_type→type、assistant_message→agent_message），
+    解析兼容两种。权限：默认沙箱只读（plan）；写工作区用 --sandbox workspace-write
+    （acceptEdits）；全放行 --dangerously-bypass-approvals-and-sandbox（fullAccess）。
+    """
+    cli_name = "codex"
+    _BIN = ["codex"]
+    PERMISSION_FLAGS = {
+        "plan": [],  # 默认只读沙箱
+        "acceptEdits": ["--sandbox", "workspace-write"],
+        "fullAccess": ["--dangerously-bypass-approvals-and-sandbox"],
+    }
+
+    def binary(self) -> str | None:
+        return shutil.which(self._BIN[0])
+
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        # cwd 由 subprocess 层 cwd= 覆盖（与 claude 同），codex exec 无 --cd 必需
+        cmd = [self.binary(), "exec", "--json"]
+        cmd += self.PERMISSION_FLAGS.get(permission_mode, self.PERMISSION_FLAGS["plan"])
+        if model:
+            cmd += ["--model", model]
+        if resume:
+            # codex resume 子命令：--last 续最近会话；传 thread_id 时按 id 恢复。
+            # --json 必须保留（parse_stream 依赖 JSONL），prompt 为续接后新指令
+            cmd = [self.binary(), "exec", "resume", "--json"]
+            cmd += self.PERMISSION_FLAGS.get(permission_mode, self.PERMISSION_FLAGS["plan"])
+            if resume == "last":
+                cmd += ["--last"]
+            else:
+                cmd += [resume]
+            if model:
+                cmd += ["--model", model]
+            cmd.append(prompt)
+            return cmd
+        cmd.append(prompt)
+        return cmd
+
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        # codex exec --json 实测格式（v0.44+）：
+        # thread.started{thread_id} / turn.started / item.started|completed{item}
+        # turn.completed{usage} / turn.failed{error} / error
+        events: list[dict] = []
+        usage: dict[str, Any] = {}
+        thread_id: str | None = None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            typ = raw.get("type")
+            if typ == "thread.started":
+                tid = raw.get("thread_id")
+                if tid:
+                    thread_id = str(tid)
+            elif typ in ("item.started", "item.completed", "item.updated"):
+                item = raw.get("item") if isinstance(raw.get("item"), dict) else {}
+                itype = item.get("type") or item.get("item_type")  # 兼容版本漂移
+                if itype in ("assistant_message", "agent_message"):
+                    text = item.get("text") or ""
+                    events.append({"type": "agent.message",
+                                   "payload": {"text": text}})
+                elif itype == "command_execution":
+                    events.append({"type": "agent.tool_use", "payload": {
+                        "name": "bash",
+                        "input": {"command": item.get("command", "")},
+                        "output": item.get("output", ""),
+                    }})
+            elif typ == "turn.completed":
+                u = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+                usage = {
+                    "input_tokens": _num(u.get("input_tokens")),
+                    "output_tokens": _num(u.get("output_tokens")),
+                    "cache_creation": 0,
+                    "cache_read": _num(u.get("cached_input_tokens")),
+                    "reasoning_tokens": _num(u.get("reasoning_output_tokens")),
+                    "cost_usd": 0.0,
+                }
+                events.append({"type": "agent.usage", "payload": dict(usage)})
+                events.append({"type": "agent.terminated",
+                               "payload": {"stop_reason": "end_turn",
+                                           "session_id": thread_id}})
+            elif typ == "turn.failed":
+                err = raw.get("error") or {}
+                events.append({"type": "agent.terminated",
+                               "payload": {"stop_reason": "error",
+                                           "session_id": thread_id,
+                                           "error": str(err)[:500]}})
+        usage = _normalize_usage(usage)
+        return events, usage
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        # thread.started 顶层 thread_id
+        tid = raw.get("thread_id") if isinstance(raw, dict) else None
+        return str(tid) if tid else None
+
+
+class KimiAdapter(ClaudeAdapter):
+    """Kimi Code CLI（Moonshot，npm @moonshot-ai/kimi-code）。
+
+    headless：`kimi -p <prompt> --output-format stream-json` → JSONL 事件流。
+    参数（官方文档）：`-m/--model` 模型、`-S/--session [id]` resume 指定会话、
+    `-c/--continue` 续最近会话。`--output-format` 只能与 `-p` 同用。
+    注意：`-p` 与 `--yolo/--auto/--plan` 互斥（启动即拒绝）——非交互模式
+    默认 auto 权限，permission_mode 不映射 CLI flag（留空，注释说明）。
+    stream-json 事件结构仿 claude/grok（assistant/result 行），解析复用
+    ClaudeAdapter 实现；字段细节 ⏳ 待实测校准。
+    """
+    cli_name = "kimi"
+    _BIN = ["kimi", str(HOME / ".local/bin/kimi")]
+    PERMISSION_FLAGS = {
+        # -p 与 --yolo/--auto/--plan 互斥：非交互默认 auto 权限，不追加 flag
+        "plan": [],
+        "acceptEdits": [],
+        "fullAccess": [],
+    }
+
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        cmd = [self.binary(), "-p", "--output-format", "stream-json"]
+        cmd += self.PERMISSION_FLAGS.get(permission_mode, [])
+        if model:
+            cmd += ["-m", model]
+        if resume:
+            # -c 续最近会话；-S <id> 续指定会话（同 PiAdapter 约定）
+            cmd += ["-c"] if resume == "last" else ["-S", resume]
+        cmd.append(prompt)
+        return cmd
+
+
+class CopilotAdapter(BaseAdapter):
+    """GitHub Copilot CLI（github/copilot-cli，新一代 agentic CLI；
+    `gh copilot` 已于 2025-10-25 弃用）。
+
+    headless：`copilot -p <PROMPT>`（-p/--prompt 程序化执行，完成后退出，
+    退出摘要含 `copilot --resume=SESSION-ID` 续接提示）。`-r/--resume[=VALUE]`
+    续会话、`-c/--continue` 续最近会话、`--mode=interactive|plan|autopilot`、
+    `--max-ai-credits` 上限。权限走 `--allow all`（等价 COPILOT_ALLOW_ALL=true）。
+
+    parse_stream 为保守文本捕获：可见文本 → agent.message；退出摘要中
+    `--resume=<id>` → terminated 回填 session_id（resume 用）。usage 无
+    结构化来源（⏳ 待实测：若有 JSONL/usage 输出再精修）。
+    """
+    cli_name = "copilot"
+    _BIN = ["copilot"]
+    PERMISSION_FLAGS = {
+        "plan": [],
+        "acceptEdits": ["--allow", "all"],
+        "fullAccess": ["--allow", "all"],
+    }
+
+    def binary(self) -> str | None:
+        return shutil.which(self._BIN[0])
+
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        # cwd 由 subprocess 层 cwd= 覆盖（copilot 无 --cd，工作目录即信任目录）
+        cmd = [self.binary(), "-p", prompt]
+        cmd += self.PERMISSION_FLAGS.get(permission_mode, [])
+        if resume:
+            cmd += ["--resume", resume]
+        return cmd
+
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        visible: list[str] = []
+        session_id: str | None = None
+        for line in lines:
+            line = line.rstrip("\n")
+            # 退出摘要：copilot --resume=SESSION-ID 续接提示（可出现在任意位置）
+            m = re.search(r"--resume=(\S+)", line)
+            if m and session_id is None:
+                session_id = m.group(1)
+            stripped = line.strip()
+            if not stripped:
+                continue
+            visible.append(stripped)
+        events: list[dict] = []
+        text = "\n".join(visible).strip()
+        if text:
+            events.append({"type": "agent.message", "payload": {"text": text}})
+        if session_id:
+            events.append({"type": "agent.terminated",
+                           "payload": {"session_id": session_id}})
+        return events, {}
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        return None
+
+
+class PiAdapter(BaseAdapter):
+    """Pi（earendil-works/pi，npm @earendil-works/pi-coding-agent，pi.dev）。
+
+    注意：Pi 与 omp（oh-my-pi）是**两个不同项目**，勿混。
+    headless：`pi -p "prompt"` 打印模式；`pi --mode json "prompt"` → stdout
+    JSONL 事件流（官方 docs/json.md）。事件：首行 `session{version,id,cwd}`，
+    其后 agent_start / turn_start / message_start / message_update
+    （assistantMessageEvent.text_delta 增量）/ message_end（权威 message）/
+    turn_end / agent_end。会话 id 取首行 session.id；续接 `pi -c`（最近）或
+    `pi --session <path|id>`。模型/权限 flag 文档未明确（⏳ 待实测），
+    parse_stream 保守：message_end 文本 → agent.message，agent_end → terminated；
+    usage 无结构化来源（⏳）。
+    """
+    cli_name = "pi"
+    _BIN = ["pi", str(HOME / ".local/bin/pi")]
+
+    def binary(self) -> str | None:
+        for cand in self._BIN:
+            found = shutil.which(cand)
+            if found:
+                return found
+        return None
+
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        # --mode json 输出全部事件；resume: -c 续最近，--session <id> 指定
+        cmd = [self.binary(), "--mode", "json"]
+        if resume:
+            cmd += ["--session", resume] if resume != "last" else ["-c"]
+        cmd.append(prompt)
+        return cmd
+
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        events: list[dict] = []
+        session_id: str | None = None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            typ = raw.get("type")
+            if typ == "session" and raw.get("id"):
+                session_id = str(raw["id"])
+            elif typ == "message_end" and isinstance(raw.get("message"), dict):
+                text = _extract_text(raw["message"].get("content"))
+                if text:
+                    events.append({"type": "agent.message",
+                                   "payload": {"text": text}})
+            elif typ == "agent_end":
+                events.append({"type": "agent.terminated",
+                               "payload": {"stop_reason": "end_turn",
+                                           "session_id": session_id}})
+        return events, {}
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        sid = raw.get("id") if isinstance(raw, dict) else None
+        return str(sid) if sid else None
+
+
+class ZcodeAdapter(BaseAdapter):
+    """ZCode（Z.ai 智谱，github.com/zhipuai/zcode）。
+
+    headless 路径 ⏳ 待实测：官方 CLI 存在 `--prompt`，但社区集成尝试发现
+    其依赖私有配置 schema，GUI 实际走 app-server 协议（session/create +
+    state.updated patch 流），CLI 直连有 401 认证障碍。本适配器先保守：
+    `zcode --prompt <prompt>` + 文本捕获兜底（可见文本 → agent.message），
+    待真实输出后按文档精修。
+    """
+    cli_name = "zcode"
+    _BIN = ["zcode"]
+
+    def binary(self) -> str | None:
+        return shutil.which(self._BIN[0])
+
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        cmd = [self.binary(), "--prompt"]
+        if model:
+            cmd += ["--model", model]
+        if resume:
+            cmd += ["--session", resume]
+        cmd.append(prompt)
+        return cmd
+
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        visible: list[str] = []
+        for line in lines:
+            line = line.rstrip("\n")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            visible.append(stripped)
+        events: list[dict] = []
+        text = "\n".join(visible).strip()
+        if text:
+            events.append({"type": "agent.message", "payload": {"text": text}})
+        return events, {}
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        return None
+
+
+class ClineAdapter(BaseAdapter):
+    """Cline（cline/cline，VS Code 内模型无关 agent；Apache-2.0）。
+
+    ⚠️ Cline 主要为 VS Code 扩展（IDE 绑定），独立 CLI headless 模式不明确
+    （⏳ 待实测确认二进制与参数）。本适配器保守：`cline --prompt <prompt>`
+    + 文本捕获兜底；若不存在独立 CLI 二进制，spawn 会报
+    "CLI cline was not found"（不会误跑 IDE 内实例）。
+    """
+    cli_name = "cline"
+    _BIN = ["cline"]
+
+    def binary(self) -> str | None:
+        return shutil.which(self._BIN[0])
+
+    def build_command(self, *, prompt, cwd, model=None, permission_mode="plan",
+                      max_turns=8, resume=None) -> list[str]:
+        cmd = [self.binary(), "--prompt"]
+        if model:
+            cmd += ["--model", model]
+        if resume:
+            cmd += ["--resume", resume]
+        cmd.append(prompt)
+        return cmd
+
+    def parse_stream(self, lines) -> tuple[list[dict], dict]:
+        visible: list[str] = []
+        for line in lines:
+            line = line.rstrip("\n")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            visible.append(stripped)
+        events: list[dict] = []
+        text = "\n".join(visible).strip()
+        if text:
+            events.append({"type": "agent.message", "payload": {"text": text}})
+        return events, {}
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        return None
+
+
 def _num(v):
     """usage 字段数值防护：非 int/float（None/字符串/布尔）一律按 0。"""
     return v if isinstance(v, (int, float)) else 0
@@ -456,12 +810,24 @@ _GROK = GrokAdapter()
 _OPENCODE = OpencodeAdapter()
 _OMP = OmpAdapter()
 _ATOMCODE = AtomCodeAdapter()
+_CODEX = CodexAdapter()
+_KIMI = KimiAdapter()
+_COPILOT = CopilotAdapter()
+_PI = PiAdapter()
+_ZCODE = ZcodeAdapter()
+_CLINE = ClineAdapter()
 _ADAPTERS: dict[str, BaseAdapter] = {
     "claude": _CLAUDE,
     "grok": _GROK,
     "opencode": _OPENCODE,
     "omp": _OMP,
     "atomcode": _ATOMCODE,
+    "codex": _CODEX,
+    "kimi": _KIMI,
+    "copilot": _COPILOT,
+    "pi": _PI,
+    "zcode": _ZCODE,
+    "cline": _CLINE,
 }
 
 
@@ -473,3 +839,214 @@ def get_adapter(name: str) -> BaseAdapter:
 
 def register_adapter(adapter: BaseAdapter) -> None:
     _ADAPTERS[adapter.cli_name] = adapter
+
+
+def adapter_names() -> list[str]:
+    """已注册适配器名（内置 + 自定义），供 MCP 层 target_cli enum 动态化。"""
+    return sorted(_ADAPTERS)
+
+
+def _get_path(obj: Any, dotted: str) -> Any:
+    """按点路径取值（'message.content' → obj['message']['content']）；缺失返回 None。"""
+    cur = obj
+    for part in (dotted.split(".") if dotted else []):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+class GenericAdapter(BaseAdapter):
+    """配置驱动的通用适配器：用户为新 CLI 写一份 JSON 配置即可接入，无需改代码。
+
+    配置放 <state_dir>/custom-clis/*.json（state_dir 默认 ~/.codex/agent-mcp），
+    daemon 与 MCP 薄层启动时自动加载注册；模板与字段说明见 docs/custom-cli.md。
+
+    配置结构：
+    {
+      "cli_name": "mycli",                        # 必填：target_cli 使用的名字
+      "bins": ["mycli", "~/.local/bin/mycli"],    # 二进制探测顺序（可省，默认 [cli_name]）
+      "first_start_seconds": 10,                  # 可选：min_expected_seconds（默认 10）
+      "command": {
+        "prefix": ["-p", "--output-format", "stream-json"],   # 固定前置参数（{cwd} 占位可替换）
+        "permission_flags": {                     # 可选：按 permission_mode 追加
+          "plan": ["--permission-mode", "plan"],
+          "acceptEdits": ["--permission-mode", "acceptEdits"],
+          "fullAccess": ["--dangerously-skip-permissions"]
+        },
+        "model_flag": ["--model", "{value}"],     # 可选：传 model 时追加（{value} 占位）
+        "resume_flag": ["--resume", "{value}"]    # 可选：传 resume 时追加（{value} 占位）
+      },                                           # prompt 始终追加在命令末尾
+      "parse": {
+        "mode": "jsonl",                          # jsonl（默认）| text
+        "event_field": "type",                    # jsonl：事件类型字段名
+        "message_types": ["assistant"],           # jsonl：视为消息的事件类型
+        "message_text_path": "message.content",   # jsonl：消息文本点路径（content 可为块数组）
+        "result_types": ["result"],               # jsonl：视为终局 usage 的事件类型
+        "usage_path": "usage",                    # jsonl：usage 对象点路径
+        "cost_path": "total_cost_usd",            # jsonl：成本字段点路径（可省，缺省 0）
+        "session_id_path": "session_id",          # jsonl：会话 id 点路径（可省）
+        "stop_reason_path": "stop_reason",        # jsonl：终止原因点路径（缺省 end_turn）
+        "skip_prefixes": ["[tokens]", "[done]"],  # text：跳过的前缀行
+        "usage_regex": ""                         # text：可选 named-group 正则提取 usage
+      }
+    }
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        self._cfg = config
+        self.cli_name = str(config.get("cli_name") or "")
+        if not self.cli_name:
+            raise ValueError("custom CLI config missing cli_name")
+        self._bins = [str(b) for b in config.get("bins") or [self.cli_name]]
+        self._cmd = config.get("command") or {}
+        self._parse = config.get("parse") or {}
+        self.first_start_seconds = float(config.get("first_start_seconds") or 10)
+
+    def binary(self) -> str | None:
+        for cand in self._bins:
+            found = shutil.which(cand)
+            if found:
+                return found
+        return None
+
+    def _flag(self, key: str, value: str | None) -> list[str]:
+        if value is None:
+            return []
+        spec = self._cmd.get(key)
+        if not spec:
+            return []
+        return [str(x).replace("{value}", value) for x in spec]
+
+    def build_command(self, *, prompt: str, cwd: str, model: str | None,
+                      permission_mode: str, max_turns: int,
+                      resume: str | None) -> list[str]:
+        cmd = [self.binary()]
+        prefix = self._cmd.get("prefix") or []
+        cmd += [str(x).replace("{cwd}", str(cwd)) for x in prefix]
+        perm = (self._cmd.get("permission_flags") or {}).get(permission_mode)
+        if perm:
+            cmd += [str(x) for x in perm]
+        cmd += self._flag("model_flag", model)
+        cmd += self._flag("resume_flag", resume)
+        cmd.append(prompt)
+        return cmd
+
+    def parse_stream(self, lines: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        if self._parse.get("mode") == "text":
+            return self._parse_text(lines)
+        return self._parse_jsonl(lines)
+
+    def _parse_jsonl(self, lines) -> tuple[list[dict], dict]:
+        events: list[dict] = []
+        usage: dict[str, Any] = {}
+        ev_field = self._parse.get("event_field", "type")
+        msg_types = set(self._parse.get("message_types") or ["assistant"])
+        result_types = set(self._parse.get("result_types") or ["result"])
+        text_path = self._parse.get("message_text_path", "message.content")
+        usage_path = self._parse.get("usage_path", "usage")
+        cost_path = self._parse.get("cost_path", "total_cost_usd")
+        sid_path = self._parse.get("session_id_path", "session_id")
+        stop_path = self._parse.get("stop_reason_path", "stop_reason")
+        umap = self._parse.get("usage_field_map") or {
+            "input_tokens": "input_tokens",
+            "output_tokens": "output_tokens",
+            "cache_creation": "cache_creation",
+            "cache_read": "cache_read",
+            "cost_usd": "cost_usd",
+        }
+        session_id: str | None = None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            sid = _get_path(raw, sid_path)
+            if sid:
+                session_id = str(sid)
+            typ = raw.get(ev_field)
+            if typ in msg_types:
+                text = _get_path(raw, text_path)
+                events.append({"type": "agent.message",
+                               "payload": {"text": _extract_text(text)}})
+            elif typ in result_types:
+                u = _get_path(raw, usage_path)
+                if isinstance(u, dict):
+                    usage = {k: _num(u.get(v)) for k, v in umap.items()}
+                cost = _get_path(raw, cost_path)
+                if isinstance(cost, (int, float)):
+                    usage["cost_usd"] = cost
+                events.append({"type": "agent.usage", "payload": dict(usage)})
+                stop = _get_path(raw, stop_path) or "end_turn"
+                events.append({"type": "agent.terminated",
+                               "payload": {"stop_reason": str(stop),
+                                           "session_id": session_id}})
+        usage = _normalize_usage(usage)
+        return events, usage
+
+    def _parse_text(self, lines) -> tuple[list[dict], dict]:
+        visible: list[str] = []
+        usage: dict[str, Any] = {}
+        skip = tuple(self._parse.get("skip_prefixes") or [])
+        rx = self._parse.get("usage_regex") or ""
+        for line in lines:
+            line = line.rstrip("\n")
+            if rx:
+                m = re.search(rx, line)
+                if m:
+                    parsed: dict[str, Any] = {}
+                    for k, v in m.groupdict().items():
+                        if not v:
+                            continue
+                        try:
+                            parsed[k] = int(v)
+                        except ValueError:
+                            try:
+                                parsed[k] = float(v)
+                            except ValueError:
+                                pass  # 非数字捕获跳过该字段，不中断整段解析
+                    if parsed:
+                        usage = parsed
+                    continue
+            if skip and line.lstrip().startswith(skip):
+                continue
+            visible.append(line)
+        text = "\n".join(visible).strip()
+        events: list[dict] = []
+        if text:
+            events.append({"type": "agent.message", "payload": {"text": text}})
+        if usage:
+            usage = _normalize_usage(usage)
+            events.append({"type": "agent.usage", "payload": dict(usage)})
+        return events, usage
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        sid = _get_path(raw, self._parse.get("session_id_path", "session_id"))
+        return str(sid) if sid else None
+
+
+def load_custom_adapters(state_dir: Path | str) -> list[str]:
+    """扫描 <state_dir>/custom-clis/*.json 注册 GenericAdapter，返回注册的 cli 名列表。
+
+    单文件失败仅 stderr 告警不中断（坏配置不该拖垮整个 daemon 启动）。
+    """
+    custom_dir = Path(state_dir) / "custom-clis"
+    loaded: list[str] = []
+    if not custom_dir.is_dir():
+        return loaded
+    for path in sorted(custom_dir.glob("*.json")):
+        try:
+            cfg = json.loads(path.read_text(encoding="utf-8"))
+            register_adapter(GenericAdapter(cfg))
+            loaded.append(str(cfg.get("cli_name")))
+            print(f"[cli_adapters] registered custom CLI adapter: {cfg.get('cli_name')} <- {path}",
+                  file=sys.stderr)
+        except Exception as exc:
+            print(f"[cli_adapters] failed to load custom CLI {path}: {exc}",
+                  file=sys.stderr)
+    return loaded

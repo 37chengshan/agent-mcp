@@ -51,9 +51,10 @@ def test_spawn_schema_requires_cwd():
 
 def test_spawn_schema_lists_atomcode_task_cli():
     schema = next(tool for tool in mcp_server.TOOLS if tool["name"] == "spawn_agent")["inputSchema"]
-    assert schema["properties"]["target_cli"]["enum"] == [
-        "claude", "grok", "opencode", "omp", "atomcode"
-    ]
+    enum = schema["properties"]["target_cli"]["enum"]
+    for expect in ("claude", "grok", "opencode", "omp", "atomcode",
+                   "codex", "kimi", "copilot", "pi", "zcode", "cline"):
+        assert expect in enum
 
 
 def test_wait_agent_schema_timeout_custom_cap():

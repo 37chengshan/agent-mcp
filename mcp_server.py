@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_mcp import SESSION_MISMATCH_MARK
+from agent_mcp.cli_adapters import adapter_names, load_custom_adapters
 
 SERVER_VERSION = "2.1.0"
 LEGACY_PROTOCOL_VERSION = "2025-03-26"
@@ -45,6 +46,10 @@ def state_dir_from_env() -> Path:
 
 STATE_DIR = state_dir_from_env()
 DAEMON_JSON = STATE_DIR / "daemon.json"
+# 自定义 CLI 适配器（<state_dir>/custom-clis/*.json）与本层同步注册，
+# 使 spawn_agent 的 target_cli enum 动态包含用户自定义 CLI
+load_custom_adapters(STATE_DIR)
+_CLI_NAMES = adapter_names()
 SESSION_ID_PREFIX = STATE_DIR / "session-id"
 # 宿主注入的稳定会话标识（同对话 resume 不变）优先；缺失时按 host 持久化兜底
 _HOST_SESSION_ENV_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID",
@@ -78,14 +83,15 @@ TOOLS = [
     {
         "name": "spawn_agent",
         "description": "创建任务 agent 并启动 CLI 子进程（槽位满则排队，返回 status=queued）。"
-                       "target_cli 为 claude/grok/opencode/omp/atomcode；context 注入父摘要；"
+                       "target_cli 为内置 CLI（claude/grok/opencode/omp/atomcode/codex/kimi/copilot/"
+                       "pi/zcode/cline）或用户自定义 CLI（见 docs/custom-cli.md）；context 注入父摘要；"
                        "resume 透传 CLI session id（AtomCode 不支持稳定 session-id resume）。"
                        "返回 agent_id 用于后续监控。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "target_cli": {"type": "string",
-                               "enum": ["claude", "grok", "opencode", "omp", "atomcode"],
+                               "enum": _CLI_NAMES,
                                "description": "执行任务的 CLI。"},
                 "prompt": {"type": "string", "description": "任务提示词。"},
                 "task_name": {"type": "string", "description": "分层名称，如 /root/task1。"},

@@ -20,7 +20,8 @@ import psutil
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent_mcp import SESSION_MISMATCH_MARK
-from agent_mcp.cli_adapters import ResumeUnsupportedError, get_adapter
+from agent_mcp.cli_adapters import (ResumeUnsupportedError, get_adapter,
+                                    load_custom_adapters)
 from agent_mcp.daemon_http import DaemonHTTPServer, EventBroadcaster, HEARTBEAT_SECONDS
 from agent_mcp.db import DB
 from agent_mcp.dispatch import (SlotScheduler, is_pid_running, spawn_cli_worker,
@@ -36,7 +37,10 @@ MAX_WAIT_SECONDS = float(os.environ.get("AGENT_MCP_MAX_WAIT", "600"))
 # context_mode=compact 的截断阈值：超过此字符才 head+tail 截中间
 CONTEXT_COMPACT_THRESHOLD = 8_000
 # P7: CLI 首启耗时矩阵（秒）——spawn 返 min_expected_seconds 便主 agent 规划等待节奏
-_CLI_FIRST_START_SECONDS = {"claude": 3, "grok": 120, "omp": 5, "atomcode": 8}
+# 新适配器暂按 10s 保守估计（⏳ 待实测），自定义 CLI 由 load_custom_adapters 动态并入
+_CLI_FIRST_START_SECONDS = {"claude": 3, "grok": 120, "omp": 5, "atomcode": 8,
+                            "codex": 10, "kimi": 10, "copilot": 10,
+                            "pi": 10, "zcode": 10, "cline": 10}
 # 子代理"完成前自审"提醒：spawn 首次追加全文；followup 不重复全文，改追加短标记
 SELF_CHECK_REMINDER = (
     "\n\n[完成前自审] 回传 FINAL_ANSWER 前必须自证目标达成："
@@ -1337,6 +1341,12 @@ def main() -> int:
 
     token = _load_or_create_token(state_dir)
     db = DB(state_dir / "daemon.db")
+    # 自定义 CLI 适配器：<state_dir>/custom-clis/*.json，启动即注册（首启耗时并入矩阵）
+    for cli_name in load_custom_adapters(state_dir):
+        try:
+            _CLI_FIRST_START_SECONDS[cli_name] = get_adapter(cli_name).first_start_seconds
+        except Exception:
+            pass
     # D3+D4: 启动时主动清理过期 spawn_cache + 7 天前 events，并启动 6h 循环 Timer
     for purge in (db.purge_spawn_cache, db.purge_events):
         try:

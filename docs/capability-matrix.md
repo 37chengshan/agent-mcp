@@ -1,7 +1,7 @@
 # 四 CLI 能力矩阵（实测记录）
 
 > 更新原则：每项标 ✅=已实测 / ⏳=待实测。实现 Task 0 时逐项确认。
-> 2026-08-12 复核：未新增实测，条目状态不变。
+> 2026-08-12 复核：新增适配器 codex/kimi/copilot/pi/zcode/cline（⏳ 待实测）；既有四 CLI 状态不变。
 
 | 能力 | claude (2.1.220) | grok (0.2.118) | opencode (1.14.51) | omp(pi) |
 |---|---|---|---|---|
@@ -23,3 +23,16 @@
 4. grok 首次初始化慢（模型发现）：spawn 时 timeout 预算需预留（>120s），或常驻预热
 5. 三主载体注册：codex config.toml ✅（已知）；claude .mcp.json ✅（已知）；omp `~/.omp/agent/` MCP client 配置 ⏳（日志已确认支持 MCP 加载）
 6. omp 二进制在 `~/.bun/bin/omp`（bun 安装）——Windows 安装路径待实测
+
+## 新增适配器（2026-08-12 接入，⏳ 待实测）
+
+> 依据官方文档/社区调研实现，字段细节待真实输出校准；见 `agent_mcp/cli_adapters.py` 各适配器 docstring。
+
+| 适配器 | headless 命令 | 事件流 | resume | 权限 | 备注 |
+|---|---|---|---|---|---|
+| codex | `codex exec --json <prompt>` | JSONL：`thread.started`/`item.*`（assistant_message/command_execution…）/`turn.completed`（usage: input/cached→cache_read/output/reasoning） | `codex exec resume --last` / `<thread_id>` | 默认只读沙箱；`--sandbox workspace-write`；`--dangerously-bypass-approvals-and-sandbox` | 字段名有版本漂移（item_type→type），解析兼容两种 |
+| kimi | `kimi -p <prompt> --output-format stream-json` | JSONL（仿 claude/grok：assistant/result 行） | `-S/--session <id>`、`-c` 续最近 | `-p` 与 `--yolo/--auto/--plan` 互斥：非交互默认 auto | npm `@moonshot-ai/kimi-code` |
+| copilot | `copilot -p <PROMPT>` | 文本捕获（无 JSONL 文档化） | `--resume=<id>` / `-c` | `--allow all`（=COPILOT_ALLOW_ALL） | 新一代 github/copilot-cli；`gh copilot` 已弃用 |
+| pi | `pi --mode json <prompt>` | JSONL：首行 `session{id}` + `message_end`（权威 message）/`agent_end` | `pi -c` / `--session <id>` | ⏳ | **Pi 与 omp 是两个项目**；npm `@earendil-works/pi-coding-agent` |
+| zcode | `zcode --prompt <prompt>` | 文本捕获（headless 路径未实证） | `--session <id>`（⏳） | ⏳ | CLI 直连有 401 认证障碍；GUI 走 app-server 协议 |
+| cline | `cline --prompt <prompt>` | 文本捕获 | `--resume <id>`（⏳） | ⏳ | 主要 VS Code 扩展；独立 CLI headless 不明确 |
