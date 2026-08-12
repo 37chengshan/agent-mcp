@@ -70,6 +70,8 @@ _DAEMON_PATHS = {
     "list_agents": "/api/agents/list",
     "get_agent_activity": "/api/agents/activity",
     "get_token_usage": "/api/usage",
+    "memory_store": "/api/memory/store",
+    "memory_recall": "/api/memory/recall",
 }
 
 TOOLS = [
@@ -285,6 +287,50 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True},
     },
+    {
+        "name": "memory_store",
+        "description": "写一条项目记忆（记忆银行，零依赖 SQLite）。content 必填；"
+                       "kind 为 decision/lesson/convention/final_answer（默认 lesson）；"
+                       "key 可选键名，tags 为空格分隔标签串；session_id 缺省当前会话（同会话隔离）。"
+                       "适合沉淀决策、经验教训、约定等供后续 memory_recall 召回。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "记忆正文（必填）。"},
+                "kind": {"type": "string",
+                         "enum": ["decision", "lesson", "convention", "final_answer"],
+                         "default": "lesson",
+                         "description": "记忆类型（默认 lesson）。"},
+                "key": {"type": "string", "description": "可选键名，便于精确召回。"},
+                "tags": {"type": "string", "description": "可选标签串（空格分隔），参与关键词检索。"},
+                "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
+            },
+            "required": ["content"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "memory_recall",
+        "description": "检索项目记忆：query 关键词 LIKE 命中 content/key/tags（中文场景比 FTS5 可靠），"
+                       "可按 kind 过滤，按时间倒序，limit 截断（默认 5，上限 20）；"
+                       "仅返回同 session 的记忆（隔离）。返回 memories 列表，每条含 "
+                       "id/kind/key/content/tags/created_at/source。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "关键词；缺省返回该 session 最近记忆。"},
+                "kind": {"type": "string",
+                         "enum": ["decision", "lesson", "convention", "final_answer"],
+                         "description": "按类型过滤；缺省不过滤。"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5,
+                          "description": "返回条数上限（默认 5，最大 20）。"},
+                "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
 ]
 
 
@@ -437,7 +483,7 @@ def _pruned_tools(request: dict[str, Any]) -> list[dict[str, Any]]:
         name = tool.get("name")
         if name in _TOOL_PRUNE_KEEP or name in declared:
             kept.append(tool)
-    # 兜底也只返通用三件（spawn/wait/interrupt），不返全量 TOOLS，
+    # 兜底也只返通用四件（spawn/wait/interrupt/estimate_complexity），不返全量 TOOLS，
     # 省 legacy/未声明 client 每回合 schema overhead
     return kept or [t for t in TOOLS if t.get("name") in _TOOL_PRUNE_KEEP]
 
@@ -607,15 +653,27 @@ def _ensure_token_file() -> str:
 
 
 def _spawn_detached(command: list[str], *, env: dict[str, str] | None = None) -> None:
-    """跨平台分离启动 daemon（薄层零依赖，不复用 agent_mcp.dispatch 的 psutil 路径）。"""
+    """跨平台分离启动 daemon（薄层零依赖，不复用 agent_mcp.dispatch 的 psutil 路径）。
+
+    stderr 落盘到 state_dir/daemon.err.log（而非 DEVNULL），daemon 内部
+    print 诊断（ingest 失败等）可事后排查；stdout 仍丢弃。
+    """
+    err_log = STATE_DIR / "daemon.err.log"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        err_fh = err_log.open("a", encoding="utf-8")
+    except Exception:
+        err_fh = subprocess.DEVNULL
     kwargs: dict[str, Any] = dict(env=env, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                  stdout=subprocess.DEVNULL, stderr=err_fh)
     if os.name == "nt":
         kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
                                    | getattr(subprocess, "DETACHED_PROCESS", 0))
     else:
         kwargs["start_new_session"] = True
     subprocess.Popen(command, **kwargs)
+    if err_fh is not subprocess.DEVNULL:
+        err_fh.close()
 
 
 _STARTUP_LOCK = threading.Lock()

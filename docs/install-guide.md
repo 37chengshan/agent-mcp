@@ -9,7 +9,7 @@
 
 Agent MCP 是一个 **MCP 服务器 + 编排 Skill**：
 
-- `mcp_server.py`：MCP stdio 服务器，暴露 9 个编排工具（`spawn_agent` / `send_message` / `steer_agent` / `followup_task` / `wait_agent` / `interrupt_agent` / `list_agents` / `get_agent_activity` / `get_token_usage` + `estimate_complexity`）
+- `mcp_server.py`：MCP stdio 服务器，暴露 12 个工具——9 个编排工具（`spawn_agent` / `send_message` / `steer_agent` / `followup_task` / `wait_agent` / `interrupt_agent` / `list_agents` / `get_agent_activity` / `get_token_usage` + `estimate_complexity`）+ 记忆银行（`memory_store` / `memory_recall` 跨会话项目记忆）
 - `skill/`：编排工作流 Skill（SKILL.md + 10 个内置 Agent 预设 + 任务简报模板）
 - 安装后，你的 agent 可以把任意 CLI（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展）当子 Agent 工作池派发任务
 

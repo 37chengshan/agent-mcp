@@ -93,13 +93,41 @@
 | 5 | Windows 平台 | 三处跨平台分支（进程树/拉起/控制台）未在真实 Windows 验证 | 双平台 CI 冒烟 |
 | 6 | 网页浏览器渲染 | 本次仅静态结构 + SSE 直播流断言；impl-t11 已交付渲染验证 | 人工复核 `http://127.0.0.1:8765/` |
 | 7 | skill 跨宿主自动编排 | 六步工作流装载依赖宿主 skill 机制 | 各主载体新会话实测 |
-| 8 | 任务级 timeout_seconds 未实现 | schema 与 skill 文档声明 1-1800，但 Dispatcher→spawn_cli_worker 全链路未读该参数；wait_agent 轮询超时上限已可自定义（默认 30s，`AGENT_MCP_MAX_WAIT` 环境变量可调至 600s），但那是轮询超时非任务超时 | 实现终止定时器后启用；当前传值被忽略 |
-| 9 | 运行中无实时事件流 | 事件为 worker 完成后一次性 ingest（daemon_main._ingest_output）；运行中 agent 在网页上无 message/tool_use 实时显示，仅状态迁移直播（spawned→running→terminated） | 后续做 worker 侧流式 tail + 增量 ingest |
-| 10 | daemon 崩溃孤儿回收未实现 | 重启无孤儿扫描：崩溃时运行中 worker 继续跑，重启后 agent 卡 running、out.log 无人 ingest | 启动时扫 state_dir 非 finished worker 标记 daemon_restart |
-| 11 | SSE last_seq 回放未实现 | daemon_http._stream_events 忽略 last_seq 查询参数与 Last-Event-ID 头；断线期间事件丢失（前端 dedupe 有、回放无） | 实现按 seq 回放后前端无需改动 |
+
+## 已补齐遗留项（原清单 #8–#11 → ✅ 已实现）
+
+| # | 项 | 状态 | 证据 |
+|---|---|---|---|
+| 8 | 任务级 timeout_seconds | ✅ | `daemon_main.py` `_coerce_timeout_seconds`（146–157 行）daemon 边界校验（空/None→禁用，非正数→同步 ValueError，不启动 worker）；`Dispatcher.spawn`/`followup` 校验后透传 body（400–401、482–483 行）；`dispatch.py` `spawn_cli_worker`（148、179、206–207 行）透传 worker；`dispatch_worker.py` 超时终止 CLI 进程树（`terminate_tree`，37 行起；85、114–121 行）并写 `timed_out=true`（132–133 行，daemon 映射 incomplete）。单测 `test_dispatcher.py::test_spawn_timeout_seconds_passed_to_worker`（385 行）覆盖 spawn body→worker 全链路。**实测**：`python3 -m pytest tests/test_dispatcher.py -q -k timeout` → 7 passed |
+| 9 | 运行中实时事件流 | ✅ | `daemon_main.py` `_tail_progress`（922–929 行注释：运行中增量 tail，新字节→touch_activity 心跳 + 轻量 delta 广播）+ `_tail`（120 行）；`agent.message_delta` 只广播不落库（963–966 行，`db.insert_event` 对 message_delta 返回 None），权威事件（message/usage/terminated）仍由完成态 `_ingest_output` 一次性 ingest（1127–1131 行注释） |
+| 10 | daemon 崩溃孤儿回收 | ✅ | `daemon_main.py` `_recover_orphans`（321–338 行）：启动时扫 DB 所有 running 状态 agent，`is_pid_running(pid)` 不存活 → 标 `incomplete` + `stop_reason="orphaned"` + 广播 `agent.orphaned`；Dispatcher 启动即调用（308 行）。运行期孤儿检测另有 `_check_worker`（793–796 行注释）+ `test_orphan_*` 3 单测覆盖（`test_dispatcher.py` 608/635/668 行） |
+| 11 | SSE last_seq 回放 | ✅ | `daemon_http.py` `_stream_events`（218 行起）：`last_seq` 查询参数（229 行）与 `Last-Event-ID` 头（233 行）取回放起点；先 connect 后回放（221–222 行注释），回放以连接时刻 `max_seq` 为固定上界分页补发 `(last_seq, boundary]`（250 行，每页至多 1000 条），已回放 seq 记入 replayed 去重，不重不丢顺序严格。单测：`test_daemon_http.py::test_events_last_seq_replays_persisted_events_then_live`（174 行）+ `test_events_replays_over_1000_persisted_events_tail_delivered`（212 行）。**实测**：`python3 -m pytest tests/test_daemon_http.py -q -k "last_seq or replay"` → 3 passed |
 
 ## 验收总评
 
 - **实测通过**：claude + omp 真实任务全链路、MCP stdio 全工具面、中断/重启稳定性、usage 对账四字段全等、内存 26.5MB、页面 5ms、三端注册片段（codex/claude 实测、omp 指引）
 - **期间修复**：claude result 行解析（顶层结构兼容，output/cost 不再丢失）
+- **已知设计**：D5 工具静态裁剪——`tools/list` 默认只暴露四件通用工具（spawn_agent / wait_agent / interrupt_agent / estimate_complexity，`mcp_server.py` `_TOOL_PRUNE_KEEP`，414 行）；client 在 tools/list 请求 `params._meta.clientCapabilities.extensions` 声明 `io.modelcontextprotocol/tools` 扩展（`used` 工具名列表）才暴露全量（`_pruned_tools`，417–442 行）。`tools/call` 不拦截（838 行起直接派发），未声明时直接调用工具名仍可用
 - **遗留**：grok/opencode 真实冒烟、Windows、omp 注册自动写入、omp resume、skill 跨宿主（均非阻塞，见清单）
+
+## flaky 复现与修复（2026-08-12）
+
+**复现**：修复前循环 `python3 -m pytest tests/test_integration.py::test_mcp_stdio_end_to_end -q` 5 次，1 败（wait 返回 `running` 而非 `terminated`）。失败局 usage 已正确落库（input_tokens=81452），worker `completed_at` 晚于测试 30s 等待窗口——共享 model 负载下 claude 短任务可超过单次短阻塞窗口，属 L2 设计内行为（wait 超时返 liveness + "call wait_agent again" 提示），测试单次等待未按契约续等。
+
+**修复**：
+- `daemon_main.py` `wait()` 超时路径增加 GRACE 竞态守卫（`_WAIT_GRACE_SECONDS=5.0`/`_WAIT_GRACE_POLL=0.1`）：worker 已退出但 `_check_worker` 完成处理（`_ingest_output`/`_set_status`）尚未落库时轮询 DB 等终态，避免"worker 已死却报 running"的窄窗口误判。
+- `tests/test_integration.py` 等待路径按 L2 契约重试 `wait_agent` 至终态（总预算 120s），真实负载下不再依赖单次 30s 窗口。
+
+**验证**（2026-08-12，修复后连续 5 次全过）：
+```bash
+for i in 1 2 3 4 5; do python3 -m pytest tests/test_integration.py::test_mcp_stdio_end_to_end -q; done
+```
+| 次 | 结果 | 耗时 |
+|---|---|---|
+| 1 | ✅ passed | 19.54s |
+| 2 | ✅ passed | 13.74s |
+| 3 | ✅ passed | 17.00s |
+| 4 | ✅ passed | 12.92s |
+| 5 | ✅ passed | 14.17s |
+
+依赖回归：`python3 -m pytest tests/test_dispatcher.py -q` → 30 passed。

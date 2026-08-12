@@ -134,3 +134,9 @@ def test_web_mobile_form_controls_avoid_ios_focus_zoom():
     html = WEB_HTML.read_text(encoding="utf-8")
     assert "@media (max-width:639px)" in html
     assert "font-size:16px" in html
+
+def test_web_graph_wraps_overflow_into_horizontal_pages_and_focuses_latest_agent():
+    """导图固定纵向槽位，超出后横向换页；首次视角聚焦最新 agent。"""
+    html = WEB_HTML.read_text(encoding="utf-8")
+    assert "ROW_H" in html and "MAX_ROWS" in html and "WRAP_W" in html
+    assert "latestAgent" in html and "focusLatest" in html and "focusNode" in html and "clampPan" in html

@@ -18,7 +18,7 @@
 | 🎯 **验证回投** | `verify_command` + `max_fix_attempts`：daemon 自跑验证，失败自动同 session 回投修复，只把最终结果交回主 Agent |
 | 💰 **成本控制** | `token_budget` 超额自动降档 model 重跑；`cache_ttl` 读密集结果秒级缓存（TTL 内 0 token）；`summary_chars` / `context_mode` 裁剪回传体积 |
 | 🔐 **会话隔离** | session_id 是所有权边界：宿主注入的稳定会话标识派生，同一对话重开 MCP 连接旧 agent 仍可用，跨会话不可互操作 |
-| 📊 **实时监控页** | 单文件、零外部依赖的只读 Web UI（SSE 直播事件流 + 对话图 + 明暗主题），daemon 随手起，`GET /` 实测 5ms |
+| 📊 **实时监控页** | 单文件、零外部依赖的只读 Web UI（SSE 直播事件流 + 对话图 + 明暗主题），异常状态（needs_advisor 需决策 / orphaned 失联 / verify 回投 / 降档 / ingest 失败）实时可见，daemon 随手起，`GET /` 实测 5ms |
 | 🧠 **记忆银行** | `memory_store` / `memory_recall` 跨会话项目记忆存取：FINAL_ANSWER 自动沉淀 + 关键词召回注入 |
 | 🛠️ **一键安装** | `install.py` 同时注册 codex / claude / omp / opencode / kimi / zcode 六个 host，装 skill 与 SessionStart hook；或 curl 一键脚本 / 通用提示词交给任意 AI 安装；写配置前自动备份、`--rollback` 可回滚、`--dry-run` 只预览 |
 
@@ -35,7 +35,7 @@
                ▼                                        │
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
 │   mcp_server.py (无状态)      │        │   daemon_main.py (常驻 daemon) │
-│   · 9 个编排工具              │  HTTP  │   · 槽位 / 排队 / 心跳 / 看护   │
+│   · 12 个工具（编排+记忆）     │  HTTP  │   · 槽位 / 排队 / 心跳 / 看护   │
 │   · host 识别 + 会话隔离      │ ─────► │   · 验证回投 / 降档 / 缓存      │
 │   · 无 daemon 时原子拉起      │  X-Auth │   · SQLite 状态机持久化         │
 └──────────────────────────────┘   Token └──────────────┬───────────────┘
@@ -147,6 +147,6 @@ tests/                   # 20+ 测试文件（含真实 stdio 与 CLI 集成冒�
 
 ## 📚 文档
 
-- [安装教程（AI 可读版）](docs/install-guide.md) · [验收清单](docs/acceptance.md) · [四 CLI 能力矩阵](docs/capability-matrix.md)
+- [安装教程（AI 可读版）](docs/install-guide.md) · [CLI 选型指南](skill/cli-guide.md) · [验收清单](docs/acceptance.md) · [四 CLI 能力矩阵](docs/capability-matrix.md)
 - [设计文档](docs/plans/2026-08-03-agent-mcp-redesign-design.md) · [实现计划](docs/plans/2026-08-03-agent-mcp-implementation.md)
 - [编排 Skill 全文](skill/SKILL.md)

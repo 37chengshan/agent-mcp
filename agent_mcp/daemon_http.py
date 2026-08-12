@@ -23,6 +23,8 @@ _API_METHODS = {
     "/api/agents/list": "list_agents",
     "/api/agents/activity": "activity",
     "/api/usage": "usage",
+    "/api/memory/store": "memory_store",
+    "/api/memory/recall": "memory_recall",
 }
 
 

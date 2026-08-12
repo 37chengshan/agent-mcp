@@ -8,6 +8,10 @@ EVENT_TYPES = frozenset({
     "agent.tool_use", "agent.tool_result", "agent.usage",
     "agent.thread_message_sent", "agent.thread_message_received",
     "agent.idle", "agent.terminated", "agent.error", "agent.cancelled",
+    # 异常/运维路径（daemon 广播但不在常规链路；需持久化 + 前端可见）
+    "agent.orphaned", "agent.needs_advisor",
+    "agent.verify_failed", "agent.verify_passed",
+    "agent.budget_downgrade", "agent.ingest_failed",
 })
 NON_PERSISTED = frozenset({"agent.message_delta"})
 

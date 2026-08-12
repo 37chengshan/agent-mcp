@@ -29,7 +29,7 @@
   <g filter="url(#shadow)">
     <rect x="330" y="196" width="300" height="86" rx="12" fill="#FFFFFF" stroke="#9C3D2C" stroke-width="1.5"/>
     <text x="480" y="222" text-anchor="middle" font-size="14" font-weight="700" fill="#9C3D2C">mcp_server.py · MCP 薄层</text>
-    <text x="480" y="244" text-anchor="middle" font-size="11" fill="#6E675A">9 个编排工具 · host 识别 · 会话隔离</text>
+    <text x="480" y="244" text-anchor="middle" font-size="11" fill="#6E675A">12 个工具（编排 + 记忆） · host 识别 · 会话隔离</text>
     <text x="480" y="262" text-anchor="middle" font-size="11" fill="#6E675A">无 daemon 时原子拉起 · stdio 零依赖</text>
   </g>
 

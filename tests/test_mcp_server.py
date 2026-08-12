@@ -35,11 +35,12 @@ def test_initialize_returns_server_info():
     assert mcp_server._HOST == "codex"
 
 
-def test_tools_list_has_ten_tools_in_order():
+def test_tools_list_has_twelve_tools_in_order():
     names = [t["name"] for t in mcp_server.TOOLS]
     assert names == ["spawn_agent", "send_message", "steer_agent", "followup_task",
                      "wait_agent", "interrupt_agent", "list_agents",
-                     "get_agent_activity", "get_token_usage", "estimate_complexity"]
+                     "get_agent_activity", "get_token_usage", "estimate_complexity",
+                     "memory_store", "memory_recall"]
 
 
 def test_spawn_schema_requires_cwd():

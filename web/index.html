@@ -13,7 +13,8 @@
   --green:#3E7A56; --green-soft:#E4F0E8; --red:#B13E33; --red-soft:#F7E4E1;
   --amber:#9A7B2F; --amber-soft:#F5EDD8; --gray:#8B867A; --gray-soft:#F1EFE9;
   --claude:#8A4B2E; --grok:#9A7B2F; --opencode:#3E7A56; --omp:#5A54A3; --atomcode:#286ca6;
-  --radius:16px; --radius-sm:10px;
+  --radius:18px; --radius-sm:12px;
+  --sp1:6px; --sp2:12px; --sp3:20px; --sp4:32px; --sp5:48px;
   --shadow:0 1px 2px rgba(46,42,34,.05),0 4px 14px rgba(46,42,34,.05),0 12px 36px rgba(46,42,34,.04);
   --shadow-pop:0 2px 6px rgba(46,42,34,.08),0 14px 40px rgba(46,42,34,.12);
   --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
@@ -33,14 +34,14 @@
   }
 }
 *{box-sizing:border-box}html,body{width:100%;height:100%;margin:0;overflow:hidden}
-body{display:grid;grid-template-rows:72px auto minmax(0,1fr) 30px;grid-template-areas:"hd" "gt" "mn" "ft";background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
-header{grid-area:hd;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:18px;padding:0 22px;background:var(--card);border-bottom:1px solid var(--line);box-shadow:var(--shadow);z-index:5}
+body{display:grid;grid-template-rows:72px auto minmax(0,1fr) 34px;grid-template-areas:"hd" "gt" "mn" "ft";background:var(--bg);color:var(--ink);font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+header{grid-area:hd;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:18px;padding:0 26px;background:var(--card);border-bottom:1px solid var(--line);z-index:5}
 .brand{display:flex;align-items:center;gap:12px;user-select:none}
 .brand-mark{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent-deep));color:#fff;font:700 15px/1 var(--mono);box-shadow:0 2px 8px rgba(192,80,58,.35)}
 .kicker{font:700 9px/1 var(--mono);letter-spacing:.18em;color:var(--accent);text-transform:uppercase}
-h1{margin:2px 0 0;font-family:var(--serif);font-size:21px;font-weight:700;letter-spacing:-.02em}
+h1{margin:2px 0 0;font-family:var(--serif);font-size:22px;font-weight:700;letter-spacing:-.02em}
 .stats{display:flex;justify-content:center;min-width:0;overflow:hidden;cursor:pointer}
-.stat{display:flex;align-items:center;gap:7px;padding:6px 14px;margin:0 3px;border-radius:var(--radius-sm);white-space:nowrap;transition:background .18s var(--ease),transform .15s var(--ease)}
+.stat{display:flex;align-items:center;gap:7px;padding:8px 16px;margin:0 3px;border-radius:var(--radius-sm);white-space:nowrap;transition:background .18s var(--ease),transform .15s var(--ease)}
 .stat:hover{background:var(--gray-soft);transform:translateY(-1px)}
 .stat .lbl{font:700 9px/1 var(--mono);color:var(--ink-soft);text-transform:uppercase;letter-spacing:.08em}.stat b{font:700 17px/1 var(--serif);font-variant-numeric:tabular-nums}
 .stat.run b{color:var(--accent)}.stat.queued b{color:var(--amber)}.stat.done b{color:var(--green)}.stat.fail b{color:var(--red)}
@@ -58,20 +59,50 @@ select.sess:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0
 /* U5 Gantt */
 #gantt{grid-area:gt;background:var(--card);border-bottom:1px solid var(--line);overflow:hidden;transition:max-height .2s ease}
 #gantt[hidden]{display:none}#gantt.show{display:block}
-#gantt .ghead{display:flex;align-items:center;gap:10px;padding:4px 18px;font:9px/1 var(--mono);color:var(--ink-soft);text-transform:uppercase;letter-spacing:.1em}
+#gantt .ghead{display:flex;align-items:center;gap:10px;padding:10px 26px;font:9px/1 var(--mono);color:var(--ink-soft);text-transform:uppercase;letter-spacing:.1em}
 #gantt .ghead button{margin-left:auto;padding:2px 8px;border:1px solid var(--line);border-radius:5px;background:var(--card);font:9px var(--mono);cursor:pointer}
-#gantt canvas{display:block;width:100%;height:70px}
+#gantt canvas{display:block;width:100%;height:76px}
 main{grid-area:mn;display:flex;flex-direction:row;min-height:0;overflow:hidden}
 #map-pane{flex:3 1 0;min-width:0;min-height:0;overflow:hidden;background:var(--bg);position:relative}
-#map-hint{position:absolute;left:0;top:0;z-index:2;width:100%;height:36px;display:flex;align-items:center;padding:0 18px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 88%,transparent);color:var(--ink-soft);font-size:11px;letter-spacing:.01em;backdrop-filter:blur(8px);pointer-events:none}
-#graph-canvas{position:absolute;top:36px;left:0;cursor:grab}
-#graph-canvas:active{cursor:grabbing}
-#detail-pane{flex:1 1 0;min-width:300px;max-width:44%;overflow-y:auto;border-left:1px solid var(--line);background:var(--card);padding:18px 20px 30px}
-footer{grid-area:ft;display:flex;align-items:center;gap:14px;padding:0 18px;border-top:1px solid var(--line);background:var(--card);color:var(--ink-soft);font:10px/1 var(--mono);white-space:nowrap;overflow:hidden}
+#map-hint{position:absolute;left:0;top:0;z-index:2;width:100%;height:40px;display:flex;align-items:center;padding:0 18px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--bg) 88%,transparent);color:var(--ink-soft);font-size:11px;letter-spacing:.01em;backdrop-filter:blur(8px);pointer-events:none}
+#graph-scroll{position:absolute;inset:40px 0 0 0;overflow:hidden;cursor:grab}
+#graph-scroll.grabbing{cursor:grabbing}
+#graph-viewport{position:absolute;left:0;top:0;transform-origin:0 0}
+#graph-edges,#graph-nodes{position:absolute;left:0;top:0}
+#graph-edges{overflow:visible}
+#graph-edges path{fill:none;stroke:var(--line);stroke-width:1.5;stroke-linecap:round}
+#graph-edges path.on{stroke:var(--accent);stroke-width:2}
+#graph-nodes{pointer-events:none}
+#graph-nodes .node{pointer-events:auto}
+.graph-empty[hidden]{display:none}
+/* 思维导图节点 */
+.node{position:absolute;left:0;top:0;display:flex;align-items:center;gap:10px;border-radius:14px;transition:transform .45s var(--ease),opacity .3s ease,box-shadow .2s ease;cursor:pointer;user-select:none}
+.node:hover{box-shadow:var(--shadow-pop)}
+.node.fresh{animation:nodeIn .35s var(--ease) backwards}
+.node.session{width:190px;height:56px;padding:0 14px;flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;background:linear-gradient(135deg,var(--ink),#4a463d);color:rgba(255,255,255,.9);cursor:default}
+.node.session .nsub{color:rgba(255,255,255,.55)}
+.node.turn{width:168px;height:36px;padding:0 14px;border-radius:999px;background:var(--accent-soft);color:var(--accent-deep)}
+.node.agent{width:210px;height:58px;padding:0 12px;background:var(--card);border:1px solid var(--line);box-shadow:var(--shadow)}
+.node.agent.sel{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.node.agent.st-running::after{content:"";position:absolute;inset:-3px;border-radius:16px;border:1.5px solid var(--accent);animation:nodePulse 1.8s ease-in-out infinite;pointer-events:none}
+.node.agent.st-terminated:not(.sel){opacity:.82}
+.ndot{width:10px;height:10px;border-radius:50%;flex:0 0 10px}
+.nmain{min-width:0;flex:1}
+.ntitle{font-weight:650;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nsub{font:600 9px var(--mono);color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.node.agent.st-running .nsub{color:var(--accent)}
+.node.agent.st-queued .nsub{color:var(--amber)}
+.node.agent.st-error .nsub,.node.agent.st-cancelled .nsub{color:var(--red)}
+.node.agent.st-needs_advisor .nsub{color:var(--amber)}
+.node.agent.st-terminated .nsub{color:var(--green)}
+.nbadges{position:absolute;top:-7px;right:8px;display:flex;gap:4px}
+.nbadges .badge{font:700 8px/1 var(--mono);padding:2px 7px}
+#detail-pane{flex:1 1 0;min-width:300px;max-width:44%;overflow-y:auto;border-left:1px solid var(--line);background:var(--card);padding:26px 26px 40px}
+footer{grid-area:ft;display:flex;align-items:center;gap:14px;padding:0 26px;border-top:1px solid var(--line);background:var(--card);color:var(--ink-soft);font:10px/1 var(--mono);white-space:nowrap;overflow:hidden}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--gray);box-shadow:0 0 0 3px var(--gray-soft)}.dot.ok{background:var(--green);box-shadow:0 0 0 3px var(--green-soft)}.dot.bad{background:var(--amber);box-shadow:0 0 0 3px var(--amber-soft)}.dot.conn{background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .live-b{font:700 9px/1 var(--mono);padding:3px 8px;border:1px solid var(--line);border-radius:999px;letter-spacing:.05em}.live-b.live{color:var(--green);border-color:var(--green);background:var(--green-soft)}.live-b.buf{color:var(--amber);border-color:var(--amber);background:var(--amber-soft)}.live-b.disc{color:var(--red);border-color:var(--red);background:var(--red-soft)}
 .foot-tag{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;background:var(--gray-soft);font:700 9px/1 var(--mono)}
-.dk{display:flex;align-items:center;gap:8px;margin:22px 0 10px;color:var(--ink-soft);font:700 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}
+.dk{display:flex;align-items:center;gap:8px;margin:32px 0 12px;color:var(--ink-soft);font:700 10px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase}
 .dk::after{content:"";height:1px;flex:1;background:var(--line)}
 h2.aname{margin:0;font-family:var(--serif);font-size:19px;font-weight:700;line-height:1.25;letter-spacing:-.02em;word-break:break-all}
 .cli-badge{display:inline-block;margin-left:8px;padding:3px 9px;border-radius:999px;color:#fff;font:700 9px/1 var(--mono);vertical-align:3px;text-transform:uppercase;box-shadow:0 1px 3px rgba(46,42,34,.15)}
@@ -81,16 +112,16 @@ h2.aname{margin:0;font-family:var(--serif);font-size:19px;font-weight:700;line-h
 .badge.stuck{border-color:var(--red);color:var(--red)}.badge.fail{border-color:var(--amber);color:var(--amber)}
 .badge.silent{border-color:var(--gray);color:var(--gray)}.badge.timeout{border-color:var(--red);color:var(--red)}
 table.sum{width:100%;border-collapse:collapse;font-size:11.5px}table.sum td{padding:6px 0;border-bottom:1px solid var(--line);word-break:break-all}table.sum td:first-child{width:74px;color:var(--ink-soft);font-weight:600}
-.cur-act{padding:10px 12px;border-left:3px solid var(--accent);background:var(--accent-soft);font-size:11px;border-radius:0 var(--radius-sm) var(--radius-sm) 0}.cur-act .tn{font-weight:700;color:var(--ink)}.cur-act .in{color:var(--ink-soft);font:10px/1.5 var(--mono);white-space:pre-wrap}.cur-act .ico{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:7px;animation:breathe 1.6s ease-in-out infinite}
-.msgs{display:flex;flex-direction:column;gap:7px}.msg{padding:9px 11px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--bg);font-size:11px;white-space:pre-wrap;word-break:break-word}
+.cur-act{padding:12px 14px;border-left:3px solid var(--accent);background:var(--accent-soft);font-size:11px;border-radius:0 var(--radius-sm) var(--radius-sm) 0}.cur-act .tn{font-weight:700;color:var(--ink)}.cur-act .in{color:var(--ink-soft);font:10px/1.5 var(--mono);white-space:pre-wrap}.cur-act .ico{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:7px;animation:breathe 1.6s ease-in-out infinite}
+.msgs{display:flex;flex-direction:column;gap:10px}.msg{padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--bg);font-size:11px;white-space:pre-wrap;word-break:break-word}
 .msg.delta{border-style:dashed;color:var(--ink-soft)}.msg .seq{margin-right:6px;color:var(--ink-soft);font:9px/1 var(--mono)}
-.events{font-size:9.5px}.ev{display:grid;grid-template-columns:34px 120px minmax(0,1fr);gap:6px;padding:4px 0;border-bottom:1px solid var(--line)}
+.events{font-size:9.5px}.ev{display:grid;grid-template-columns:34px 120px minmax(0,1fr);gap:6px;padding:7px 0;border-bottom:1px solid var(--line)}
 .ev .seq{color:var(--ink-soft);font-family:var(--mono)}.ev .tp{font-weight:650;white-space:nowrap;color:var(--ink)}.ev .py{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-soft)}
 .ev .tp.tool{color:var(--accent)}.ev .tp.msg{color:var(--green)}.ev .tp.term{color:var(--gray)}.ev .tp.err{color:var(--red)}.ev .tp.use{color:var(--amber)}
 .empty{padding:26px 0;text-align:center;color:var(--ink-soft);font-size:11px}
 #search-box{width:100%;margin-bottom:10px;padding:7px 10px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--bg);color:var(--ink);font:12px inherit;transition:border-color .18s var(--ease),box-shadow .18s var(--ease)}
 #search-box:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
-.operator{margin:16px -20px 0;padding:13px 20px;border-block:1px solid var(--line);background:var(--bg)}
+.operator{margin:16px -26px 0;padding:13px 26px;border-block:1px solid var(--line);background:var(--bg)}
 .operator label{display:block;margin-bottom:7px;color:var(--ink-soft);font:700 10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}
 .operator textarea{width:100%;min-height:76px;padding:9px 11px;border:1px solid var(--line);border-radius:var(--radius-sm);resize:vertical;background:var(--card);color:var(--ink);font:12px/1.5 inherit;transition:border-color .18s var(--ease),box-shadow .18s var(--ease)}
 .operator textarea:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
@@ -132,7 +163,7 @@ table.sum{width:100%;border-collapse:collapse;font-size:11.5px}table.sum td{padd
 /* ============ 布局重构：可拖动分面板 + 呼吸感动画 ============ */
 /* 三块可拖动：map-pane 与 detail-pane 之间拖拽分隔条；Gantt 可折；usage 面板可拖 */
 #map-pane.resizing{user-select:none;cursor:col-resize}
-#map-pane.resizing #graph-canvas{cursor:col-resize}
+#map-pane.resizing #graph-scroll{cursor:col-resize}
 main.resizing{user-select:none;cursor:col-resize}
 #drag-divider{position:relative;z-index:10;width:6px;flex:0 0 6px;cursor:col-resize;background:transparent;transition:background .18s ease}
 #drag-divider:hover,#drag-divider.active{background:var(--accent-soft)}
@@ -148,7 +179,7 @@ main.resizing{user-select:none;cursor:col-resize}
 #gantt:hover,#usage-panel:hover{box-shadow:0 2px 6px rgba(61,57,41,.08),0 10px 28px rgba(61,57,41,.09)}
 /* 节点呼吸：运行中脉冲 / 新节点出现 / 终态淡入 */
 @keyframes nodePulse{0%,100%{box-shadow:0 0 0 0 rgba(193,95,60,.35)}50%{box-shadow:0 0 0 7px rgba(193,95,60,0)}}
-@keyframes nodeIn{from{opacity:0;transform:scale(.82)}to{opacity:1;transform:scale(1)}}
+@keyframes nodeIn{from{opacity:0;scale:.82}to{opacity:1;scale:1}}
 @keyframes nodeSettled{0%{transform:scale(1)}45%{transform:scale(1.07)}100%{transform:scale(1)}}
 @keyframes breathe{0%,100%{opacity:.55}50%{opacity:1}}
 @keyframes statBump{0%{transform:scale(1)}40%{transform:scale(1.24)}100%{transform:scale(1)}}
@@ -212,8 +243,14 @@ h2.aname{letter-spacing:-.015em}
 <div id="usage-panel" hidden></div>
 <main id="main-pane">
   <section id="map-pane">
-    <div id="map-hint">每次用户输入生成一个节点，向右连接本轮 agent · 拖拽平移 · 滚轮缩放 · 点击节点查看详情 · 拖动中间分隔条调整布局</div>
-    <canvas id="graph-canvas"></canvas>
+    <div id="map-hint">思维导图：会话在左，回合与 agent 分支向右展开 · 拖拽平移 · 滚轮缩放 · 点击节点查看详情</div>
+    <div id="graph-scroll">
+      <div id="graph-viewport">
+        <svg id="graph-edges"></svg>
+        <div id="graph-nodes"></div>
+      </div>
+      <div class="graph-empty" hidden></div>
+    </div>
   </section>
   <div id="drag-divider" role="separator" aria-orientation="vertical" title="拖动调整详情面板宽度" tabindex="0"></div>
   <aside id="detail-pane"><div class="empty">选择 agent 节点查看详情</div></aside>
@@ -259,7 +296,7 @@ h2.aname{letter-spacing:-.015em}
  * 单文件零依赖。canvas pan/zoom + 增量渲染 + SSE 退避重连
  * + Gantt + token 面板 + replay scrubber + template 详情 + 异常 badges + 明暗主题
  * ============================================================ */
-const EVENT_TYPES=["agent.spawned","agent.user_turn","agent.running","agent.message","agent.message_delta","agent.tool_use","agent.tool_result","agent.usage","agent.thread_message_sent","agent.thread_message_received","agent.idle","agent.terminated","agent.error","agent.cancelled"];
+const EVENT_TYPES=["agent.spawned","agent.user_turn","agent.running","agent.message","agent.message_delta","agent.tool_use","agent.tool_result","agent.usage","agent.thread_message_sent","agent.thread_message_received","agent.idle","agent.terminated","agent.error","agent.cancelled","agent.orphaned","agent.needs_advisor","agent.verify_failed","agent.verify_passed","agent.budget_downgrade","agent.ingest_failed"];
 const SEQ_KEY="amcp_last_seq",SEL_KEY="amcp_sel",MSG_PAGE=40;
 
 /* 全局状态 */
@@ -269,7 +306,7 @@ const S={
   seen:new Set(),sessions:new Set(["all"]),sse:"connecting",sseEs:null,sseRetry:0,
   msgsShown:MSG_PAGE,snapTimer:null,snapErr:"",token:"",opMode:"steer",opBusy:false,opFeedback:"",
   /* U3 增量渲染 */
-  dirty:new Set(),fullRedrawTimer:null,lastGraph:null,lastLayout:null,
+  fullRedrawTimer:null,lastGraph:null,nodeEls:new Map(),_fitted:false,
   /* U2 canvas pan/zoom */
   pan:{x:0,y:0},zoom:1,drag:null,
   /* U7 replay */
@@ -289,8 +326,8 @@ function shortLabel(v,n=24){const s=String(v||"").replace(/\s+/g," ").trim();ret
 function shortName(v){const p=String(v||"").split("/").filter(Boolean),s=p.length?p[p.length-1]:String(v||"");return shortLabel(s,22);}
 function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()||"#888";}
 function cliColor(cli,isRoot){if(isRoot)return"var(--accent)";return cli==="grok"?"var(--grok)":cli==="opencode"?"var(--opencode)":cli==="omp"?"var(--omp)":cli==="atomcode"?"var(--atomcode)":"var(--claude)";}
-function statusColor(s){return s==="running"?"var(--accent)":s==="terminated"?"var(--green)":s==="error"?"var(--red)":"var(--gray)";}
-function statusLabel(s){return s==="running"?"运行中":s==="terminated"?"完成":s==="queued"?"排队":s==="error"?"失败":s==="cancelled"?"已取消":s==="incomplete"?"超时":s||"—";}
+function statusColor(s){return s==="running"?"var(--accent)":s==="terminated"?"var(--green)":s==="error"?"var(--red)":s==="needs_advisor"?"var(--amber)":"var(--gray)";}
+function statusLabel(s){return s==="running"?"运行中":s==="terminated"?"完成":s==="queued"?"排队":s==="error"?"失败":s==="cancelled"?"已取消":s==="incomplete"?"超时/失联":s==="needs_advisor"?"需决策":s||"—";}
 function anomalyLabel(k){return{"stuck_loop":"卡循环","high_fail":"高失败","silent":"静默","timeout":"超时"}[k]||k;}
 
 /* U4 SSE 退避重连 */
@@ -309,7 +346,8 @@ async function apiPost(path,body){
 function clearState(){
   S.agents=new Map();S.children=new Map();S.eventLog=new Map();S.usage=new Map();
   S.deltas=new Map();S.curTool=new Map();S.seen=new Set();S.lastSeq=0;S.msgsShown=MSG_PAGE;
-  markAllDirty();
+  S.nodeEls?.forEach(el=>el.remove());S.nodeEls?.clear();S._fitted=false;
+  scheduleRender();
 }
 async function loadSnapshot(reset){
   if(reset)clearState();
@@ -317,10 +355,10 @@ async function loadSnapshot(reset){
   try{
     const r=await fetch("/api/snapshot"+q);
     if(!r.ok){S.snapErr="快照不可用 ("+r.status+")";scheduleRender();return;}
-    applySnapshot(await r.json());S.snapErr="";
+    applySnapshot(await r.json(),reset);S.snapErr="";
   }catch(e){S.snapErr="无法连接 daemon";scheduleRender();}
 }
-function applySnapshot(s){
+function applySnapshot(s,focusLatest=false){
   const kept=[...S.eventLog.entries()].filter(([seq])=>seq>(s.last_seq||0));
   S.eventLog.clear();
   for(const e of s.events||[])if(typeof e.seq==="number")S.eventLog.set(e.seq,e);
@@ -332,9 +370,8 @@ function applySnapshot(s){
   for(const u of((s.usage||{}).per_agent)||[])S.usage.set(u.agent_id,u);
   S.sessions=new Set(["all"]);
   for(const a of S.agents.values())S.sessions.add(a.session_id||"unknown");
-  if(!S.agents.has(S.selected))S.selected=firstAgent();
+  if(focusLatest||!S.agents.has(S.selected))S.selected=latestAgent();
   localStorage.setItem(SEQ_KEY,String(S.lastSeq));
-  markAllDirty();
   scheduleRender();
 }
 function rebuildChildren(){
@@ -344,7 +381,13 @@ function rebuildChildren(){
     S.children.get(a.parent_id).push(a.id);
   }
 }
-function firstAgent(){const a=[...S.agents.keys()].sort((x,y)=>x-y);return a.length?a[0]:null;}
+function latestAgent(){
+  const a=[...S.agents.values()].sort((x,y)=>{
+    const xt=Date.parse(x.created_at||"")||0,yt=Date.parse(y.created_at||"")||0;
+    return yt-xt||(Number(y.id)||0)-(Number(x.id)||0);
+  });
+  return a.length?a[0].id:null;
+}
 function scheduleSnapshot(){
   if(S.snapTimer)return;
   S.snapTimer=setTimeout(()=>{S.snapTimer=null;loadSnapshot(false);},400);
@@ -388,6 +431,17 @@ function onEvent(type,ev){
     a.status=payload.stop_reason==="timeout"?"incomplete":"terminated";
     a.stop_reason=payload.stop_reason;
     markDirty(aid);
+  }else if(type==="agent.needs_advisor"&&S.agents.has(aid)){
+    const a=S.agents.get(aid);a.status="needs_advisor";
+    if(payload.question)a.stop_reason=String(payload.question).slice(0,120);
+    markDirty(aid);
+  }else if(type==="agent.orphaned"&&S.agents.has(aid)){
+    const a=S.agents.get(aid);a.status="incomplete";a.stop_reason="orphaned";
+    markDirty(aid);
+  }else if(type==="agent.verify_failed"&&S.agents.has(aid)){
+    const a=S.agents.get(aid);a.stop_reason="verify_failed(attempt "+String(payload.attempt||1)+")";markDirty(aid);
+  }else if(type==="agent.verify_passed"&&S.agents.has(aid)){
+    const a=S.agents.get(aid);a.stop_reason="verify_passed";markDirty(aid);
   }else if(type==="agent.message"&&aid!=null){S.deltas.delete(aid);markDirty(aid);}
   else if(type==="agent.message_delta"&&aid!=null){S.deltas.set(aid,(S.deltas.get(aid)||"")+String(payload.delta||""));markDirty(aid);}
   else if(type==="agent.tool_use"&&aid!=null){S.curTool.set(aid,payload);markDirty(aid);}
@@ -396,20 +450,14 @@ function onEvent(type,ev){
 }
 
 /* U3 dirty flag 增量渲染 */
-function markDirty(aid){S.dirty.add(aid);}
-function markAllDirty(){S.dirty=new Set(S.agents.keys());if(S.lastGraph)for(const k of S.lastGraph.nodes.keys())S.dirty.add(k);}
+function markDirty(){scheduleRender();}
 
 let raf=null;
 function scheduleRender(){
   if(raf)return;
   raf=requestAnimationFrame(()=>{raf=null;renderAll();});
 }
-function renderAll(){renderHeader();renderCanvas();renderDetail();renderFooter();renderGantt();}
-/* 每 10s 兜底全量重画一次防漏 */
-function startFullRedrawTimer(){
-  if(S.fullRedrawTimer)return;
-  S.fullRedrawTimer=setInterval(()=>{markAllDirty();scheduleRender();},10000);
-}
+function renderAll(){renderHeader();renderGraph();renderDetail();renderFooter();renderGantt();}
 
 function renderHeader(){
   const sel=$("sess"),current=sel.value;
@@ -429,8 +477,45 @@ function renderHeader(){
   upd("st-run",run);upd("st-queued",q);upd("st-done",done);upd("st-fail",fail);upd("st-tok",fmtTok(tok));upd("st-cost","$"+cost.toFixed(4));
 }
 
-/* U2 Conversation Graph——canvas 2D + pan/zoom + 命中检测 */
-const NODE_W=176,NODE_H=58,X_STEP=226,MG=18;
+/* 思维导图：固定纵向槽位，超出后按叶子顺序横向换页 */
+const NW={session:190,turn:168,agent:210}, NH={session:56,turn:36,agent:58};
+const COL_W=300, GAP_Y=24, GAP_ROOT=72;
+const ROW_H=Math.max(...Object.values(NH))+GAP_Y;
+function layoutTree(g){
+  const children=new Map(),indeg=new Set();
+  for(const [f,t]of g.edges){if(!g.nodes.has(f)||!g.nodes.has(t))continue;
+    if(!children.has(f))children.set(f,[]);children.get(f).push(t);indeg.add(t);
+  }
+  const roots=[...g.nodes.keys()].filter(k=>!indeg.has(k)).sort();
+  const spans=new Map(),depths=new Map();let leafCount=0,maxDepth=0;
+  function measure(k,depth){
+    depths.set(k,depth);maxDepth=Math.max(maxDepth,depth);
+    const kids=(children.get(k)||[]).slice().sort();
+    if(!kids.length){const span={first:leafCount,last:leafCount};leafCount++;spans.set(k,span);return span;}
+    const first=measure(kids[0],depth+1);let last=first;
+    for(let i=1;i<kids.length;i++)last=measure(kids[i],depth+1);
+    const span={first:first.first,last:last.last};spans.set(k,span);return span;
+  }
+  for(const r of roots)measure(r,0);
+  const viewportH=Math.max($("graph-scroll").clientHeight||620,ROW_H);
+  const MAX_ROWS=Math.max(1,Math.floor(Math.max(viewportH-GAP_Y,ROW_H)/ROW_H));
+  const WRAP_W=(maxDepth+1)*COL_W+GAP_ROOT;
+  const pos=new Map();let maxX=0;
+  for(const [k,n]of g.nodes){
+    const span=spans.get(k),depth=depths.get(k)||0,center=(span.first+span.last)/2;
+    const page=depth===0?Math.floor(span.first/MAX_ROWS):Math.floor(center/MAX_ROWS);
+    const row=Math.min(MAX_ROWS-1,Math.floor(center)%MAX_ROWS);
+    const x=depth*COL_W+page*WRAP_W,y=row*ROW_H+(ROW_H-NH[n.type])/2;
+    pos.set(k,{x,y});maxX=Math.max(maxX,x+NW[n.type]);
+  }
+  const maxPage=Math.max(0,Math.floor(Math.max(leafCount-1,0)/MAX_ROWS));
+  return{pos,width:Math.max(maxX,(maxPage+1)*WRAP_W),height:MAX_ROWS*ROW_H,maxRows:MAX_ROWS,rowH:ROW_H};
+}
+function clampPan(l,scroll){
+  const cw=scroll.clientWidth,ch=scroll.clientHeight,w=l.width*S.zoom,h=l.height*S.zoom;
+  S.pan.x=w<=cw-64?(cw-w)/2:Math.max(cw-w-32,Math.min(32,S.pan.x));
+  S.pan.y=h<=ch-64?(ch-h)/2:Math.max(ch-h-32,Math.min(32,S.pan.y));
+}
 function userTurns(aid){return [...S.eventLog.values()].filter(e=>e.agent_id===aid&&e.type==="agent.user_turn").sort((a,b)=>(a.seq||0)-(b.seq||0));}
 function buildGraph(){
   const nodes=new Map(),edges=[],lastRun=new Map();
@@ -450,153 +535,126 @@ function buildGraph(){
   }
   return{nodes,edges};
 }
-function layoutGraph(g){
-  const incoming=new Map();for(const k of g.nodes.keys())incoming.set(k,[]);
-  for(const [f,t]of g.edges)if(g.nodes.has(f)&&g.nodes.has(t))incoming.get(t).push(f);
-  const depth=new Map(),visit=k=>{if(depth.has(k))return depth.get(k);const ins=incoming.get(k)||[],d=ins.length?Math.max(...ins.map(visit))+1:0;depth.set(k,d);return d;};
-  for(const k of g.nodes.keys())visit(k);
-  const cols=new Map();for(const [k,d]of depth){if(!cols.has(d))cols.set(d,[]);cols.get(d).push(k);}
-  const H=Math.max(($('map-pane').clientHeight||620)-70,220),maxRows=Math.max(1,Math.floor((H-MG)/(NODE_H+MG))),pos=new Map();
-  let visualCol=0;
-  for(const [d,keys]of [...cols].sort((a,b)=>a[0]-b[0])){
-    keys.sort();const groups=[];
-    for(let i=0;i<keys.length;i+=maxRows)groups.push(keys.slice(i,i+maxRows));
-    for(const group of groups){
-      const gap=Math.max(MG,(H-group.length*NODE_H)/(group.length+1));
-      group.forEach((k,i)=>pos.set(k,{x:MG+visualCol*X_STEP,y:gap*(i+1)+NODE_H*i}));
-      visualCol++;
-    }
+/* 思维导图渲染：keyed DOM reconcile + SVG 贝塞尔边 */
+function renderGraph(){
+  const g=buildGraph(); S.lastGraph=g;
+  const scroll=$("graph-scroll"), vp=$("graph-viewport");
+  const emptyEl=scroll.querySelector(".graph-empty");
+  if(!g.nodes.size){
+    $("graph-nodes").innerHTML=""; $("graph-edges").innerHTML="";
+    S.nodeEls.forEach(el=>el.remove()); S.nodeEls.clear();
+    emptyEl.hidden=false;
+    emptyEl.textContent = S.sse==="connected" ? "暂无对话节点 · 用户输入后将在这里向右展开" : "正在连接 daemon…";
+    return;
   }
-  return{pos,width:Math.max(MG+visualCol*X_STEP,$("map-pane").clientWidth),height:H,maxRows};
+  emptyEl.hidden=true;
+  const l=layoutTree(g);
+  /* 首次有数据时固定纵向尺度并把视角对准最新 agent */
+  if(!S._fitted){
+    S._fitted=true;
+    const cw=scroll.clientWidth,ch=scroll.clientHeight;
+    const focusNode=[...g.nodes.values()].reverse().find(n=>n.type==="agent"&&n.agent.id===S.selected);
+    const focusPos=focusNode?l.pos.get(focusNode.key):null;
+    const z=Math.max(0.3,Math.min(1,(ch-64)/l.height));
+    S.zoom=z;
+    const fx=focusPos?focusPos.x+NW.agent/2:l.width/2,fy=focusPos?focusPos.y+NH.agent/2:l.height/2;
+    const graphW=l.width*z,graphH=l.height*z;
+    if(graphW<=cw-64)S.pan.x=(cw-graphW)/2;
+    else S.pan.x=Math.max(Math.min(32,cw-graphW-32),Math.min(32,cw*.62-fx*z));
+    if(graphH<=ch-64)S.pan.y=(ch-graphH)/2;
+    else S.pan.y=Math.max(Math.min(32,ch-graphH-32),Math.min(32,ch*.5-fy*z));
+  }
+  clampPan(l,scroll);vp.style.transform=`translate(${S.pan.x}px,${S.pan.y}px) scale(${S.zoom})`;
+  const edges=$("graph-edges"), layer=$("graph-nodes");
+  edges.setAttribute("width",l.width); edges.setAttribute("height",l.height);
+  layer.style.width=l.width+"px"; layer.style.height=l.height+"px";
+  /* 选中链高亮：从选中 agent 的节点沿入边走祖先 */
+  const chain=ancestorChain(g);
+  edges.innerHTML=g.edges.map(([f,t])=>{
+    const p=l.pos.get(f),c=l.pos.get(t); if(!p||!c)return"";
+    const nf=g.nodes.get(f),nt=g.nodes.get(t);
+    const x1=p.x+NW[nf.type],y1=p.y+NH[nf.type]/2,x2=c.x,y2=c.y+NH[nt.type]/2;
+    const dx=Math.max(40,(x2-x1)*0.5);
+    const on=chain.has(t)?' class="on"':'';
+    return `<path d="M ${x1} ${y1} C ${x1+dx} ${y1}, ${x2-dx} ${y2}, ${x2} ${y2}"${on}/>`;
+  }).join("");
+  /* keyed reconcile */
+  const seen=new Set();
+  for(const n of g.nodes.values()){
+    seen.add(n.key);
+    let el=S.nodeEls.get(n.key);
+    if(!el){ el=createNodeEl(n); S.nodeEls.set(n.key,el); layer.appendChild(el); }
+    updateNodeEl(el,n,l.pos.get(n.key));
+  }
+  for(const [k,el] of [...S.nodeEls]) if(!seen.has(k)){ el.remove(); S.nodeEls.delete(k); }
 }
-/* U3 增量：只重画 dirty 节点，其余复用 canvas 保留 */
-function renderCanvas(){
-  const canvas=$("graph-canvas"),pane=$("map-pane");
-  const dpr=window.devicePixelRatio||1;
-  const cw=pane.clientWidth,ch=pane.clientHeight-34;
-  if(canvas.width!==cw*dpr||canvas.height!==ch*dpr){canvas.width=cw*dpr;canvas.height=ch*dpr;canvas.style.width=cw+"px";canvas.style.height=ch+"px";markAllDirty();}
-  const ctx=canvas.getContext("2d");ctx.setTransform(dpr,0,0,dpr,0,0);
-  const g=buildGraph();if(!g.nodes.size){
-    ctx.clearRect(0,0,cw,ch);
-    /* 加载态 vs 空态：SSE 未连上显示连接提示，连上且无数据显示空态 */
-    const text=S.sse==="connected"?"暂无对话节点 · 用户输入后将在这里向右展开":"正在连接 daemon…";
-    ctx.fillStyle=cssVar("--ink-soft");ctx.font="11px -apple-system,sans-serif";ctx.textAlign="center";ctx.fillText(text,cw/2,ch/2);S.lastGraph=g;return;
-  }
-  const l=layoutGraph(g);S.lastGraph=g;S.lastLayout=l;
-  /* 全量清画布（增量靠 dirty 跳过重画但底层 canvas 无保留，这里全画但 skip 节点优化后续） */
-  ctx.clearRect(0,0,cw,ch);
-  ctx.save();ctx.translate(S.pan.x,S.pan.y);ctx.scale(S.zoom,S.zoom);
-  /* 画边：平滑贝塞尔曲线，透明渐变尾部 */
-  ctx.strokeStyle=cssVar("--line");ctx.lineWidth=1.4;ctx.fillStyle="none";
-  for(const [f,t]of g.edges){
-    const p=l.pos.get(f),c=l.pos.get(t);if(!p||!c)continue;
-    const x1=p.x+NODE_W,y1=p.y+NODE_H/2,x2=c.x,y2=c.y+NODE_H/2;
-    ctx.beginPath();ctx.moveTo(x1,y1);
-    ctx.bezierCurveTo(x1+(x2-x1)*0.45,y1,x2-(x2-x1)*0.45,y2,x2,y2);
-    ctx.stroke();
-    /* 目标端小圆点 */
-    ctx.fillStyle=cssVar("--gray");
-    ctx.beginPath();ctx.arc(x2,y2,2.2,0,Math.PI*2);ctx.fill();
-  }
-  /* 画节点 */
-  for(const n of g.nodes.values())drawNode(ctx,l.pos,n);
-  ctx.restore();
+function ancestorChain(g){
+  const inc=new Map(); for(const [f,t] of g.edges) inc.set(t,f);
+  const out=new Set(); let cur=null;
+  for(const k of g.nodes.keys()){ const n=g.nodes.get(k);
+    if((n.type==="agent"&&n.agent.id===S.selected)||(n.type==="turn"&&n.agentId===S.selected)) cur=k; }
+  while(cur){ out.add(cur); cur=inc.get(cur); }
+  return out;
 }
-function drawNode(ctx,pos,n){
-  const p=pos.get(n.key);if(!p)return;
-  const x=p.x,y=p.y,r=10;
+function createNodeEl(n){
+  const el=document.createElement("div");
+  el.className="node "+n.type+" fresh";
+  el.dataset.agent=n.agentId||n.agent?.id||"";
   if(n.type==="session"){
-    /* 会话根节点：深色渐变卡片 */
-    const grd=ctx.createLinearGradient(x,0,x+NODE_W,0);
-    grd.addColorStop(0,cssVar("--ink"));grd.addColorStop(1,"#4a463d");
-    ctx.fillStyle=grd;roundRect(ctx,x,y,NODE_W,NODE_H,r);ctx.fill();
-    ctx.fillStyle="rgba(255,255,255,.9)";ctx.font="700 12px -apple-system,sans-serif";ctx.textAlign="left";ctx.fillText(n.label,x+13,y+26);
-    ctx.fillStyle="rgba(255,255,255,.55)";ctx.font="9px "+cssVar("--mono");ctx.fillText("CONVERSATION",x+13,y+43);
+    el.innerHTML='<div class="ntitle"></div><div class="nsub">CONVERSATION</div>';
   }else if(n.type==="turn"){
-    /* 用户回合：accent 描边浅底 */
-    ctx.fillStyle=cssVar("--accent-soft");roundRect(ctx,x,y,NODE_W,NODE_H,r);ctx.fill();
-    ctx.strokeStyle=cssVar("--accent");ctx.lineWidth=1.5;roundRect(ctx,x,y,NODE_W,NODE_H,r);ctx.stroke();
-    ctx.fillStyle=cssVar("--accent-deep");ctx.font="700 9px "+cssVar("--mono");ctx.fillText("USER · "+String(n.kind||"TURN").toUpperCase(),x+13,y+19);
-    ctx.fillStyle=cssVar("--ink");ctx.font="600 11px -apple-system,sans-serif";ctx.fillText(shortLabel(n.label,28),x+13,y+40);
+    el.innerHTML='<div class="ntitle"></div>';
   }else{
-    const a=n.agent,gone=a.status==="terminated"||a.status==="cancelled"||a.status==="incomplete",sel=a.id===S.selected;
-    /* 终态节点整体降对比（跑动/选中前置突出） */
-    ctx.save();
-    if(gone&&!sel&&a.status!=="terminated")ctx.globalAlpha=0.72;
-    if(a.status==="terminated"&&!sel)ctx.globalAlpha=0.88;
-    /* 卡片底：选中 accent-soft 填充，其余白/暗色卡片（第 4 轮：阴影用主题色） */
-    ctx.fillStyle=sel?cssVar("--accent-soft"):cssVar("--card");
-    roundRect(ctx,x,y,NODE_W,NODE_H,r);ctx.fill();
-    /* 卡片阴影（离屏绘制淡色条，随主题） */
-    ctx.fillStyle="color-mix(in srgb,var(--ink) 6%,transparent)";roundRect(ctx,x+1,y+3,NODE_W,NODE_H,r);ctx.fill();
-    ctx.fillStyle=sel?cssVar("--accent-soft"):cssVar("--card");roundRect(ctx,x,y,NODE_W,NODE_H,r);ctx.fill();
-    /* 描边：选中 accent 加粗，终态线细，running 呼吸 */
-    ctx.strokeStyle=sel?cssVar("--accent"):a.status==="error"||a.status==="cancelled"?cssVar("--red"):a.status==="queued"?cssVar("--amber"):a.status==="running"?cssVar("--accent"):cssVar("--line");
-    ctx.lineWidth=sel?2.4:a.status==="running"?1.8:1.3;
-    roundRect(ctx,x,y,NODE_W,NODE_H,r);ctx.stroke();
-    /* CLI 徽标：左侧色条 */
-    const cc=cliColor(a.cli,false);
-    ctx.fillStyle=cc;roundRect(ctx,x,y,4,NODE_H,2);ctx.fill();
-    /* status dot + 状态色 */
-    ctx.fillStyle=a.status==="running"?cssVar("--accent"):a.status==="queued"?cssVar("--amber"):a.status==="error"?cssVar("--red"):a.status==="terminated"?cssVar("--green"):cssVar("--gray");
-    ctx.beginPath();ctx.arc(x+16,y+15,3.6,0,Math.PI*2);ctx.fill();
-    ctx.fillStyle=cssVar("--ink");ctx.font="700 11px -apple-system,sans-serif";ctx.textAlign="left";ctx.fillText(shortLabel(a.task_name,26),x+25,y+19);
-    /* CLI + 状态副行 */
-    ctx.fillStyle=cssVar("--ink-soft");ctx.font="600 8.5px "+cssVar("--mono");
-    ctx.fillText(String(a.cli||"").toUpperCase(),x+13,y+35);
-    ctx.fillStyle=a.status==="error"||a.status==="cancelled"?cssVar("--red"):a.status==="queued"?cssVar("--amber"):a.status==="terminated"?cssVar("--green"):cssVar("--accent");
-    ctx.fillText(a.status==="running"?"运行中":a.status==="queued"?"排队":a.status==="terminated"?"完成":a.status==="error"?"失败":a.status==="cancelled"?"已取消":a.status==="incomplete"?"超时":(a.status||""),x+13+ctx.measureText(String(a.cli||"").toUpperCase()+"  ").width,y+35);
-    /* 活动摘要 */
-    ctx.fillStyle=cssVar("--ink-soft");ctx.font="9px -apple-system,sans-serif";
-    ctx.fillText(currentActivity(a)||shortLabel(a.last_message||"",26)||"等待事件…",x+13,y+51);
-    /* U9 异常 badges（右上） */
+    const a=n.agent;
+    el.innerHTML=`<span class="ndot" style="background:${cliColor(a.cli,false)}"></span><div class="nmain"><div class="ntitle"></div><div class="nsub"></div></div><span class="nbadges"></span>`;
+  }
+  return el;
+}
+function updateNodeEl(el,n,p){
+  el.style.transform=`translate(${p.x}px,${p.y}px)`;
+  if(n.type==="session"){
+    el.querySelector(".ntitle").textContent=n.label;
+  }else if(n.type==="turn"){
+    el.querySelector(".ntitle").textContent=(n.kind&&n.kind!=="spawn"?n.kind+" · ":"用户输入 · ")+shortLabel(n.label,20);
+  }else{
+    const a=n.agent;
+    for(const c of["running","queued","terminated","error","cancelled","incomplete"])el.classList.remove("st-"+c);
+    if(a.status)el.classList.add("st-"+a.status);
+    el.classList.toggle("sel",a.id===S.selected);
+    el.querySelector(".ntitle").textContent=shortLabel(a.task_name||String(a.id),22);
+    const sub=el.querySelector(".nsub");
+    sub.textContent=a.status==="running"?(currentActivity(a)||"▸ 运行中"):(String(a.cli||"").toUpperCase()+" · "+statusLabel(a.status));
     const anoms=a.anomalies||[];
-    if(anoms.length){
-      ctx.font="700 8px "+cssVar("--mono");
-      let bx=x+NODE_W-8;
-      for(const an of anoms){
-        const lbl=anomalyLabel(an.kind);const w=ctx.measureText(lbl).width+10;
-        bx-=w+3;ctx.fillStyle=an.kind==="stuck_loop"||an.kind==="timeout"?cssVar("--red"):an.kind==="silent"?cssVar("--gray"):cssVar("--amber");
-        roundRect(ctx,bx,y+5,w,13,6.5);ctx.fill();
-        ctx.fillStyle="#fff";ctx.fillText(lbl,bx+5,y+14);
-      }
-    }
-    /* running pulse 外发光 */
-    if(a.status==="running"&&!matchMedia("(prefers-reduced-motion:reduce)").matches){
-      ctx.strokeStyle=cssVar("--accent");ctx.globalAlpha=0.35+0.3*Math.sin(Date.now()/500);ctx.lineWidth=2;
-      roundRect(ctx,x-2,y-2,NODE_W+4,NODE_H+4,r+2);ctx.stroke();ctx.globalAlpha=1;
-    }
+    const nb=el.querySelector(".nbadges");
+    nb.innerHTML=anoms.length?anoms.map(an=>`<span class="badge ${an.kind==="stuck_loop"||an.kind==="timeout"?"stuck":an.kind==="silent"?"silent":"fail"}">${esc(anomalyLabel(an.kind))}</span>`).join(""):"";
   }
 }
-function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);ctx.arcTo(x+w,y,x+w,y+r,r);ctx.lineTo(x+w,y+h-r);ctx.arcTo(x+w,y+h,x+w-r,y+h,r);ctx.lineTo(x+r,y+h);ctx.arcTo(x,y+h,x,y+h-r,r);ctx.lineTo(x,y+r);ctx.arcTo(x,y,x+r,y,r);ctx.closePath();}
 function currentActivity(a){const t=S.curTool.get(a.id);if(t)return"▸ "+String(t.name||"tool");const d=S.deltas.get(a.id);return d&&d.trim()?"▸ "+shortLabel(d.trim(),27):null;}
 
-/* U2 命中检测：canvas 坐标→节点坐标查 */
-function hitTest(cx,cy){
-  if(!S.lastGraph||!S.lastLayout)return null;
-  const lx=(cx-S.pan.x)/S.zoom,ly=(cy-S.pan.y)/S.zoom;
-  for(const n of S.lastGraph.nodes.values()){
-    const p=S.lastLayout.pos.get(n.key);if(!p)continue;
-    if(lx>=p.x&&lx<=p.x+NODE_W&&ly>=p.y&&ly<=p.y+NODE_H)return n;
-  }
-  return null;
-}
-function setupCanvas(){
-  const c=$("graph-canvas");
-  c.addEventListener("mousedown",e=>{
+/* 图区交互：拖拽平移 + 滚轮缩放 + 点击选中（事件委托） */
+function setupGraphNav(){
+  const scroll=$("graph-scroll"),layer=$("graph-nodes");
+  scroll.addEventListener("mousedown",e=>{
     S.drag={x:e.clientX,y:e.clientY,px:S.pan.x,py:S.pan.y,moved:false};
+    scroll.classList.add("grabbing");
   });
-  c.addEventListener("mousemove",e=>{
+  window.addEventListener("mousemove",e=>{
     if(!S.drag)return;
     const dx=e.clientX-S.drag.x,dy=e.clientY-S.drag.y;
     if(Math.abs(dx)+Math.abs(dy)>3)S.drag.moved=true;
     S.pan.x=S.drag.px+dx;S.pan.y=S.drag.py+dy;scheduleRender();
   });
-  c.addEventListener("mouseup",e=>{
-    if(S.drag&&!S.drag.moved){const r=c.getBoundingClientRect();const n=hitTest(e.clientX-r.left,e.clientY-r.top);if(n&&n.type!=="session")selectAgent(n.agentId||n.agent?.id);}
-    S.drag=null;
+  window.addEventListener("mouseup",()=>{
+    if(!S.drag)return;
+    S.dragMoved=S.drag.moved;S.drag=null;scroll.classList.remove("grabbing");
   });
-  c.addEventListener("wheel",e=>{e.preventDefault();const r=c.getBoundingClientRect();const mx=e.clientX-r.left,my=e.clientY-r.top;const factor=e.deltaY<0?1.1:1/1.1;const nz=Math.max(0.3,Math.min(3,S.zoom*factor));S.pan.x=mx-(mx-S.pan.x)*(nz/S.zoom);S.pan.y=my-(my-S.pan.y)*(nz/S.zoom);S.zoom=nz;scheduleRender();},{passive:false});
+  scroll.addEventListener("wheel",e=>{e.preventDefault();const r=scroll.getBoundingClientRect();const mx=e.clientX-r.left,my=e.clientY-r.top;const factor=e.deltaY<0?1.1:1/1.1;const nz=Math.max(0.3,Math.min(3,S.zoom*factor));S.pan.x=mx-(mx-S.pan.x)*(nz/S.zoom);S.pan.y=my-(my-S.pan.y)*(nz/S.zoom);S.zoom=nz;scheduleRender();},{passive:false});
+  layer.addEventListener("click",e=>{
+    if(S.dragMoved){S.dragMoved=false;return;}
+    const el=e.target.closest(".node");if(!el||el.classList.contains("session"))return;
+    selectAgent(Number(el.dataset.agent));
+  });
+  window.addEventListener("resize",()=>scheduleRender());
 }
 
 /* U8 详情模板化 */
@@ -610,10 +668,12 @@ function renderDetail(){
   root.querySelector("#drawer-toggle").setAttribute("aria-expanded",pane.classList.contains("drawer-open")?"true":"false");
   root.querySelector(".dh-name").textContent=a?a.task_name:"";
   if(!a){
+    const empty=root.querySelector('[data-role="cur-act"]');
+    empty.replaceWith(emptyNode("选择 agent 节点查看详情"));
     pane.innerHTML="";pane.appendChild(root);
-    root.querySelector('[data-role="cur-act"]').replaceWith(emptyNode("选择 agent 节点查看详情"));
     return;
   }
+  root.querySelector(".aname").textContent=a.task_name||String(a.id);
   /* search box */
   root.querySelector("#search-box").addEventListener("input",e=>filterDetail(e.target.value));
   /* anomalies badges U9 */
@@ -719,7 +779,7 @@ function renderGantt(){
   if(!ags.length||!S.ganttOpen){sec.hidden=true;return;}
   sec.hidden=false;sec.classList.add("show");
   const dpr=window.devicePixelRatio||1;
-  const w=canvas.parentElement.clientWidth||800,h=70;
+  const w=canvas.parentElement.clientWidth||800,h=76;
   if(canvas.width!==w*dpr||canvas.height!==h*dpr){canvas.width=w*dpr;canvas.height=h*dpr;canvas.style.width=w+"px";canvas.style.height=h+"px";}
   const ctx=canvas.getContext("2d");ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
   const ts=ags.map(a=>({a,s:new Date(a.created_at).getTime()||0,e:a.finished_at?new Date(a.finished_at).getTime():(a.updated_at?new Date(a.updated_at).getTime():Date.now())}));
@@ -851,7 +911,7 @@ function renderHeader(){
 document.addEventListener("DOMContentLoaded",()=>{
   const saved=parseInt(localStorage.getItem(SEL_KEY),10);
   if(Number.isFinite(saved)&&saved>0)S.selected=saved;
-  setupCanvas();
+  setupGraphNav();
   setupDragDivider();  // 布局重构：拖拽分隔条
   $("stats-bar").addEventListener("click",()=>{S.usageOpen=!S.usageOpen;renderUsagePanel();});
   $("gantt-toggle").addEventListener("click",()=>{S.ganttOpen=!S.ganttOpen;const g=$("gantt");if(!S.ganttOpen)g.hidden=true;renderGantt();});
@@ -866,7 +926,7 @@ document.addEventListener("DOMContentLoaded",()=>{
   document.addEventListener("keydown",e=>{if(e.key==="Escape"){$("detail-pane").classList.remove("drawer-open");$("usage-panel").hidden=true;S.usageOpen=false;scheduleRender();}});
   $("sess").addEventListener("change",e=>{S.session=e.target.value;loadSnapshot(true);});
   $("map-pane").addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!=" ")return;});
-  renderAll();loadConfig();loadSnapshot(true);connect();startFullRedrawTimer();
+  renderAll();loadConfig();loadSnapshot(true);connect();setInterval(scheduleRender,10000);
   /* running pulse 帧动画 */
   if(!matchMedia("(prefers-reduced-motion:reduce)").matches)setInterval(()=>{if([...S.agents.values()].some(a=>a.status==="running"))scheduleRender();},500);
   maybeShowReplay();setInterval(maybeShowReplay,2000);

@@ -44,6 +44,14 @@ CREATE TABLE IF NOT EXISTS spawn_cache (
   created_at TEXT, expires_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_spawn_cache_expires ON spawn_cache(expires_at);
+CREATE TABLE IF NOT EXISTS project_memory (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'lesson',
+  key TEXT, content TEXT NOT NULL, tags TEXT,
+  created_at TEXT NOT NULL, source TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_session_kind ON project_memory(session_id, kind);
+CREATE INDEX IF NOT EXISTS idx_memory_session_created ON project_memory(session_id, created_at);
 """
 
 # F7: verbose 层 payload 超 2KB 存 gzip 压缩；authority 层不压（查频高）
@@ -432,6 +440,47 @@ class DB:
             " ORDER BY id LIMIT ? OFFSET ?",
             (agent_id, size, page * size),
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- 记忆银行（阶段 1）：project_memory 键值式记忆 + LIKE 关键词检索 ----
+
+    def insert_memory(self, *, session_id: str, kind: str = "lesson",
+                      key: str | None = None, content: str, tags: str | None = None,
+                      source: str | None = None) -> int:
+        """写一条记忆（session_id 隔离；kind/key/tags 供检索过滤；source 记来源）。"""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO project_memory (session_id, kind, key, content, tags,"
+                    " created_at, source) VALUES (?,?,?,?,?,?,?)",
+                    (session_id, kind, key, content, tags, self._utc(), source))
+                conn.commit()
+                return int(cur.lastrowid)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def recall_memories(self, session_id: str, *, query: str | None = None,
+                        kind: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
+        """检索记忆：query 关键词 LIKE 命中 content/key/tags，可按 kind 过滤，
+        按 created_at DESC 收敛 limit 条（同 session 隔离）。"""
+        where = ["session_id=?"]
+        params: list[Any] = [session_id]
+        if query:
+            like = f"%{query}%"
+            where.append("(content LIKE ? OR key LIKE ? OR tags LIKE ?)")
+            params += [like, like, like]
+        if kind:
+            where.append("kind=?")
+            params.append(kind)
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT id, kind, key, content, tags, created_at, source FROM project_memory"
+            " WHERE " + " AND ".join(where)
+            + " ORDER BY created_at DESC, id DESC LIMIT ?",
+            params + [limit]).fetchall()
         return [dict(r) for r in rows]
 
     def spawn_cache_get(self, key: str) -> dict[str, Any] | None:

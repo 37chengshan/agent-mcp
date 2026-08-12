@@ -86,10 +86,11 @@ description: Use when a task should be decomposed and dispatched across claude, 
   3. **判返工**：证据缺失或与目标不符 → `followup_task` 迭代；仅关键路径（认证/支付/数据）才深查
   4. **查成本**：分支返回后调 `get_token_usage`，超 ET 阈值的分支下次降档或拆分（§8 降档表）；频次高的分支优先优化
 
-## 2. 工具速查（9）
+## 2. 工具速查（12）
 
 | 工具 | 用途 |
 |---|---|
+| estimate_complexity | 本地复杂度分级（第零步判级工具）：传 `task` + 已知涉及文件 `files`，返回 `level`（S/M/L）+ `rationale` + `delegate` + `suggestion`；本地直算，零 token、不 spawn |
 | spawn_agent | 派发新 agent（立即返回 agent_id + status + prompt_chars + estimated_tokens + min_expected_seconds；槽位满返回 queued）。**参数**：context_mode（compact/full/tail，控上下文压缩）、summary_chars（wait 回传摘要上限）、return_ref（true=只返 ref+预览，延迟拉全文）、cache_ttl（读密集结果缓存秒数）、token_budget（超额自动降档重跑）、verify_command+max_fix_attempts（daemon 自跑验证+回投）、min_expected_seconds（按 CLI 首启矩阵估：claude 3/grok 120/omp 5/atomcode 8，便主 agent 规划等待节奏） |
 | send_message | 投递消息到队列，不触发执行 |
 | steer_agent | 中途插话：先终止当前 run，再在同一节点立即开始下一 turn；稳定 session id 的 CLI 自动恢复原会话 |
@@ -99,6 +100,10 @@ description: Use when a task should be decomposed and dispatched across claude, 
 | list_agents | 列 agent 树（默认只返 id/task_name/status/stop_reason；fields=all 返全量含 CLI/父 id/最近消息） |
 | get_agent_activity | 实时活动流（since_seq 增量；默认压缩已消费 payload，include=verbose 返全量原文） |
 | get_token_usage | token 统计（派发侧估算；含 ET 有效 token 指标；AtomCode 从 `-v` 的 `[tokens] prompt=… completion=… cached=…` 解析） |
+| memory_store | 记忆银行写入（跨会话项目记忆存取）。**参数**：`content` 必填；`kind`/`key`/`tags` 可选 |
+| memory_recall | 记忆银行召回（跨会话项目记忆检索）。**参数**：`query`/`kind`/`limit`（默认 5）；会话隔离 |
+
+**工具可见性（tools/list 静态裁剪）**：`tools/list` 默认只暴露四件通用工具（spawn_agent / wait_agent / interrupt_agent / estimate_complexity）；完整工具集（send_message / steer_agent / followup_task / list_agents / get_agent_activity / get_token_usage / memory_store / memory_recall）需 client 在 initialize 的 tools/list 请求 `params._meta.clientCapabilities.extensions` 声明 `io.modelcontextprotocol/tools.used` 扩展（即 `io.modelcontextprotocol/tools` 键下的 `used` 工具名列表）才暴露全量。未声明时用不到的工具会显示为不存在——此时以直接调用工具名（`tools/call` 不拦截）或升级客户端声明为准。
 
 **协议**：兼容 legacy MCP 2025-03-26 与 modern 2026-07-28 双协议；错误返回带 **error_type** 字段（session_mismatch/daemon_unreachable/port_conflict/timeout/cli_exit_nonzero/worker_died），便主 agent 自动化错误分流。实现细节见 `docs/`。
 
@@ -123,6 +128,7 @@ description: Use when a task should be decomposed and dispatched across claude, 
 
 | 症状 | 动作 |
 |---|---|
+| 工具未在列表中出现 | `tools/call` 仍可直接调用（不拦截）；或按 §2「工具可见性」升级客户端声明暴露 |
 | 工具返回 error | 先读 summary 定根因（session 不匹配 / 参数错 / daemon 失联），按本表处理；处理不了回传 BLOCKED 并停手，禁止用 echo/no-op 命令空转试探 |
 | session 不匹配（agent 不属于当前会话） | 先 `list_agents`（include_other_sessions=true）找回旧 agent 状态——同一对话重开应能直接取到（见 §4）；确认是不同对话才失联，**不要复用旧 agent_id**，重新 spawn 新 agent，prompt 带前次摘要/上下文 |
 | 超时 | 任务级：spawn/followup 传 `timeout_seconds` 自动终止（incomplete/timeout，可 resume）；等待超时 → 读 hint 的**存活证据**：worker_pid alive 或 out/err 日志在增长 → 健康，按第四步纪律再 wait 一次（5-10 分钟）；worker_pid 已死且日志不再增长 → 才判僵住，interrupt + 重派（context 带前次摘要） |

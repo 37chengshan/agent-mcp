@@ -38,7 +38,22 @@ NO_CLAUDE_REASON = "claude CLI not installed"
 
 MCP_TOOL_NAMES = ["spawn_agent", "send_message", "steer_agent", "followup_task",
                   "wait_agent", "interrupt_agent", "list_agents",
-                  "get_agent_activity", "get_token_usage"]
+                  "get_agent_activity", "get_token_usage", "estimate_complexity",
+                  "memory_store", "memory_recall"]
+
+# D5 静态裁剪：未声明 capability 的 client 只发现通用四件（spawn/wait/interrupt/estimate）
+PRUNED_TOOL_NAMES = ["spawn_agent", "wait_agent", "interrupt_agent", "estimate_complexity"]
+
+# tools/list 的 _meta capability 声明（modern client 扩展约定），使 _pruned_tools 保留全量
+FULL_TOOLS_META = {
+    "_meta": {
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": {
+                "io.modelcontextprotocol/tools": {"used": MCP_TOOL_NAMES}
+            }
+        }
+    }
+}
 
 
 # ---- 工具函数 ----
@@ -107,10 +122,13 @@ def daemon(tmp_path):
     proc.wait(timeout=5)
 
 
-def _sse_reader(base: str, q: queue.Queue) -> None:
-    """后台线程读 SSE 行到队列；EOF/异常投递 None 哨兵。"""
+def _sse_reader(base: str, q: queue.Queue, ready: threading.Event | None = None) -> None:
+    """后台线程读 SSE 行到队列；EOF/异常投递 None 哨兵。
+    ready（可选）：HTTP 响应头返回（服务器已注册 SSE client）后 set。"""
     try:
         with urllib.request.urlopen(base + "/events", timeout=60) as resp:
+            if ready is not None:
+                ready.set()
             for line in resp:
                 q.put(line.decode("utf-8", "replace").rstrip("\n"))
     except Exception:
@@ -223,7 +241,11 @@ def test_daemon_sse_receives_heartbeat(daemon):
 def test_daemon_sse_streams_live_spawn_events(daemon):
     """SSE 连接后 spawn 真实任务，直播流收到 spawned → running → terminated。"""
     q: queue.Queue = queue.Queue()
-    threading.Thread(target=_sse_reader, args=(daemon["base"], q), daemon=True).start()
+    ready: threading.Event = threading.Event()
+    threading.Thread(target=_sse_reader, args=(daemon["base"], q, ready),
+                     daemon=True).start()
+    # 连接就绪（服务器已注册 SSE client）再 spawn，避免 spawned 广播早于连接建立而丢失
+    assert ready.wait(5), "SSE 连接 5s 内未建立"
     r = _post(daemon["base"], daemon["token"], "/api/agents/spawn",
               {"target_cli": "claude", "prompt": SHORT_PROMPT,
                "cwd": daemon["cwd"], "max_turns": 1, "session_id": "sse-test"})
@@ -324,7 +346,8 @@ def test_mcp_stdio_end_to_end(mcp_proc):
     assert init["result"]["serverInfo"] == {"name": "agent-mcp", "version": mcp_server.SERVER_VERSION}
     assert init["result"]["protocolVersion"] == "2025-03-26"
 
-    tools = _rpc(proc, q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    tools = _rpc(proc, q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                           "params": FULL_TOOLS_META})
     names = [t["name"] for t in tools["result"]["tools"]]
     assert names == MCP_TOOL_NAMES
 
@@ -350,24 +373,52 @@ def test_mcp_stdio_end_to_end(mcp_proc):
                                 "target_cli": "claude", "prompt": SHORT_PROMPT,
                                 "cwd": mcp_proc["cwd"], "max_turns": 1}}})
     aid2 = json.loads(spawn2["result"]["content"][0]["text"])["agent_id"]
-    waited = _rpc(proc, q, {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
-                            "params": {"name": "wait_agent",
-                                       "arguments": {"agent_id": aid2, "timeout": 30}}})
-    wbody = json.loads(waited["result"]["content"][0]["text"])
-    assert wbody["status"] == "terminated"
+    # L2 契约：wait_agent 是"短阻塞"——超时返回 running + liveness 存活证据，
+    # 提示客户端"call wait_agent again to keep waiting"。真实 claude 任务在共享
+    # model 负载下可能超过单次 30s 窗口，按契约重试直到终态（总预算 120s）。
+    rid = 6
+    wbody = {}
+    wait_deadline = time.monotonic() + 120
+    while time.monotonic() < wait_deadline:
+        waited = _rpc(proc, q, {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                                "params": {"name": "wait_agent",
+                                           "arguments": {"agent_id": aid2,
+                                                         "timeout": 30}}})
+        rid += 1
+        wbody = json.loads(waited["result"]["content"][0]["text"])
+        if wbody["status"] in ("terminated", "error", "cancelled", "incomplete"):
+            break
+        assert wbody["status"] == "running", wbody  # 未知状态直接失败
+    assert wbody["status"] == "terminated", wbody
     assert wbody["stop_reason"] == "end_turn"
 
     # 会话内 list / usage 查询
-    listed = _rpc(proc, q, {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+    listed = _rpc(proc, q, {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
                             "params": {"name": "list_agents", "arguments": {}}})
     lbodies = [a["id"] for a in
                json.loads(listed["result"]["content"][0]["text"])["agents"]]
     assert aid in lbodies and aid2 in lbodies
-    used = _rpc(proc, q, {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+    used = _rpc(proc, q, {"jsonrpc": "2.0", "id": rid + 1, "method": "tools/call",
                           "params": {"name": "get_token_usage",
                                      "arguments": {"agent_id": aid2}}})
     ub = json.loads(used["result"]["content"][0]["text"])
     assert ub["input_tokens"] > 0 and ub["estimated"] is True
+
+
+@pytest.mark.integration
+def test_mcp_tools_pruned_for_undeclared_client(mcp_proc):
+    """D5 契约：未声明 capability 的 client 在 tools/list 只发现通用四件；
+    但 tools/call 不拦截未声明工具（裁剪只影响发现，不影响调用）。"""
+    proc, q = mcp_proc["proc"], mcp_proc["q"]
+
+    init = _rpc(proc, q, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                          "params": {"protocolVersion": "2025-03-26",
+                                     "clientInfo": {"name": "codex", "version": "1.0"}}})
+    assert init["result"]["serverInfo"]["name"] == "agent-mcp"
+
+    tools = _rpc(proc, q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    names = [t["name"] for t in tools["result"]["tools"]]
+    assert names == PRUNED_TOOL_NAMES
 
 
 # ---- 性能：常驻内存 ----

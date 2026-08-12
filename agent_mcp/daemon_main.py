@@ -58,6 +58,8 @@ VERIFY_FIX_INSTRUCTION = (
     "\n\n[verify failed] 上面是验证命令的失败输出。"
     "修根因而非删测试或弱化断言；保留 reproduce 路径。"
 )
+# 记忆银行（阶段 1）：project_memory 允许的 kind 枚举
+_MEMORY_KINDS = ("decision", "lesson", "convention", "final_answer")
 
 
 def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[bool, str]:
@@ -87,6 +89,11 @@ DEFAULT_STATE_DIR = default_state_dir()
 DEFAULT_WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 
 _TERMINAL = ("terminated", "error", "cancelled", "incomplete")
+
+# L2 wait 超时竞态守卫：worker 已退出但完成处理（_ingest_output/_set_status）
+# 尚未落库时，wait 在 GRACE 窗口内轮询 DB 等终态，避免误报 running。
+_WAIT_GRACE_SECONDS = 5.0
+_WAIT_GRACE_POLL = 0.1
 
 
 def _write_private(path: Path, data: dict) -> None:
@@ -552,7 +559,11 @@ class Dispatcher:
         """短阻塞等待（默认 25s，上限 MAX_WAIT_SECONDS 可自定义）；完成后返回摘要 + 结构化结果，超时给存活证据。
 
         F1: 事件驱动——阻塞在 threading.Event.wait(timeout) 不轮询；终态时 _set_status set 唤醒。
-        超时兜底仍走一次原轮询路径查 state 防漏（state 文件先于 DB 写入的窗口）。"""
+        超时兜底仍走一次原轮询路径查 state 防漏（state 文件先于 DB 写入的窗口）。
+        L2 竞态守卫：worker 进程已退出（_workers 已 pop）但 _check_worker 尚未完成
+        （_ingest_output/_set_status 进行中，watcher 线程仍在）时，短窗内 DB 仍非终态——
+        此时返回 running 会让客户端误判"未完成"。超时路径若发现 watcher 仍在，则
+        在 GRACE 窗口内轮询 DB 等终态落库，之后才给 liveness 超时返回。"""
         agent_id = self._require_id(body)
         timeout = min(max(float(body.get("timeout") or 25), 0.1), MAX_WAIT_SECONDS)
         deadline = time.monotonic() + timeout
@@ -575,6 +586,7 @@ class Dispatcher:
                 # 超时兜底：走一次原轮询路径查 state 防漏（state 先于 DB 写入的窗口）
                 with self._lock:
                     info = self._workers.get(agent_id)
+                    watcher = self._watchers.get(agent_id)
                 if info and _read_json(info["state_path"]).get("status") == "finished":
                     self._check_worker(agent_id)
                 agent = self.db.get_agent(agent_id)
@@ -582,6 +594,24 @@ class Dispatcher:
                     raise ValueError(f"agent {agent_id} not found")
                 self._require_session(body, agent)
                 if agent["status"] in _TERMINAL:
+                    return self._wait_result(agent, "", summary_chars=summary_chars,
+                                             return_ref=return_ref)
+                # L2 竞态守卫：_workers 已 pop 但 watcher 仍在（_check_worker 完成处理中）——
+                # 短窗内 DB 尚未落终态。轮询 DB 等终态，避免误报 running。
+                if watcher is not None and info is None:
+                    grace_deadline = time.monotonic() + _WAIT_GRACE_SECONDS
+                    while time.monotonic() < grace_deadline:
+                        agent = self.db.get_agent(agent_id)
+                        if agent is not None and agent["status"] in _TERMINAL:
+                            return self._wait_result(agent, "",
+                                                     summary_chars=summary_chars,
+                                                     return_ref=return_ref)
+                        with self._lock:
+                            if self._watchers.get(agent_id) is None:
+                                break  # watcher 已退出：完成处理收尾，DB 立即可见
+                        time.sleep(_WAIT_GRACE_POLL)
+                agent = self.db.get_agent(agent_id)
+                if agent is not None and agent["status"] in _TERMINAL:
                     return self._wait_result(agent, "", summary_chars=summary_chars,
                                              return_ref=return_ref)
                 # L2: 超时返 liveness 结构化字段（worker_pid_alive/log_growing/healthy）
@@ -685,6 +715,53 @@ class Dispatcher:
                     totals[k] = totals.get(k, 0) + v
         totals["estimated"] = True
         return totals
+
+    # ---- 记忆银行（阶段 1）：memory_store / memory_recall + FINAL_ANSWER 自动沉淀 ----
+
+    def memory_store(self, body: dict) -> dict:
+        """写一条记忆。content 必填；kind 默认 lesson（decision/lesson/convention/final_answer）；
+        session_id 缺省 'default'；key/tags/source 可选。"""
+        content = body.get("content")
+        if not content or not str(content).strip():
+            raise ValueError("content is required")
+        kind = body.get("kind") or "lesson"
+        if kind not in _MEMORY_KINDS:
+            raise ValueError(f"kind must be one of {_MEMORY_KINDS}")
+        mid = self.db.insert_memory(
+            session_id=body.get("session_id") or "default", kind=kind,
+            key=body.get("key"), content=str(content).strip(),
+            tags=body.get("tags"), source=body.get("source"))
+        return {"id": mid, "status": "stored"}
+
+    def memory_recall(self, body: dict) -> dict:
+        """检索记忆：query 关键词 LIKE 命中 content/key/tags，可按 kind 过滤，
+        limit 截断（默认 5，上限 20），按时间倒序，仅同 session 可见。"""
+        try:
+            limit = min(max(int(body.get("limit") or 5), 1), 20)
+        except (TypeError, ValueError):
+            limit = 5
+        memories = self.db.recall_memories(
+            body.get("session_id") or "default",
+            query=body.get("query"), kind=body.get("kind"), limit=limit)
+        return {"memories": memories}
+
+    def _sink_final_answer(self, agent_id: int, summary: str, session_id: str) -> None:
+        """自动沉淀：完成态 summary 含 FINAL_ANSWER: 时写入 kind=final_answer 记忆
+        （source=agent:<id>，去首尾空白，空则不写）。best-effort，失败只记日志。"""
+        marker = "FINAL_ANSWER:"
+        pos = summary.rfind(marker)
+        if pos < 0:
+            return
+        text = summary[pos + len(marker):].strip()
+        if not text:
+            return
+        try:
+            self.db.insert_memory(session_id=session_id or "default",
+                                  kind="final_answer", content=text,
+                                  source=f"agent:{agent_id}")
+        except Exception as exc:
+            print(f"[dispatcher] memory sink failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
 
     # ---- 内部 ----
 
@@ -883,6 +960,8 @@ class Dispatcher:
                 self._broadcast("agent.terminated", {"agent_id": agent_id,
                                                     "stop_reason": "end_turn",
                                                     "summary": summary}, agent_id)
+                # 记忆银行：完成态自动沉淀 FINAL_ANSWER → kind=final_answer 记忆
+                self._sink_final_answer(agent_id, summary, (agent or {}).get("session_id") or "default")
                 # C3 token_budget 降档：完成态后判超额，触发 followup 用低档 model 重跑（不运行中换）
                 self._maybe_downgrade_on_budget(agent_id, agent, body)
         else:
@@ -1136,10 +1215,22 @@ class Dispatcher:
             if not lines:
                 return
             adapter = get_adapter(cli)
+        except Exception as exc:
+            # 适配器缺失（unknown CLI）属系统防御分支：spawn 有 enum 校验不会触发，
+            # 保持原 noop 契约（stderr 诊断即可，不落事件）
+            print(f"[dispatcher] ingest skipped for agent {agent_id}: {exc}",
+                  file=sys.stderr)
+            return
+        try:
             events, usage = adapter.parse_stream(lines)
         except Exception as exc:
             print(f"[dispatcher] ingest failed for agent {agent_id}: {exc}",
                   file=sys.stderr)
+            # 不静默：parse 失败广播可见事件，wait hint 与监控页可观测，
+            # 避免 terminated 已广播但 usage 缺失时无从排查
+            self._broadcast("agent.ingest_failed", {
+                "agent_id": agent_id, "error": str(exc)[:500],
+            }, agent_id)
             return
         for ev in events:
             typ = ev.get("type")
