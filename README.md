@@ -1,6 +1,6 @@
 # Agent MCP
 
-**打通不同 Agent CLI 壁垒的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把 claude / grok / opencode / omp / atomcode 五个 CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池，让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。CLI 不再是孤岛：每个模型都能**驾驭最适配它的底座**——读密集探索交给快底座（omp/grok），深推理规划交给强底座（claude），模型与底座按任务现场自由匹配，成本与质量自己说了算。
+**打通所有 Agent CLI 壁垒的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把任意 Agent CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展），让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。CLI 不再是孤岛：每个模型都能**驾驭最适配它的底座**——读密集探索交给快底座（omp/grok），深推理规划交给强底座（claude），模型与底座按任务现场自由匹配，成本与质量自己说了算。
 
 > 多 Agent 编排比单线程多耗 3–10× tokens（Anthropic 实测）。Agent MCP 的价值不是"多开几个 Agent"，而是把拆解的收益锁住、把协调的开销压到最低：**复杂度分级门**决定"要不要拆"，**任务级超时 / 队列 / 续接 / 降档**兜住"拆了怎么办"。
 
@@ -10,7 +10,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| 🧩 **五 CLI 统一派发** | `spawn_agent` 一个入口派发 claude / grok / opencode / omp / atomcode；适配器层各自归一化事件流、usage 与 session，上层无感 |
+| 🧩 **任意 Agent CLI 统一派发** | `spawn_agent` 一个入口派发任意 CLI 子 Agent（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展）；适配器层各自归一化事件流、usage 与 session，上层无感 |
 | 🚦 **复杂度分级门** | `estimate_complexity` 本地直算（零 token、不 spawn），按 S/M/L 判级决定是否进入编排——**默认直接做，按需才拆**，杜绝过拆 |
 | ⏱️ **任务级超时** | `timeout_seconds`（1–1800s）到时终止整个进程树并标记 `incomplete/timeout`，可 resume 续跑；不等死、不悬空 |
 | 🔁 **可续接可插话** | `resume` 透传 CLI session id；`steer_agent` 中途插话、`followup_task` 合并挂起消息重派；同一 agent 节点复用，上下文不丢 |
@@ -123,7 +123,7 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 mcp_server.py            # MCP 薄层：工具定义、host 识别、会话隔离、daemon 原子拉起
 agent_mcp/
   daemon_main.py         # 常驻 daemon：Dispatcher、槽位/排队/心跳/看护、验证回投、SSE
-  cli_adapters.py        # 五 CLI 适配器（命令构造 + 事件流归一化）
+  cli_adapters.py        # 多 CLI 适配器（命令构造 + 事件流归一化）
   state_machine.py       # agent 状态机（starting/running/terminated/error/…）
   db.py                  # SQLite 持久化（agent/事件/usage）
   daemon_http.py         # HTTP 路由 + X-Auth-Token 认证

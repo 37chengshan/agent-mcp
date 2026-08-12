@@ -62,7 +62,7 @@
   <line x1="480" y1="402" x2="480" y2="430" stroke="#9C3D2C" stroke-width="2" marker-end="url(#arrow)"/>
 
   <!-- 派发 → worker 池 -->
-  <text x="480" y="552" text-anchor="middle" font-size="12" font-weight="700" fill="#2E2A22">五 CLI 工作池</text>
+  <text x="480" y="552" text-anchor="middle" font-size="12" font-weight="700" fill="#2E2A22">任意 CLI 工作池</text>
   <g>
     <g filter="url(#shadow)">
       <rect x="150" y="568" width="120" height="52" rx="10" fill="#FFFFFF" stroke="#8A4B2E" stroke-width="1.5"/>

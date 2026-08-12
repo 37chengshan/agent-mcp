@@ -16,7 +16,7 @@
 
   <!-- 标题 -->
   <text x="480" y="44" text-anchor="middle" font-size="26" font-weight="700" fill="#2E2A22">Agent MCP 架构</text>
-  <text x="480" y="68" text-anchor="middle" font-size="13" fill="#6E675A">跨 CLI 的多 Agent 编排基础设施 · 一个 MCP 协议 · 五个 CLI 工作池</text>
+  <text x="480" y="68" text-anchor="middle" font-size="13" fill="#6E675A">打通所有 Agent CLI 壁垒 · 一个 MCP 协议 · 任意 CLI 工作池</text>
 
   <!-- 主 Agent -->
   <g filter="url(#shadow)">
@@ -69,7 +69,7 @@
   </g>
   <line x1="710" y1="360" x2="736" y2="360" stroke="#3E7A56" stroke-width="2" marker-end="url(#arrowB)"/>
 
-  <!-- 五个 CLI worker -->
+  <!-- CLI worker 池 -->
   <text x="480" y="474" text-anchor="middle" font-size="12" fill="#6E675A">统一事件流归一化：agent.spawned → running → message / usage → terminated</text>
   <g>
     <g filter="url(#shadow)">
