@@ -28,6 +28,25 @@ die() { say "错误: $*" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || die "需要 python3（>=3.9），请先安装 Python。"
 
 # --- 1. 获取项目文件 ---
+# 下载函数：codeload tarball（git 不可用或 clone 失败时的回退通道）
+fetch_tarball() {
+  command -v curl >/dev/null 2>&1 || die "需要 git 或 curl。"
+  tmp="$(mktemp -d)"
+  curl -fsSL "https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/heads/main" \
+    -o "$tmp/repo.tar.gz" || die "下载失败。"
+  tar -xzf "$tmp/repo.tar.gz" -C "$tmp" || die "解压失败。"
+  # POSIX sh：解压顶层应为唯一目录（<repo>-<ref>），取第一个
+  found=""
+  for d in "$tmp"/*/; do
+    [ -d "$d" ] || continue
+    found="$d"
+    break
+  done
+  [ -n "$found" ] || die "解压失败。"
+  cp -R "$found/." "$INSTALL_DIR"/ || die "拷贝项目文件失败。"
+  rm -rf "$tmp"
+}
+
 if [ -f "$INSTALL_DIR/install.py" ]; then
   say "已存在 $INSTALL_DIR，尝试更新…"
   if command -v git >/dev/null 2>&1 && [ -d "$INSTALL_DIR/.git" ]; then
@@ -38,25 +57,19 @@ else
   say "下载 agent-mcp 到 $INSTALL_DIR …"
   mkdir -p "$INSTALL_DIR"
   if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 "https://github.com/${GITHUB_REPO}.git" "$INSTALL_DIR" >/dev/null 2>&1 \
-      || die "git clone 失败。"
+    if git clone --depth 1 "https://github.com/${GITHUB_REPO}.git" "$INSTALL_DIR" >/dev/null 2>&1; then
+      :
+    else
+      # git clone 失败（网络/代理/证书常见）→ 自动回退归档下载，不中断安装
+      say "git clone 失败，自动改用归档下载…"
+      rm -rf "$INSTALL_DIR"
+      mkdir -p "$INSTALL_DIR"
+      fetch_tarball
+    fi
   else
-    # 无 git 时退回 curl 下载 tarball（codeload 才是归档端点，raw 只服务单文件）
-    command -v curl >/dev/null 2>&1 || die "需要 git 或 curl。"
-    tmp="$(mktemp -d)"
-    curl -fsSL "https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/heads/main" \
-      -o "$tmp/repo.tar.gz" || die "下载失败。"
-    tar -xzf "$tmp/repo.tar.gz" -C "$tmp" || die "解压失败。"
-    # POSIX sh：解压顶层应为唯一目录（<repo>-<ref>），取第一个
-    found=""
-    for d in "$tmp"/*/; do
-      [ -d "$d" ] || continue
-      found="$d"
-      break
-    done
-    [ -n "$found" ] || die "解压失败。"
-    cp -R "$found/." "$INSTALL_DIR"/ || die "拷贝项目文件失败。"
-    rm -rf "$tmp"
+    # 无 git 时直接走归档下载
+    say "未检测到 git，使用归档下载…"
+    fetch_tarball
   fi
   [ -f "$INSTALL_DIR/install.py" ] || die "项目文件不完整，请重试。"
 fi
