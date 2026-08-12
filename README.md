@@ -1,6 +1,6 @@
 # Agent MCP
 
-**打通所有 Agent CLI 壁垒的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把任意 Agent CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展），让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。CLI 不再是孤岛：每个模型都能**驾驭最适配它的底座**——读密集探索交给快底座（omp/grok），深推理规划交给强底座（claude），模型与底座按任务现场自由匹配，成本与质量自己说了算。
+**打通所有 Agent CLI 壁垒的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把任意 Agent CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池（**兼容任意 CLI**：内置 claude / grok / opencode / omp / atomcode 适配器，其余 CLI 一行注册即可接入），让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。CLI 不再是孤岛：每个模型都能**驾驭最适配它的底座**——读密集探索交给快底座（omp/grok），深推理规划交给强底座（claude），模型与底座按任务现场自由匹配，成本与质量自己说了算。
 
 > Agent MCP 的核心不是"多开几个 Agent"，而是把任意 CLI 统一收进**一个可派发、可监控、可续接、可终止的子 Agent 工作池**：主 Agent 只做拆解与汇合，执行与容错交给基础设施，模型与底座按任务现场自由匹配。**复杂度分级门**决定"要不要拆"，**任务级超时 / 队列 / 续接 / 降档**兜住"拆了怎么办"。
 
@@ -18,13 +18,15 @@
 curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.sh | bash
 ```
 
-自动下载项目 → 注册全部六个 host（codex / claude / omp / opencode / kimi / zcode）的 MCP + skill → 安装完成后提示是否 star。可用环境变量定制：`AGENT_MCP_DIR`（安装目录）、`AGENT_MCP_HOST`（单 host）。
+> ⚠️ 管道执行会以**当前用户权限**直接运行远程脚本——请先审阅 [install.sh](install.sh) 内容再执行；更稳妥的安装方式见下方 git clone。也可改用固定 commit 引用：`curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/<commit-sha>/install.sh | bash`。
+
+一键配置支持 **codex / claude / omp / opencode / kimi / zcode** 六种 Agent CLI（注册 MCP + 安装 skill）→ 安装完成后提示是否 star。**其它 CLI 同样可以接入**：用 `AGENT_MCP_HOST` 指定单个 host，或按下方方式三把提示词交给任意 AI 完成注册。`AGENT_MCP_DIR` 可自定义安装目录。
 
 **方式二 · git clone + 安装脚本**：
 
 ```bash
 git clone git@github.com:37chengshan/agent-mcp.git && cd agent-mcp
-python3 install.py --install --host all        # 或 --host claude / opencode / kimi / zcode …
+python3 install.py --install --host all        # 支持 codex / claude / omp / opencode / kimi / zcode，或 --host <单个>
 python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open 打开监控页
 ```
 
@@ -47,7 +49,7 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 
 | 能力 | 说明 |
 |---|---|
-| 🧩 **任意 Agent CLI 统一派发** | `spawn_agent` 一个入口派发任意 CLI 子 Agent（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展）；适配器层各自归一化事件流、usage 与 session，上层无感 |
+| 🧩 **任意 Agent CLI 统一派发** | `spawn_agent` 一个入口派发任意 CLI 子 Agent（内置 claude / grok / opencode / omp / atomcode 适配器，其余 CLI 注册即用）；适配器层各自归一化事件流、usage 与 session，上层无感 |
 | 🚦 **复杂度分级门** | `estimate_complexity` 本地直算（零 token、不 spawn），按 S/M/L 判级决定是否进入编排——**默认直接做，按需才拆**，杜绝过拆 |
 | ⏱️ **任务级超时** | `timeout_seconds`（1–1800s）到时终止整个进程树并标记 `incomplete/timeout`，可 resume 续跑；不等死、不悬空 |
 | 🔁 **可续接可插话** | `resume` 透传 CLI session id；`steer_agent` 中途插话、`followup_task` 合并挂起消息重派；同一 agent 节点复用，上下文不丢 |
