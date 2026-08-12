@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Agent MCP 安装 / 迁移脚本（纯 stdlib，不 import agent_mcp）。
 
-三主载体（codex/claude/omp）注册同一 MCP server（mcp_server.py）：
+六个主载体（codex/claude/omp/opencode/kimi/zcode）注册同一 MCP server（mcp_server.py）：
 - --install：写配置前先备份（*.bak-agentmcp-<ts>）；--dry-run 只打印不写文件
 - codex：~/.codex/config.toml 末尾追加 [mcp_servers.agent-mcp]；检测旧 [mcp_servers.grok-cli]
   并提示废弃，--remove-legacy 自动移除
 - claude：~/.claude.json（或 --claude-config <path>）的 mcpServers 合并写入
 - omp：~/.omp/agent/mcp.json 的 mcpServers 合并写入
-- 三者均安装共享 skill；Codex/Claude 另安装 SessionStart launcher hook
+- opencode：~/.config/opencode/opencode.json 的 mcp 键（type=local + command 数组）
+- kimi：~/.kimi-code/mcp.json（或 $KIMI_CODE_HOME）的 mcpServers 合并写入
+- zcode：~/.zcode/cli/config.json 的 mcp.servers 合并写入
+- 全部安装共享 skill；Codex/Claude 另安装 SessionStart launcher hook
 - --rollback：从最新备份恢复（恢复后删除备份）
 - --legacy-map：打印旧 9 工具 → 新 9 工具映射（breaking change 迁移表）
 
 只做配置变更，不拷贝代码文件：默认假定 mcp_server.py 已在目标位置，
 或由用户自行拷贝整个项目目录。
+
+安装完成后提示是否 star（GitHub CLI 已登录则直接 gh repo star，否则打开浏览器）。
 """
 from __future__ import annotations
 import argparse
@@ -32,9 +37,11 @@ from typing import Any
 SERVER_NAME = "agent-mcp"
 LEGACY_NAME = "grok-cli"
 BACKUP_SUFFIX = ".bak-agentmcp-"
-HOSTS = ("codex", "claude", "omp")
+HOSTS = ("codex", "claude", "omp", "opencode", "kimi", "zcode")
 STARTER_NAME = "start_agent_mcp.py"
 HOOK_MARKER = "# agent-mcp-session-start"
+GITHUB_REPO = "37chengshan/agent-mcp"
+GITHUB_STAR_URL = f"https://github.com/{GITHUB_REPO}/stargazers"
 # SessionStart hook 注入主代理的评判纪律：stdout 会被宿主（Claude Code）注入上下文。
 # 文本避免 shell 元字符（& < > | 等），保证 posix/win 两平台 echo 均安全。
 MAIN_AGENT_REMINDER = (
@@ -104,6 +111,35 @@ def omp_registration_json(script_path: str) -> dict[str, Any]:
         "requestIdFormat": "number",
         "enabled": True,
     }}}
+
+
+def opencode_registration_json(script_path: str) -> dict[str, Any]:
+    """生成 opencode 配置的 mcp 键（~/.config/opencode/opencode.json）。
+
+    opencode 的 stdio server 用 type=local + command 数组（命令与参数合并在一个数组）。
+    """
+    return {"mcp": {SERVER_NAME: {
+        "type": "local",
+        "command": ["python3", script_path],
+        "enabled": True,
+    }}}
+
+
+def kimi_registration_json(script_path: str) -> dict[str, Any]:
+    """生成 kimi 的 mcpServers 片段（~/.kimi-code/mcp.json，标准 MCP 客户端兼容格式）。"""
+    return {"mcpServers": {SERVER_NAME: {
+        "command": "python3",
+        "args": [script_path],
+    }}}
+
+
+def zcode_registration_json(script_path: str) -> dict[str, Any]:
+    """生成 zcode 的 mcp.servers 片段（~/.zcode/cli/config.json）。"""
+    return {"mcp": {"servers": {SERVER_NAME: {
+        "command": "python3",
+        "args": [script_path],
+        "env": {},
+    }}}}
 
 
 # --- Hook 与 skill 安装 ---
@@ -314,6 +350,42 @@ def apply_omp_install(config: dict[str, Any], script_path: str) -> dict[str, Any
     return out
 
 
+def apply_opencode_install(config: dict[str, Any], script_path: str) -> dict[str, Any]:
+    """合并 agent-mcp 注册进 opencode 配置（兼容 mcp 顶层与 mcp.servers 两种结构）。"""
+    entry = opencode_registration_json(script_path)["mcp"][SERVER_NAME]
+    mcp = dict(config.get("mcp", {}))
+    if isinstance(mcp.get("servers"), dict):
+        servers = dict(mcp["servers"])
+        servers[SERVER_NAME] = entry
+        mcp["servers"] = servers
+    else:
+        mcp[SERVER_NAME] = entry
+    out = dict(config)
+    out["mcp"] = mcp
+    return out
+
+
+def apply_kimi_install(config: dict[str, Any], script_path: str) -> dict[str, Any]:
+    """合并 agent-mcp 注册进 kimi mcp.json（标准 mcpServers 结构）。"""
+    servers = dict(config.get("mcpServers", {}))
+    servers[SERVER_NAME] = kimi_registration_json(script_path)["mcpServers"][SERVER_NAME]
+    out = dict(config)
+    out["mcpServers"] = servers
+    return out
+
+
+def apply_zcode_install(config: dict[str, Any], script_path: str) -> dict[str, Any]:
+    """合并 agent-mcp 注册进 zcode config.json 的 mcp.servers。"""
+    entry = zcode_registration_json(script_path)["mcp"]["servers"][SERVER_NAME]
+    mcp = dict(config.get("mcp", {}))
+    servers = dict(mcp.get("servers", {}))
+    servers[SERVER_NAME] = entry
+    mcp["servers"] = servers
+    out = dict(config)
+    out["mcp"] = mcp
+    return out
+
+
 # --- 安装执行 ---
 
 def default_paths() -> dict[str, Path]:
@@ -321,15 +393,22 @@ def default_paths() -> dict[str, Path]:
     home = Path.home()
     codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex"))
     omp_home = Path(os.environ.get("PI_CODING_AGENT_DIR", home / ".omp" / "agent"))
+    kimi_home = Path(os.environ.get("KIMI_CODE_HOME", home / ".kimi-code"))
     return {
         "codex_mcp": codex_home / "config.toml",
         "codex_hooks": codex_home / "hooks.json",
         "claude_mcp": home / ".claude.json",
         "claude_hooks": home / ".claude" / "settings.json",
         "omp_mcp": omp_home / "mcp.json",
+        "opencode_mcp": home / ".config" / "opencode" / "opencode.json",
+        "kimi_mcp": kimi_home / "mcp.json",
+        "zcode_mcp": home / ".zcode" / "cli" / "config.json",
         "codex_skill": home / ".agents" / "skills" / SERVER_NAME,
         "claude_skill": home / ".claude" / "skills" / SERVER_NAME,
         "omp_skill": omp_home / "skills" / SERVER_NAME,
+        "opencode_skill": home / ".config" / "opencode" / "skills" / SERVER_NAME,
+        "kimi_skill": kimi_home / "skills" / SERVER_NAME,
+        "zcode_skill": home / ".agents" / "skills" / SERVER_NAME,
     }
 
 
@@ -460,6 +539,27 @@ def install_host(host: str, script_path: str, starter_path: str, skill_source: P
         logs.append("OMP 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。")
         logs.extend(install_skill(skill_source, paths["omp_skill"], dry_run=dry_run))
         return logs
+    if host == "opencode":
+        logs.extend(_install_json_transform(
+            paths["opencode_mcp"], lambda config: apply_opencode_install(config, script_path),
+            dry_run=dry_run, description="opencode mcp.agent-mcp"))
+        logs.append("opencode 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。")
+        logs.extend(install_skill(skill_source, paths["opencode_skill"], dry_run=dry_run))
+        return logs
+    if host == "kimi":
+        logs.extend(_install_json_transform(
+            paths["kimi_mcp"], lambda config: apply_kimi_install(config, script_path),
+            dry_run=dry_run, description="kimi mcpServers.agent-mcp"))
+        logs.append("kimi 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。")
+        logs.extend(install_skill(skill_source, paths["kimi_skill"], dry_run=dry_run))
+        return logs
+    if host == "zcode":
+        logs.extend(_install_json_transform(
+            paths["zcode_mcp"], lambda config: apply_zcode_install(config, script_path),
+            dry_run=dry_run, description="zcode mcp.servers.agent-mcp"))
+        logs.append("zcode 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。")
+        logs.extend(install_skill(skill_source, paths["zcode_skill"], dry_run=dry_run))
+        return logs
     raise ValueError(f"未知 host: {host}")
 
 
@@ -469,6 +569,9 @@ _ROLLBACK_KEYS = {
     "codex": ("codex_mcp", "codex_hooks", "codex_skill"),
     "claude": ("claude_mcp", "claude_hooks", "claude_skill"),
     "omp": ("omp_mcp", "omp_skill"),
+    "opencode": ("opencode_mcp", "opencode_skill"),
+    "kimi": ("kimi_mcp", "kimi_skill"),
+    "zcode": ("zcode_mcp", "zcode_skill"),
 }
 
 
@@ -523,11 +626,53 @@ def default_skill_path() -> Path:
     return Path(__file__).resolve().parent / "skill"
 
 
+# --- star 提示 ---
+
+
+def _open_url(url: str) -> None:
+    """用系统默认浏览器打开 URL（跨平台；失败静默，不打断安装）。"""
+    try:
+        if os.name == "nt":
+            os.startfile(url)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def prompt_star() -> None:
+    """安装完成后提示 star：GitHub CLI 已登录则直接 gh repo star，否则打开浏览器。
+
+    已 star 时 gh repo star 幂等返回非零，忽略即可；gh 缺失/未登录走浏览器兜底。
+    """
+    logged_in = False
+    try:
+        proc = subprocess.run(["gh", "auth", "status"], capture_output=True, timeout=10)
+        logged_in = proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    if logged_in:
+        try:
+            subprocess.run(["gh", "repo", "star", GITHUB_REPO],
+                           capture_output=True, timeout=30)
+            print(f"安装完成！已通过 GitHub CLI 为 {GITHUB_REPO} 点亮 star ⭐")
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    print(f"安装完成！若觉得有用，欢迎为 {GITHUB_REPO} 点个 star ⭐")
+    _open_url(GITHUB_STAR_URL)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="install.py",
-        description="Agent MCP 安装/迁移：为 codex/claude/omp 注册 mcp_server.py 并安装配套 skill。"
-                    "写配置前自动备份（*.bak-agentmcp-<ts>），--rollback 可恢复。",
+        description="Agent MCP 安装/迁移：为 codex/claude/omp/opencode/kimi/zcode 注册 "
+                    "mcp_server.py 并安装配套 skill。写配置前自动备份"
+                    "（*.bak-agentmcp-<ts>），--rollback 可恢复。",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--install", action="store_true",
@@ -595,6 +740,12 @@ def main(argv: list[str] | None = None) -> int:
         json_keys.extend(("claude_mcp", "claude_hooks"))
     if "omp" in hosts:
         json_keys.append("omp_mcp")
+    if "opencode" in hosts:
+        json_keys.append("opencode_mcp")
+    if "kimi" in hosts:
+        json_keys.append("kimi_mcp")
+    if "zcode" in hosts:
+        json_keys.append("zcode_mcp")
     errors: list[str] = []
     for key in json_keys:
         _config, error = _load_json_object(paths[key])
@@ -611,6 +762,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(logs))
     if args.dry_run:
         print("（dry-run：以上均为将要执行的变更，未写任何文件）")
+    else:
+        prompt_star()
     return 0
 
 

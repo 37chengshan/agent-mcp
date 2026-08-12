@@ -8,6 +8,7 @@ import pytest
 import install
 from install import (
     BACKUP_SUFFIX,
+    GITHUB_REPO,
     HOOK_MARKER,
     LEGACY_TOOL_MAP,
     _skill_backup_path,
@@ -15,6 +16,9 @@ from install import (
     add_codex_session_start_hook,
     apply_claude_install,
     apply_codex_install,
+    apply_kimi_install,
+    apply_opencode_install,
+    apply_zcode_install,
     backup_path,
     claude_registration_json,
     claude_session_start_entry,
@@ -24,14 +28,18 @@ from install import (
     has_section,
     install_host,
     install_skill,
+    kimi_registration_json,
     legacy_tool_map_text,
     main,
     omp_registration_json,
+    opencode_registration_json,
     posix_session_start_command,
+    prompt_star,
     remove_legacy_section,
     rollback,
     skill_backup_root,
     windows_session_start_command,
+    zcode_registration_json,
 )
 
 SCRIPT = "/tmp/mcp_server.py"
@@ -56,6 +64,12 @@ def _paths(tmp_path):
         "claude_skill": tmp_path / "claude" / "skills" / "agent-mcp",
         "omp_skill": tmp_path / "omp" / "skills" / "agent-mcp",
         "omp_mcp": tmp_path / "omp" / "mcp.json",
+        "opencode_mcp": tmp_path / "opencode" / "opencode.json",
+        "opencode_skill": tmp_path / "opencode" / "skills" / "agent-mcp",
+        "kimi_mcp": tmp_path / "kimi" / "mcp.json",
+        "kimi_skill": tmp_path / "kimi" / "skills" / "agent-mcp",
+        "zcode_mcp": tmp_path / "zcode" / "config.json",
+        "zcode_skill": tmp_path / "agents" / "skills" / "agent-mcp",
     }
 
 
@@ -74,6 +88,12 @@ def test_registration_snippets():
     omp_entry = omp_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
     assert omp_entry == {"type": "stdio", "command": "python3", "args": [SCRIPT],
                          "timeout": 30000, "requestIdFormat": "number", "enabled": True}
+    opencode_entry = opencode_registration_json(SCRIPT)["mcp"]["agent-mcp"]
+    assert opencode_entry == {"type": "local", "command": ["python3", SCRIPT], "enabled": True}
+    kimi_entry = kimi_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
+    assert kimi_entry == {"command": "python3", "args": [SCRIPT]}
+    zcode_entry = zcode_registration_json(SCRIPT)["mcp"]["servers"]["agent-mcp"]
+    assert zcode_entry == {"command": "python3", "args": [SCRIPT], "env": {}}
 
 
 def test_backup_and_toml_helpers():
@@ -106,6 +126,33 @@ def test_legacy_detection_removal_and_map():
     assert len(LEGACY_TOOL_MAP) == 9
     for entry in LEGACY_TOOL_MAP:
         assert entry["old"] in rendered and entry["new"] in rendered
+
+
+def test_apply_opencode_install_is_pure_and_preserves_other_servers():
+    # opencode 顶层 mcp 结构
+    config = {"mcp": {"other": {"type": "local", "command": ["x"]}}}
+    out = apply_opencode_install(config, SCRIPT)
+    assert out["mcp"]["other"] == {"type": "local", "command": ["x"]}
+    assert out["mcp"]["agent-mcp"] == opencode_registration_json(SCRIPT)["mcp"]["agent-mcp"]
+    assert config == {"mcp": {"other": {"type": "local", "command": ["x"]}}}  # 纯函数
+    # opencode mcp.servers 结构（新版）
+    config_v2 = {"mcp": {"servers": {"keep": {"type": "remote", "url": "u"}}}}
+    out_v2 = apply_opencode_install(config_v2, SCRIPT)
+    assert out_v2["mcp"]["servers"]["keep"] == {"type": "remote", "url": "u"}
+    assert out_v2["mcp"]["servers"]["agent-mcp"] == opencode_registration_json(SCRIPT)["mcp"]["agent-mcp"]
+    # 空配置
+    assert apply_opencode_install({}, SCRIPT)["mcp"]["agent-mcp"]["command"] == ["python3", SCRIPT]
+
+
+def test_apply_kimi_and_zcode_install_preserve_other_servers():
+    kimi_out = apply_kimi_install({"mcpServers": {"keep": {"command": "x"}}}, SCRIPT)
+    assert kimi_out["mcpServers"]["keep"] == {"command": "x"}
+    assert kimi_out["mcpServers"]["agent-mcp"] == kimi_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
+    zcode_out = apply_zcode_install({"mcp": {"servers": {"keep": {"command": "x"}}}}, SCRIPT)
+    assert zcode_out["mcp"]["servers"]["keep"] == {"command": "x"}
+    assert zcode_out["mcp"]["servers"]["agent-mcp"] == zcode_registration_json(SCRIPT)["mcp"]["servers"]["agent-mcp"]
+    # zcode 空配置自动建 mcp.servers
+    assert apply_zcode_install({}, SCRIPT)["mcp"]["servers"]["agent-mcp"]["args"] == [SCRIPT]
 
 
 def test_apply_claude_install_is_pure_and_preserves_other_servers():
@@ -257,6 +304,83 @@ def test_omp_installs_mcp_config_and_skill_without_hook(tmp_path):
     assert config["mcpServers"]["agent-mcp"] == omp_registration_json(SCRIPT)["mcpServers"]["agent-mcp"]
     assert (paths["omp_skill"] / "SKILL.md").read_text() == "agent-mcp"
     assert any("SessionStart" in line and "不支持" in line for line in logs)
+
+
+@pytest.mark.parametrize(
+    ("host", "mcp_key", "apply_fn", "reg_fn", "skill_key"),
+    [
+        ("opencode", "opencode_mcp", apply_opencode_install, opencode_registration_json, "opencode_skill"),
+        ("kimi", "kimi_mcp", apply_kimi_install, kimi_registration_json, "kimi_skill"),
+        ("zcode", "zcode_mcp", apply_zcode_install, zcode_registration_json, "zcode_skill"),
+    ],
+)
+def test_json_host_installs_config_and_skill_without_hook(
+    tmp_path, host, mcp_key, apply_fn, reg_fn, skill_key
+):
+    paths = _paths(tmp_path)
+    paths[mcp_key].parent.mkdir(parents=True)
+    paths[mcp_key].write_text(json.dumps({"keep": {"command": "x"}}))
+    logs = install_host(host, SCRIPT, STARTER, _skill_source(tmp_path), paths)
+    config = json.loads(paths[mcp_key].read_text())
+    if host == "opencode":
+        entry = reg_fn(SCRIPT)["mcp"]["agent-mcp"]
+    elif host == "zcode":
+        entry = reg_fn(SCRIPT)["mcp"]["servers"]["agent-mcp"]
+    else:
+        entry = reg_fn(SCRIPT)["mcpServers"]["agent-mcp"]
+    assert config["keep"] == {"command": "x"}
+    # 通过 apply_fn 反推 agent-mcp 注册位置
+    merged = apply_fn({"keep": {"command": "x"}}, SCRIPT)
+    if host == "zcode":
+        assert config["mcp"]["servers"]["agent-mcp"] == entry
+        assert config["mcp"]["servers"] == merged["mcp"]["servers"]
+    elif host == "opencode":
+        assert config["mcp"]["agent-mcp"] == entry
+        assert config["mcp"] == merged["mcp"]
+    else:
+        assert config["mcpServers"]["agent-mcp"] == entry
+        assert config["mcpServers"] == merged["mcpServers"]
+    assert (paths[skill_key] / "SKILL.md").read_text() == "agent-mcp"
+    assert any("SessionStart" in line and "不支持" in line for line in logs)
+
+
+def test_prompt_star_stars_via_gh_when_logged_in(monkeypatch, capsys):
+    calls = []
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        class Proc:
+            returncode = 0
+        return Proc()
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+    prompt_star()
+    out = capsys.readouterr().out
+    assert calls[0] == ["gh", "auth", "status"]
+    assert calls[1] == ["gh", "repo", "star", GITHUB_REPO]
+    assert "点亮 star" in out
+
+
+def test_prompt_star_falls_back_to_browser_when_no_gh(monkeypatch, capsys):
+    def fake_run(cmd, *args, **kwargs):
+        raise FileNotFoundError("gh not found")
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+    opened = []
+    monkeypatch.setattr(install, "_open_url", lambda url: opened.append(url))
+    prompt_star()
+    out = capsys.readouterr().out
+    assert opened == [install.GITHUB_STAR_URL]
+    assert "点个 star" in out
+
+
+def test_prompt_star_falls_back_when_gh_not_logged_in(monkeypatch, capsys):
+    def fake_run(cmd, *args, **kwargs):
+        class Proc:
+            returncode = 1 if cmd == ["gh", "auth", "status"] else 0
+        return Proc()
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+    opened = []
+    monkeypatch.setattr(install, "_open_url", lambda url: opened.append(url))
+    prompt_star()
+    assert opened == [install.GITHUB_STAR_URL]
 
 
 def test_install_unknown_host_raises(tmp_path):

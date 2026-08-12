@@ -1,6 +1,6 @@
 # Agent MCP
 
-**跨 CLI 的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把 claude / grok / opencode / omp / atomcode 五个 CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池，让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。
+**打通不同 Agent CLI 壁垒的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把 claude / grok / opencode / omp / atomcode 五个 CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池，让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。CLI 不再是孤岛：每个模型都能**驾驭最适配它的底座**——读密集探索交给快底座（omp/grok），深推理规划交给强底座（claude），模型与底座按任务现场自由匹配，成本与质量自己说了算。
 
 > 多 Agent 编排比单线程多耗 3–10× tokens（Anthropic 实测）。Agent MCP 的价值不是"多开几个 Agent"，而是把拆解的收益锁住、把协调的开销压到最低：**复杂度分级门**决定"要不要拆"，**任务级超时 / 队列 / 续接 / 降档**兜住"拆了怎么办"。
 
@@ -19,7 +19,8 @@
 | 💰 **成本控制** | `token_budget` 超额自动降档 model 重跑；`cache_ttl` 读密集结果秒级缓存（TTL 内 0 token）；`summary_chars` / `context_mode` 裁剪回传体积 |
 | 🔐 **会话隔离** | session_id 是所有权边界：宿主注入的稳定会话标识派生，同一对话重开 MCP 连接旧 agent 仍可用，跨会话不可互操作 |
 | 📊 **实时监控页** | 单文件、零外部依赖的只读 Web UI（SSE 直播事件流 + 对话图 + 明暗主题），daemon 随手起，`GET /` 实测 5ms |
-| 🛠️ **一键安装** | `install.py` 同时注册 codex / claude / omp 三主载体，装 skill 与 SessionStart hook；写配置前自动备份、`--rollback` 可回滚、`--dry-run` 只预览 |
+| 🧠 **记忆银行** | `memory_store` / `memory_recall` 跨会话项目记忆存取：FINAL_ANSWER 自动沉淀 + 关键词召回注入 |
+| 🛠️ **一键安装** | `install.py` 同时注册 codex / claude / omp / opencode / kimi / zcode 六个 host，装 skill 与 SessionStart hook；或 curl 一键脚本 / 通用提示词交给任意 AI 安装；写配置前自动备份、`--rollback` 可回滚、`--dry-run` 只预览 |
 
 ---
 
@@ -52,17 +53,32 @@
 
 ---
 
-## 🚀 快速开始
+## 🚀 快速安装
+
+**方式一 · curl 一键安装**（macOS / Linux，Windows 用 Git Bash 或 WSL 执行）：
 
 ```bash
-# 1. 克隆
+curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.sh | bash
+```
+
+自动下载项目 → 注册全部六个 host（codex / claude / omp / opencode / kimi / zcode）的 MCP + skill → 安装完成后提示是否 star。可用环境变量定制：`AGENT_MCP_DIR`（安装目录）、`AGENT_MCP_HOST`（单 host）。
+
+**方式二 · git clone + 安装脚本**：
+
+```bash
 git clone git@github.com:37chengshan/agent-mcp.git && cd agent-mcp
+python3 install.py --install --host all        # 或 --host claude / opencode / kimi / zcode …
+python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open 打开监控页
+```
 
-# 2. 一键注册三主载体（codex / claude / omp）+ 安装编排 skill
-python3 install.py --install --host all --server "$PWD/mcp_server.py"
+**方式三 · 没有你的 agent？把提示词丢给任意 AI**：
 
-# 3. 幂等启动 daemon（已运行则跳过），--open 打开监控页
-python3 start_agent_mcp.py --open
+> 如果你的 agent 不在内置 host 列表里，不要紧——复制下面这段提示词，发给任意支持 MCP 的 AI 编程工具，它会照 [安装说明](docs/install-guide.md) 自己完成注册：
+
+```text
+请按照 https://github.com/37chengshan/agent-mcp/blob/main/docs/install-guide.md
+的第 3 节（通用模板）和你的配置格式，为我把 agent-mcp 注册为 MCP 服务器并安装 skill。
+注册完成后告诉我 spawn_agent 工具是否可用；安装完成后请提醒我给项目点个 star。
 ```
 
 > `--dry-run` 先看将写入的配置；`--legacy-map` 查看旧 grok-cli 9 工具 → 新工具迁移表；误改配置用 `--rollback` 从备份恢复。
@@ -84,6 +100,8 @@ python3 start_agent_mcp.py --open
 | `list_agents` | 列出任务树 agent（可含其他会话，找回旧 agent 状态） |
 | `get_agent_activity` | 事件流水（spawned/running/message/usage/terminated…） |
 | `get_token_usage` | 累计 token / 成本对账 |
+| `memory_store` | 跨会话项目记忆写入（content 必填 + kind/key/tags 可选） |
+| `memory_recall` | 跨会话项目记忆召回（query/kind/limit 默认 5，会话隔离） |
 
 ---
 
@@ -110,7 +128,7 @@ agent_mcp/
   db.py                  # SQLite 持久化（agent/事件/usage）
   daemon_http.py         # HTTP 路由 + X-Auth-Token 认证
 dispatch_worker.py       # 子进程 worker（超时终止进程树）
-install.py               # 三主载体注册 + skill 安装 + SessionStart hook + 备份回滚
+install.py               # 六 host（codex/claude/omp/opencode/kimi/zcode）注册 + skill + 备份回滚
 start_agent_mcp.py       # 幂等启动 daemon（可选打开监控页）
 web/index.html           # 单文件零依赖只读监控页（SSE + 对话图 + 明暗主题）
 skill/                   # 编排 skill + 10 内置 Agent + 任务简报模板
@@ -129,6 +147,6 @@ tests/                   # 20+ 测试文件（含真实 stdio 与 CLI 集成冒�
 
 ## 📚 文档
 
-- [验收清单](docs/acceptance.md) · [四 CLI 能力矩阵](docs/capability-matrix.md)
+- [安装教程（AI 可读版）](docs/install-guide.md) · [验收清单](docs/acceptance.md) · [四 CLI 能力矩阵](docs/capability-matrix.md)
 - [设计文档](docs/plans/2026-08-03-agent-mcp-redesign-design.md) · [实现计划](docs/plans/2026-08-03-agent-mcp-implementation.md)
 - [编排 Skill 全文](skill/SKILL.md)
