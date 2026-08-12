@@ -4,6 +4,10 @@
 
 > 多 Agent 编排比单线程多耗 3–10× tokens（Anthropic 实测）。Agent MCP 的价值不是"多开几个 Agent"，而是把拆解的收益锁住、把协调的开销压到最低：**复杂度分级门**决定"要不要拆"，**任务级超时 / 队列 / 续接 / 降档**兜住"拆了怎么办"。
 
+<p align="center">
+  <img src="docs/images/agent-mcp-hero.png" width="100%" alt="Agent MCP — 打通不同 Agent CLI 的壁垒">
+</p>
+
 ---
 
 ## ✨ 特性
@@ -21,6 +25,17 @@
 | 📊 **实时监控页** | 单文件、零外部依赖的只读 Web UI（SSE 直播事件流 + 对话图 + 明暗主题），异常状态（needs_advisor 需决策 / orphaned 失联 / verify 回投 / 降档 / ingest 失败）实时可见，daemon 随手起，`GET /` 实测 5ms |
 | 🧠 **记忆银行** | `memory_store` / `memory_recall` 跨会话项目记忆存取：FINAL_ANSWER 自动沉淀 + 关键词召回注入 |
 | 🛠️ **一键安装** | `install.py` 同时注册 codex / claude / omp / opencode / kimi / zcode 六个 host，装 skill 与 SessionStart hook；或 curl 一键脚本 / 通用提示词交给任意 AI 安装；写配置前自动备份、`--rollback` 可回滚、`--dry-run` 只预览 |
+
+> **统一入口，不锁死在单一 Agent CLI** —— 为每个任务选择更适合的执行组合：
+
+```text
+不是：Agent MCP → 同一个 CLI
+而是：任务特征 → Agent MCP → 最合适 CLI × 最合适模型
+```
+
+<p align="center">
+  <img src="docs/images/agent-mcp-routing.png" width="100%" alt="Agent MCP — 跨 CLI 灵活路由">
+</p>
 
 ---
 
@@ -50,6 +65,16 @@
 ```
 
 完整架构图见 [docs/architecture.svg](docs/architecture.svg)，编排流程见 [docs/workflow.svg](docs/workflow.svg)。
+
+> **编排、监控、续接与容错** —— 运行起来之后怎么把多 Agent 真正管起来：
+
+```text
+复杂度分级门 → 派发 → 监控（wait 不轮询）→ 验证回投 → 容错（超时 / resume / 降档）
+```
+
+<p align="center">
+  <img src="docs/images/agent-mcp-orchestration.png" width="100%" alt="Agent MCP — 编排、监控、续接与容错">
+</p>
 
 ---
 
