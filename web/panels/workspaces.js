@@ -26,8 +26,10 @@ function statusMeta(s){
 /* 终态（merged/discarded）不再显示操作按钮 */
 function isTerminal(s){ return s === "merged" || s === "discarded"; }
 
-/* 鉴权 token：与 index.html 同约定，来自 URL hash #token=... */
+/* 鉴权 token：优先 daemon 注入的全局 token（index 页注入 window.__amToken），
+ * 回退 URL hash #token=...（与 index.html 同约定） */
 function authToken(){
+  if(window.__amToken) return window.__amToken;
   return new URLSearchParams(location.hash.slice(1)).get("token") || "";
 }
 

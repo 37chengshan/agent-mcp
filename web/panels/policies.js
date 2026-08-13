@@ -123,6 +123,8 @@ async function poll(){
 /* ---------- 认证（与 index.html 同约定：URL hash #token=） ---------- */
 
 function authToken(){
+  // 优先 daemon 注入的全局 token（index 页注入 window.__amToken），回退 URL hash
+  if(window.__amToken) return window.__amToken;
   const m = (location.hash || "").match(/token=([^&]+)/);
   return m ? decodeURIComponent(m[1]) : "";
 }

@@ -136,12 +136,19 @@ table.sum{width:100%;border-collapse:collapse;font-size:11.5px}table.sum td{padd
 .op-btn.danger{color:var(--red);border-color:var(--red)}.op-btn.danger:hover:not(:disabled){background:var(--red-soft)}
 .op-btn:disabled{opacity:.42;cursor:not-allowed}.op-note{grid-column:1/-1;color:var(--ink-soft);font-size:9.5px}
 .op-feedback{min-height:16px;margin-top:6px;color:var(--green);font-size:10px}.op-feedback.error{color:var(--red)}
-/* U7 replay scrubber */
-#replay{position:absolute;top:0;left:0;right:0;z-index:25;display:flex;align-items:center;gap:8px;padding:6px 18px;background:var(--card);border-bottom:1px solid var(--line);font:10px/1 var(--mono)}
+/* U7 replay scrubber——主区下方、footer 上方的静态底部条（不悬浮、不遮挡） */
+#replay{display:flex;align-items:center;gap:8px;padding:6px 14px;
+  background:var(--card);border-top:1px solid var(--line);font:10px/1 var(--mono)}
 #replay[hidden]{display:none}
+#replay .rp-label{color:var(--ink-soft);letter-spacing:.1em;text-transform:uppercase;font-size:8.5px}
 #replay button{padding:3px 8px;border:1px solid var(--line);border-radius:5px;background:var(--card);cursor:pointer}
 #replay input[type=range]{flex:1}#replay .rp-time{color:var(--ink-soft)}
 #detail-head{display:none}#drawer-toggle,#detail-close{min-width:42px;height:34px;border:1px solid var(--line);border-radius:8px;background:var(--card);cursor:pointer}
+/* 仪表盘入口按钮（右上角，与会话切换并排） */
+#dashboard-btn{margin-left:2px;height:34px;padding:0 12px;border:1px solid var(--accent);border-radius:8px;
+  background:var(--accent-soft);color:var(--accent-deep);font:700 11px/1 var(--mono);cursor:pointer;
+  transition:border-color .15s,background .15s,transform .15s}
+#dashboard-btn:hover{border-color:var(--accent);background:var(--accent);color:#fff;transform:translateY(-1px)}
 .btn:focus-visible,.op-btn:focus-visible,.mode-tabs button:focus-visible,select.sess:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (max-width:860px){
   body{grid-template-rows:56px auto minmax(0,1fr) 28px}
@@ -201,7 +208,7 @@ main.resizing{user-select:none;cursor:col-resize}
 /* usage-panel 从 stats 下方弹出：scale + 淡入 */
 #usage-panel{animation:popIn .26s var(--ease) backwards;transform-origin:top right}
 @keyframes popIn{from{opacity:0;transform:scale(.96) translateY(-4px)}to{opacity:1;transform:scale(1) translateY(0)}}
-/* replay 从顶部滑入 */
+/* replay 从下方浮现 */
 #replay{animation:slideDown .28s var(--ease) backwards}
 @keyframes slideDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
 /* header 品牌区：进入浮现 */
@@ -238,6 +245,7 @@ h2.aname{letter-spacing:-.015em}
   </div>
   <select id="sess" class="sess" title="会话切换"><option value="all">全部会话</option></select>
   <span id="st-models" hidden></span>
+  <button id="dashboard-btn" type="button" title="打开仪表盘（协作泳道 / 策略可视化 / 工作区视图）">仪表盘</button>
 </header>
 <section id="gantt" hidden><div class="ghead"><span>Gantt 时间线</span><span id="gantt-range"></span><button id="gantt-toggle" type="button">折叠</button></div><canvas id="gantt-canvas"></canvas></section>
 <div id="usage-panel" hidden></div>
@@ -256,8 +264,10 @@ h2.aname{letter-spacing:-.015em}
   <aside id="detail-pane"><div class="empty">选择 agent 节点查看详情</div></aside>
 </main>
 <div id="replay" hidden>
-  <button id="rp-play" type="button">▶</button><button id="rp-pause" type="button">❚❚</button>
-  <input id="rp-scrub" type="range" min="1" max="8" step="0.1" value="1"><span class="rp-time" id="rp-time">0×</span>
+  <span class="rp-label">回放</span>
+  <button id="rp-play" type="button" title="播放">▶</button>
+  <button id="rp-pause" type="button" title="暂停">❚❚</button>
+  <input id="rp-scrub" type="range" min="1" max="8" step="0.1" value="1" title="回放速度"><span class="rp-time" id="rp-time">0×</span>
 </div>
 <footer>
   <span class="dot" id="sse-dot"></span><span id="sse-txt">连接中…</span>
@@ -453,11 +463,17 @@ function onEvent(type,ev){
 function markDirty(){scheduleRender();}
 
 let raf=null;
+let detailFingerprint=""; // renderDetail 增量指纹：数据未变不重建（防拖动/定时重绘闪烁）
 function scheduleRender(){
   if(raf)return;
   raf=requestAnimationFrame(()=>{raf=null;renderAll();});
 }
-function renderAll(){renderHeader();renderGraph();renderDetail();renderFooter();renderGantt();}
+function renderAll(){
+  /* 图区拖动（pan/zoom）中：只重绘 graph，跳过 renderDetail——
+     每帧重建 detail 会重播 .msg/.ev 的 itemIn 动画，右侧文案高频闪烁 */
+  if(S.drag){renderGraph();return;}
+  renderHeader();renderGraph();renderDetail();renderFooter();renderGantt();
+}
 
 function renderHeader(){
   const sel=$("sess"),current=sel.value;
@@ -665,6 +681,12 @@ function usageSeries(id){return [...S.eventLog.values()].filter(e=>e.agent_id===
 function payloadSummary(e){const p=e.payload||{};return e.type==="agent.message"||e.type==="agent.user_turn"?String(p.text||"").slice(0,55):JSON.stringify(p).slice(0,70);}
 function renderDetail(){
   const pane=$("detail-pane"),a=S.agents.get(S.selected);
+  /* 增量指纹：选中 agent + 消息/事件最新 seq + 消息页数 未变化 → 不重建。
+     重建会重播 itemIn 动画（视觉闪烁）且浪费布局 */
+  const latestSeq=S.eventLog.size?[...S.eventLog.values()].pop().seq:0;
+  const fp=`${S.selected}|${latestSeq}|${S.msgsShown}`;
+  if(fp===detailFingerprint)return;
+  detailFingerprint=fp;
   const tpl=$("tpl-detail"),root=tpl.content.cloneNode(true);
   /* head */
   root.querySelector("#drawer-toggle").setAttribute("aria-expanded",pane.classList.contains("drawer-open")?"true":"false");

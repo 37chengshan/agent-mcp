@@ -527,14 +527,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_index(self):
-        """发送 index.html 并注入面板 loader（幂等：已有注入标记则跳过）。"""
+        """发送 index.html 并注入面板 loader（幂等：已有注入标记则跳过）。
+        同时注入 __amToken：面板鉴权不再依赖 URL hash（hash 易丢失/手动打开无 hash），
+        从页面全局变量读取，回退 hash。"""
         root = self.server.web_root.resolve()
         path = root / "index.html"
         if not path.is_file():
             self.send_error(404)
             return
         data = path.read_bytes()
-        marker = b'<script type="module" src="/panels/loader.js"></script>'
+        token_script = (f'<script>window.__amToken={json.dumps(self.server.token)};</script>'
+                        .encode("utf-8"))
+        if token_script not in data:
+            data = data.replace(b"</head>", token_script + b"</head>", 1)
+        marker = b'<script type="module" src="/panels/loader.js?v=v2"></script>'
         if marker not in data:
             if b"</body>" in data:
                 data = data.replace(b"</body>", marker + b"</body>", 1)
@@ -566,6 +572,9 @@ class Handler(BaseHTTPRequestHandler):
             ".png": "image/png",
             ".ico": "image/x-icon",
         }.get(path.suffix.lower(), "application/octet-stream")
+        # 面板 JS/CSS 迭代频繁：禁缓存，防浏览器命中旧模块（曾导致面板 401/旧逻辑）
+        if path.suffix.lower() in (".js", ".mjs", ".css"):
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()

@@ -15,10 +15,13 @@
 const SSE_URL = "/api/events";
 const CSS_URL = "/css/panels.css";
 const CSS_ID = "am-panels-css";
+// 面板模块版本化：daemon 已发 no-store，但浏览器可能仍持有 no-cache 头生效前的
+// 旧缓存响应——版本后缀保证 URL 变化必然绕过缓存（防旧模块/旧逻辑）
+const PANEL_V = "v2";
 const TAB_DEFS = [
-  { key: "collaboration", label: "协作泳道", module: "./collaboration.js" },
-  { key: "policies",      label: "策略可视化", module: "./policies.js" },
-  { key: "workspaces",    label: "工作区视图", module: "./workspaces.js" },
+  { key: "collaboration", label: "协作泳道", module: `./collaboration.js?v=${PANEL_V}` },
+  { key: "policies",      label: "策略可视化", module: `./policies.js?v=${PANEL_V}` },
+  { key: "workspaces",    label: "工作区视图", module: `./workspaces.js?v=${PANEL_V}` },
 ];
 
 let inited = false;
@@ -176,6 +179,10 @@ export function init(){
   injectCss();
   buildDom();
   getSse();
+  // 仪表盘入口：index.html header 的 #dashboard-btn（或任意元素）点击打开面板
+  window.__amOpenDashboard = (key) => { openPane(key || currentKey || TAB_DEFS[0].key); };
+  const btn = document.getElementById("dashboard-btn");
+  if(btn) btn.addEventListener("click", () => { openPane(currentKey || TAB_DEFS[0].key); });
 }
 
 if(document.readyState === "loading"){
