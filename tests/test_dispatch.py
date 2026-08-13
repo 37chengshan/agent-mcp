@@ -59,21 +59,27 @@ def test_is_pid_running_and_reaped():
 
 def test_spawn_cli_worker_builds_and_spawns(monkeypatch, tmp_path):
     captured = {}
+    # flaky 修复：用 sleep 进程替代 true（true 瞬间退出 → is_pid_running 时序竞态）
+    proc = subprocess.Popen(["sleep", "5"])
     def fake_spawn(cmd, **kw):
         captured["cmd"] = cmd
-        return subprocess.Popen(["true"])
+        return proc
     monkeypatch.setattr("agent_mcp.dispatch.spawn_detached", fake_spawn)
-    info = spawn_cli_worker("claude", prompt="hi", cwd="/tmp",
-                            permission_mode="plan",
-                            state_dir=tmp_path)
-    cmd = captured["cmd"]
-    assert any("dispatch_worker.py" in c for c in cmd)
-    assert any(c.startswith(str(tmp_path)) for c in cmd)  # state/out/err 落在 state_dir 下
-    cli_json = json.loads(cmd[-1])
-    assert cli_json[0].endswith("claude") and "hi" in cli_json
-    assert "claude" in info["command_summary"]
-    assert "--permission-mode" in info["command_summary"]
-    assert is_pid_running(info["worker_pid"])  # spawn 的对象存活（true 进程）
+    try:
+        info = spawn_cli_worker("claude", prompt="hi", cwd="/tmp",
+                                permission_mode="plan",
+                                state_dir=tmp_path)
+        cmd = captured["cmd"]
+        assert any("dispatch_worker.py" in c for c in cmd)
+        assert any(c.startswith(str(tmp_path)) for c in cmd)  # state/out/err 落在 state_dir 下
+        cli_json = json.loads(cmd[-1])
+        assert cli_json[0].endswith("claude") and "hi" in cli_json
+        assert "claude" in info["command_summary"]
+        assert "--permission-mode" in info["command_summary"]
+        assert is_pid_running(info["worker_pid"])  # spawn 的对象存活（sleep 进程）
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
 
 def test_spawn_cli_worker_binary_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_adapters._CLAUDE, "binary", lambda: None)
