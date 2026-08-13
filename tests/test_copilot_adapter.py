@@ -60,7 +60,8 @@ def test_copilot_parse_empty():
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(CopilotAdapter().binary() is None, reason="copilot CLI not installed")
+@pytest.mark.skip(reason="不跑真实 CLI（用户约束）：copilot -p 依赖真实网络/订阅，"
+                         "断网/代理下会 CAPIError 连接错误导致 flaky")
 def test_copilot_real_spawn_smoke():
     """真实跑 copilot -p 冒烟：命令可执行（不断言 AI 内容）。"""
     a = get_adapter("copilot")
