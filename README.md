@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.
 
 > ⚠️ 管道执行会以**当前用户权限**直接运行远程脚本——请先审阅 [install.sh](install.sh) 内容再执行；更稳妥的安装方式见下方 git clone。也可改用固定 commit 引用：`curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/<commit-sha>/install.sh | bash`。
 
-一键配置支持 **codex / claude / omp / opencode / kimi / zcode** 六种 Agent CLI（注册 MCP + 安装 skill）→ 安装完成后提示是否 star。**其它 CLI 同样可以接入**：用 `AGENT_MCP_HOST` 指定单个 host，或按下方方式三把提示词交给任意 AI 完成注册。`AGENT_MCP_DIR` 可自定义安装目录。
+一键配置支持 **codex / claude / omp / opencode / kimi / zcode / grok / cursor / gemini / pi / copilot / cline / qwen / devin / windsurf / amazon-q / atomcode / kiro / goose / hermes / crush** 二十一种 Agent CLI（注册 MCP；前六种另装 skill）→ 安装完成后提示是否 star。**其它 CLI 同样可以接入**：用 `AGENT_MCP_HOST` 指定单个 host，或按下方方式三把提示词交给任意 AI 完成注册。`AGENT_MCP_DIR` 可自定义安装目录。host 覆盖依据见 [docs/research/installer-coverage-2026-08-13.md](docs/research/installer-coverage-2026-08-13.md)。
 
 **方式二 · git clone + 安装脚本**：
 
@@ -58,8 +58,13 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 | 💰 **成本控制** | `token_budget` 超额自动降档 model 重跑；`cache_ttl` 读密集结果秒级缓存（TTL 内 0 token）；`summary_chars` / `context_mode` 裁剪回传体积 |
 | 🔐 **会话隔离** | session_id 是所有权边界：宿主注入的稳定会话标识派生，同一对话重开 MCP 连接旧 agent 仍可用，跨会话不可互操作 |
 | 📊 **实时监控页** | 单文件、零外部依赖的只读 Web UI（SSE 直播事件流 + 对话图 + 明暗主题），异常状态（needs_advisor 需决策 / orphaned 失联 / verify 回投 / 降档 / ingest 失败）实时可见，daemon 随手起，`GET /` 实测 5ms |
+| 📈 **仪表盘三面板（v2）** | 底部 Dock 打开**全屏分页仪表盘**：协作泳道（agent 实时状态 + 跨厂商审查卡片）/ 策略可视化（预算进度环 + 审计日志）/ 工作区视图（worktree 合并/丢弃）。面板常驻不重建（切页零闪烁）、隐藏面板暂停渲染（性能）、进入/呼吸动画（prefers-reduced-motion 自动降级） |
 | 🧠 **记忆银行** | `memory_store` / `memory_recall` 跨会话项目记忆存取：FINAL_ANSWER 自动沉淀 + 关键词召回注入 |
-| 🛠️ **一键安装** | `install.py` 同时注册 codex / claude / omp / opencode / kimi / zcode 六个 host，装 skill 与 SessionStart hook；或 curl 一键脚本 / 通用提示词交给任意 AI 安装；写配置前自动备份、`--rollback` 可回滚、`--dry-run` 只预览 |
+| 🧩 **多 Agent DAG 编排** | `orchestrate_task` 声明式任务图（依赖/cli/worktree/跨厂商审查）：无依赖任务并行、依赖任务按序推进、Polly 模式跨厂商审查（写者与审查者不同 CLI 厂商）、worktree 隔离执行 |
+| 🛡️ **策略治理引擎** | `PolicyEngine` 声明式策略链（预算/审批/工具限权 3 内置策略）：spawn/steer/orchestrate 入口前 enforcement，DENY 短路，状态落盘持久化，`policy_list/policy_add/policy_state` 会话内可配置 |
+| 📊 **监控页三面板** | 现有对话图之上新增协作泳道 / 策略可视化（预算进度环 + 审计日志）/ 工作区视图（worktree 合并/丢弃），原生 ES modules 零构建链，SSE 实时驱动 |
+| 🔒 **沙箱映射层** | 统一策略意图 → 各 CLI 沙箱参数翻译（codex `--sandbox`、claude permission-mode、omp approval-mode…），无原生沙箱的 CLI 走进程级资源兜底 |
+| 🛠️ **一键安装全覆盖** | `install.py` 注册 21 个 host（6 主载体 + grok/cursor/gemini/pi/copilot/cline/qwen/devin/windsurf/amazon-q/atomcode/kiro/goose/hermes/crush），A/B/C 三模板复用 + YAML/rc 专属注册，备份回滚、`--rollback`、`--dry-run` 只预览 |
 
 > **统一入口，不锁死在单一 Agent CLI** —— 为每个任务选择更适合的执行组合：
 
@@ -120,6 +125,7 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 |---|---|
 | `estimate_complexity` | 本地判级 S/M/L + 是否委派建议（零 token、不 spawn） |
 | `spawn_agent` | 派发新 agent（立即返回 agent_id + status；槽位满返回 queued） |
+| `orchestrate_task` | 多 Agent DAG 编排（依赖图 + worktree + 跨厂商审查，阻塞返回汇总） |
 | `send_message` | 投递消息到队列，不触发执行 |
 | `steer_agent` | 中途插话：先终止当前 run，再在同一节点立即开始下一 turn |
 | `followup_task` | 唯一触发新 turn 的入口：合并挂起消息重新 spawn（可 interrupt） |
@@ -128,6 +134,7 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 | `list_agents` | 列出任务树 agent（可含其他会话，找回旧 agent 状态） |
 | `get_agent_activity` | 事件流水（spawned/running/message/usage/terminated…） |
 | `get_token_usage` | 累计 token / 成本对账 |
+| `policy_list` / `policy_add` / `policy_state` | 策略引擎管理（daemon 级）：查看 / 收紧配置（budget/approval/tool_limit）/ 快照审计 |
 | `memory_store` | 跨会话项目记忆写入（content 必填 + kind/key/tags 可选） |
 | `memory_recall` | 跨会话项目记忆召回（query/kind/limit 默认 5，会话隔离） |
 
@@ -148,19 +155,25 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 ## 📦 项目结构
 
 ```
-mcp_server.py            # MCP 薄层：工具定义、host 识别、会话隔离、daemon 原子拉起
+mcp_server.py            # MCP 薄层：工具定义、host 识别、会话隔离、daemon 原子拉起、策略 enforcement
 agent_mcp/
   daemon_main.py         # 常驻 daemon：Dispatcher、槽位/排队/心跳/看护、验证回投、SSE
   cli_adapters.py        # 多 CLI 适配器（命令构造 + 事件流归一化）
+  orchestrator.py        # 多 Agent DAG 编排（依赖图 + Polly 跨厂商审查 + worktree）
+  policies/              # 策略治理引擎（PolicyEngine + budget/approval/tool_limit 内置策略）
+  sandbox/               # 统一沙箱意图 → CLI 参数映射 + 进程级资源兜底
   state_machine.py       # agent 状态机（starting/running/terminated/error/…）
   db.py                  # SQLite 持久化（agent/事件/usage）
-  daemon_http.py         # HTTP 路由 + X-Auth-Token 认证
+  daemon_http.py         # HTTP 路由 + X-Auth-Token 认证 + SSE（命名/消息双通道）+ 策略/工作区端点
 dispatch_worker.py       # 子进程 worker（超时终止进程树）
-install.py               # 六 host（codex/claude/omp/opencode/kimi/zcode）注册 + skill + 备份回滚
+install.py               # 21 host 注册（A/B/C 模板 + YAML/rc）+ skill + 备份回滚
+install.sh               # curl 一键安装（21 host 选择）
 start_agent_mcp.py       # 幂等启动 daemon（可选打开监控页）
 web/index.html           # 单文件零依赖只读监控页（SSE + 对话图 + 明暗主题）
+web/panels/              # 协作泳道 / 策略可视化 / 工作区视图 三面板（ES modules）
+web/css/panels.css       # 面板样式（复用 index.html 视觉语言）
 skill/                   # 编排 skill + 10 内置 Agent + 任务简报模板
-docs/                    # 验收清单 / 能力矩阵 / 设计文档
+docs/                    # 验收清单 / 能力矩阵 / 安装器覆盖调研 / 设计文档
 tests/                   # 20+ 测试文件（含真实 stdio 与 CLI 集成冒烟）
 ```
 
@@ -168,6 +181,6 @@ tests/                   # 20+ 测试文件（含真实 stdio 与 CLI 集成冒�
 
 ## 📚 文档
 
-- [安装教程（AI 可读版）](docs/install-guide.md) · [CLI 选型指南](skill/cli-guide.md) · [验收清单](docs/acceptance.md) · [四 CLI 能力矩阵](docs/capability-matrix.md) · [自定义 CLI 适配器](docs/custom-cli.md)
+- [安装教程（AI 可读版）](docs/install-guide.md) · [CLI 选型指南](skill/cli-guide.md) · [验收清单](docs/acceptance.md) · [能力矩阵](docs/capability-matrix.md) · [自定义 CLI 适配器](docs/custom-cli.md) · [安装器覆盖调研](docs/research/installer-coverage-2026-08-13.md)
 - [设计文档](docs/plans/2026-08-03-agent-mcp-redesign-design.md) · [实现计划](docs/plans/2026-08-03-agent-mcp-implementation.md)
 - [编排 Skill 全文](skill/SKILL.md)

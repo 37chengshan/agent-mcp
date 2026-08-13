@@ -37,7 +37,10 @@ from typing import Any
 SERVER_NAME = "agent-mcp"
 LEGACY_NAME = "grok-cli"
 BACKUP_SUFFIX = ".bak-agentmcp-"
-HOSTS = ("codex", "claude", "omp", "opencode", "kimi", "zcode")
+HOSTS = ("codex", "claude", "omp", "opencode", "kimi", "zcode",
+         "grok", "cursor", "gemini", "pi", "copilot", "cline", "qwen",
+         "devin", "windsurf", "amazon-q", "atomcode", "kiro",
+         "goose", "hermes", "crush")
 STARTER_NAME = "start_agent_mcp.py"
 HOOK_MARKER = "# agent-mcp-session-start"
 GITHUB_REPO = "37chengshan/agent-mcp"
@@ -140,6 +143,100 @@ def zcode_registration_json(script_path: str) -> dict[str, Any]:
         "args": [script_path],
         "env": {},
     }}}}
+
+
+# --- v0.3 扩展注册（依据 docs/research/installer-coverage-2026-08-13.md） ---
+
+def mcp_servers_entry(script_path: str) -> dict[str, Any]:
+    """A 模板：顶层 mcpServers 的 server 对象（claude/kimi 同构）。
+    覆盖 cursor/gemini/pi/copilot/cline/qwen/devin/windsurf/amazon-q/kiro。"""
+    return {"command": "python3", "args": [script_path]}
+
+
+def apply_mcp_servers_install(config: dict[str, Any], script_path: str) -> dict[str, Any]:
+    """A 模板合并：保留其他 mcpServers 与顶层键。"""
+    servers = dict(config.get("mcpServers", {}))
+    servers[SERVER_NAME] = mcp_servers_entry(script_path)
+    out = dict(config)
+    out["mcpServers"] = servers
+    return out
+
+
+def grok_registration_toml(script_path: str) -> str:
+    """grok 与 codex 同构（B 模板：TOML [mcp_servers]），直接复用 codex 片段。"""
+    return codex_registration_toml(script_path)
+
+
+def atomcode_registration_json(script_path: str) -> dict[str, Any]:
+    """atomcode/Kilo 与 opencode 同构（C 模板：mcp.<name> = {type: local, command: 数组}）。"""
+    return {"mcp": {SERVER_NAME: {"type": "local",
+                                  "command": ["python3", script_path],
+                                  "enabled": True}}}
+
+
+def apply_atomcode_install(config: dict[str, Any], script_path: str) -> dict[str, Any]:
+    """合并 agent-mcp 注册进 atomcode/kilo 配置的 mcp 顶层键（保留其他 server）。"""
+    entry = atomcode_registration_json(script_path)["mcp"][SERVER_NAME]
+    mcp = dict(config.get("mcp", {}))
+    mcp[SERVER_NAME] = entry
+    out = dict(config)
+    out["mcp"] = mcp
+    return out
+
+
+def goose_registration_yaml(script_path: str) -> str:
+    """goose 的 YAML extensions 块（~/.config/goose/config.yaml）。
+    args 用 JSON flow 序列（对简单字符串即合法 YAML）。"""
+    return (f"extensions:\n"
+            f"  {SERVER_NAME}:\n"
+            f"    name: {SERVER_NAME}\n"
+            f"    cmd: python3\n"
+            f"    args: {json.dumps([script_path])}\n"
+            f"    enabled: true\n"
+            f"    type: stdio\n"
+            f"    timeout: 60\n"
+            f"    envs: {{}}\n")
+
+
+def hermes_registration_yaml(script_path: str) -> str:
+    """hermes 的 YAML mcp_servers 块（~/.hermes/config.yaml，snake_case）。"""
+    return (f"mcp_servers:\n"
+            f"  {SERVER_NAME}:\n"
+            f"    command: python3\n"
+            f"    args: {json.dumps([script_path])}\n"
+            f"    env: {{}}\n")
+
+
+def _yaml_append_block(text: str, block: str, top_key: str) -> tuple[str, str]:
+    """YAML 块合并：top_key 已存在且含 SERVER_NAME → skip；
+    已存在但无 SERVER_NAME → 追加子块；否则整体追加。"""
+    has_top = re.search(rf"(?m)^{re.escape(top_key)}:\s*$", text) is not None
+    if has_top:
+        if re.search(rf"(?m)^\s+{re.escape(SERVER_NAME)}:", text) is not None:
+            return text, "skip"
+        body = block.split("\n", 1)[1]
+        return text.rstrip("\n") + "\n" + body, "append"
+    return text.rstrip("\n") + "\n" + block, "append"
+
+
+def apply_goose_install(text: str, script_path: str) -> tuple[str, str]:
+    return _yaml_append_block(text, goose_registration_yaml(script_path), "extensions")
+
+
+def apply_hermes_install(text: str, script_path: str) -> tuple[str, str]:
+    return _yaml_append_block(text, hermes_registration_yaml(script_path), "mcp_servers")
+
+
+def crush_registration_rc(script_path: str) -> str:
+    """crush 的 crushrc 追加行（mcp add 命令，幂等由 apply 层保证）。"""
+    return f"mcp add {SERVER_NAME} --type stdio --command python3 --args {shlex.quote(script_path)}\n"
+
+
+def apply_crush_install(text: str, script_path: str) -> tuple[str, str]:
+    # L7：匹配任意 agent-mcp 相关 mcp add 行（幂等判定放宽，防参数变化后重复追加）
+    if re.search(rf"(?m)^\s*mcp\s+add\s+{re.escape(SERVER_NAME)}\b", text):
+        return text, "skip"
+    return text.rstrip("\n") + "\n" + crush_registration_rc(script_path), "append"
 
 
 # --- Hook 与 skill 安装 ---
@@ -394,6 +491,7 @@ def default_paths() -> dict[str, Path]:
     codex_home = Path(os.environ.get("CODEX_HOME", home / ".codex"))
     omp_home = Path(os.environ.get("PI_CODING_AGENT_DIR", home / ".omp" / "agent"))
     kimi_home = Path(os.environ.get("KIMI_CODE_HOME", home / ".kimi-code"))
+    hermes_home = Path(os.environ.get("HERMES_HOME", home / ".hermes"))
     return {
         "codex_mcp": codex_home / "config.toml",
         "codex_hooks": codex_home / "hooks.json",
@@ -403,6 +501,21 @@ def default_paths() -> dict[str, Path]:
         "opencode_mcp": home / ".config" / "opencode" / "opencode.json",
         "kimi_mcp": kimi_home / "mcp.json",
         "zcode_mcp": home / ".zcode" / "cli" / "config.json",
+        "grok_mcp": home / ".grok" / "config.toml",
+        "cursor_mcp": home / ".cursor" / "mcp.json",
+        "gemini_mcp": home / ".gemini" / "settings.json",
+        "pi_mcp": home / ".pi" / "agent" / "mcp.json",
+        "copilot_mcp": home / ".copilot" / "mcp-config.json",
+        "cline_mcp": home / ".cline" / "mcp.json",
+        "qwen_mcp": home / ".qwen" / "settings.json",
+        "devin_mcp": home / ".config" / "devin" / "mcp_config.json",
+        "windsurf_mcp": home / ".codeium" / "windsurf" / "mcp_config.json",
+        "amazonq_mcp": home / ".aws" / "amazonq" / "mcp.json",
+        "atomcode_mcp": home / ".config" / "kilo" / "kilo.json",
+        "kiro_mcp": home / ".kiro" / "settings" / "mcp.json",
+        "goose_mcp": home / ".config" / "goose" / "config.yaml",
+        "hermes_mcp": hermes_home / "config.yaml",
+        "crush_mcp": home / ".config" / "crush" / "crushrc",
         "codex_skill": home / ".agents" / "skills" / SERVER_NAME,
         "claude_skill": home / ".claude" / "skills" / SERVER_NAME,
         "omp_skill": omp_home / "skills" / SERVER_NAME,
@@ -448,6 +561,23 @@ def _install_json_transform(path: Path, transform, *, dry_run: bool,
     backup = _write_with_backup(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(rendered, encoding="utf-8")
+    logs = [f"备份 → {backup}"] if backup else []
+    logs.append(f"已写入 {path}")
+    return logs
+
+
+def _install_text_transform(path: Path, transform, *, dry_run: bool,
+                            description: str) -> list[str]:
+    """文本文件（YAML/rc）追加安装：transform(text) -> (new_text, "skip"|"append")。"""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    new_text, action = transform(text)
+    if action == "skip":
+        return [f"{description} 已存在，跳过 {path}"]
+    if dry_run:
+        return [f"[dry-run] 将更新 {description} → {path}", new_text.rstrip()]
+    backup = _write_with_backup(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new_text, encoding="utf-8")
     logs = [f"备份 → {backup}"] if backup else []
     logs.append(f"已写入 {path}")
     return logs
@@ -560,6 +690,55 @@ def install_host(host: str, script_path: str, starter_path: str, skill_source: P
         logs.append("zcode 原生不支持 Claude-style SessionStart；保留 MCP 懒启动。")
         logs.extend(install_skill(skill_source, paths["zcode_skill"], dry_run=dry_run))
         return logs
+    # ---- v0.3 扩展 host（全覆盖调研：docs/research/installer-coverage-2026-08-13.md） ----
+    if host == "grok":
+        # B 模板：TOML [mcp_servers]（与 codex 同构，但 grok 无 grok-cli legacy 表，
+        # 直接用纯 TOML 追加，避免误用 codex 的 legacy 检测/移除逻辑，M7）
+        logs.extend(_install_text_transform(
+            paths["grok_mcp"],
+            lambda text: apply_codex_install(text, codex_registration_toml(script_path)),
+            dry_run=dry_run, description=f"[mcp_servers.{SERVER_NAME}]（grok）"))
+        logs.append("grok 兼容读取 ~/.claude.json 等（compat）；装好 claude 后 grok 亦可见。")
+        return logs
+    if host in ("cursor", "gemini", "pi", "copilot", "cline", "qwen",
+                "devin", "windsurf", "amazon-q", "kiro"):
+        # A 模板：顶层 mcpServers（与 claude/kimi 同构，仅路径不同）
+        mcp_key = "amazonq_mcp" if host == "amazon-q" else f"{host}_mcp"
+        logs.extend(_install_json_transform(
+            paths[mcp_key],
+            lambda config: apply_mcp_servers_install(config, script_path),
+            dry_run=dry_run, description=f"{host} mcpServers.agent-mcp"))
+        logs.append(f"{host} 不支持 Claude-style SessionStart；保留 MCP 懒启动。")
+        return logs
+    if host == "atomcode":
+        # C 模板：与 opencode 同构的 mcp 顶层键
+        logs.extend(_install_json_transform(
+            paths["atomcode_mcp"],
+            lambda config: apply_atomcode_install(config, script_path),
+            dry_run=dry_run, description="atomcode mcp.agent-mcp"))
+        logs.append("atomcode 不支持 Claude-style SessionStart；保留 MCP 懒启动。")
+        return logs
+    if host == "goose":
+        logs.extend(_install_text_transform(
+            paths["goose_mcp"],
+            lambda text: apply_goose_install(text, script_path),
+            dry_run=dry_run, description="goose extensions.agent-mcp"))
+        logs.append("goose 不支持 Claude-style SessionStart；保留 MCP 懒启动。")
+        return logs
+    if host == "hermes":
+        logs.extend(_install_text_transform(
+            paths["hermes_mcp"],
+            lambda text: apply_hermes_install(text, script_path),
+            dry_run=dry_run, description="hermes mcp_servers.agent-mcp"))
+        logs.append("hermes 不支持 SessionStart（有 cron/gateway）；保留 MCP 懒启动。")
+        return logs
+    if host == "crush":
+        logs.extend(_install_text_transform(
+            paths["crush_mcp"],
+            lambda text: apply_crush_install(text, script_path),
+            dry_run=dry_run, description="crush mcp add 行"))
+        logs.append("crush 暂无 SessionStart 事件；保留 MCP 懒启动。")
+        return logs
     raise ValueError(f"未知 host: {host}")
 
 
@@ -572,6 +751,22 @@ _ROLLBACK_KEYS = {
     "opencode": ("opencode_mcp", "opencode_skill"),
     "kimi": ("kimi_mcp", "kimi_skill"),
     "zcode": ("zcode_mcp", "zcode_skill"),
+    # v0.3 扩展 host：仅 MCP 注册（无 skill/hook 面）
+    "grok": ("grok_mcp",),
+    "cursor": ("cursor_mcp",),
+    "gemini": ("gemini_mcp",),
+    "pi": ("pi_mcp",),
+    "copilot": ("copilot_mcp",),
+    "cline": ("cline_mcp",),
+    "qwen": ("qwen_mcp",),
+    "devin": ("devin_mcp",),
+    "windsurf": ("windsurf_mcp",),
+    "amazon-q": ("amazonq_mcp",),
+    "atomcode": ("atomcode_mcp",),
+    "kiro": ("kiro_mcp",),
+    "goose": ("goose_mcp",),
+    "hermes": ("hermes_mcp",),
+    "crush": ("crush_mcp",),
 }
 
 

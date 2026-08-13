@@ -26,6 +26,7 @@ from typing import Any
 
 from agent_mcp import SESSION_MISMATCH_MARK
 from agent_mcp.cli_adapters import adapter_names, load_custom_adapters
+from agent_mcp.orchestrator import Orchestrator, OrchestratedTask
 
 SERVER_VERSION = "2.1.0"
 LEGACY_PROTOCOL_VERSION = "2025-03-26"
@@ -46,6 +47,8 @@ def state_dir_from_env() -> Path:
 
 STATE_DIR = state_dir_from_env()
 DAEMON_JSON = STATE_DIR / "daemon.json"
+# 策略引擎位于 daemon（daemon_main.Dispatcher.policy_engine）——唯一数据源，
+# spawn/usage 数据都在 daemon 进程内，enforcement 与面板同源（H1/H2 修复）。
 # 自定义 CLI 适配器（<state_dir>/custom-clis/*.json）与本层同步注册，
 # 使 spawn_agent 的 target_cli enum 动态包含用户自定义 CLI
 load_custom_adapters(STATE_DIR)
@@ -77,6 +80,9 @@ _DAEMON_PATHS = {
     "get_token_usage": "/api/usage",
     "memory_store": "/api/memory/store",
     "memory_recall": "/api/memory/recall",
+    "policy_list": "/api/policies/list",
+    "policy_add": "/api/policies/add",
+    "policy_state": "/api/policies/state",
 }
 
 TOOLS = [
@@ -134,6 +140,80 @@ TOOLS = [
             "required": ["target_cli", "prompt", "cwd"],
             "additionalProperties": False,
         },
+        "annotations": {"destructiveHint": False},
+    },
+    {
+        "name": "orchestrate_task",
+        "description": "多 Agent DAG 编排：声明任务图（依赖/cli/worktree/跨厂商审查），"
+                       "阻塞执行全部子任务并返回汇总。子任务经 daemon spawn_agent 执行"
+                       "（cwd 缺省当前目录；worktree=true 时在独立 git worktree 中运行）。"
+                       "review_by 指定不同厂商审查者（同厂商会被拒绝）。"
+                       "适用于可拆解的并行/流水线任务；简单任务直接用 spawn_agent。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "任务节点 id（唯一）。"},
+                            "prompt": {"type": "string", "description": "子任务提示词。"},
+                            "deps": {"type": "array", "items": {"type": "string"},
+                                     "description": "前置任务 id 列表（无则并行）。"},
+                            "cli": {"type": "string", "enum": _CLI_NAMES,
+                                    "default": "claude", "description": "执行 CLI。"},
+                            "worktree": {"type": "boolean", "default": False,
+                                         "description": "在独立 git worktree 中运行。"},
+                            "review_by": {"type": "string",
+                                          "description": "跨厂商审查者 CLI（须与 cli 不同厂商）。"},
+                        },
+                        "required": ["id", "prompt"],
+                        "additionalProperties": False,
+                    },
+                    "description": "任务图（非空）。",
+                },
+                "base_dir": {"type": "string",
+                             "description": "worktree 创建基准目录（worktree 任务必填）。"},
+                "max_workers": {"type": "integer", "minimum": 1, "maximum": 16,
+                                "default": 4, "description": "并行度上限。"},
+            },
+            "required": ["tasks"],
+            "additionalProperties": False,
+        },
+        "annotations": {"destructiveHint": False},
+    },
+    {
+        "name": "policy_list",
+        "description": "列出当前生效策略与状态（预算/计数，不含审计日志）。",
+        "inputSchema": {"type": "object", "properties": {},
+                        "additionalProperties": False},
+        "annotations": {"destructiveHint": False},
+    },
+    {
+        "name": "policy_add",
+        "description": "运行时注册/覆盖策略（agent 可在会话内配置）。支持内置策略："
+                       "budget_policy(limit_usd 美元上限)、approval_policy(allow_prefixes 白名单前缀)、"
+                       "tool_limit_policy(max_subtasks/max_parallel)。重复注册同名策略会覆盖。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "enum": ["budget_policy", "approval_policy",
+                                                    "tool_limit_policy"],
+                         "description": "内置策略名。"},
+                "params": {"type": "object",
+                           "description": "策略参数：limit_usd / allow_prefixes / max_subtasks / max_parallel。"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+        "annotations": {"destructiveHint": False},
+    },
+    {
+        "name": "policy_state",
+        "description": "策略引擎完整快照（预算/计数/策略链/审计日志）。",
+        "inputSchema": {"type": "object", "properties": {},
+                        "additionalProperties": False},
         "annotations": {"destructiveHint": False},
     },
     {
@@ -424,9 +504,113 @@ def _estimate_complexity(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _daemon_spawner(prompt: str, cli: str, cwd: str | None) -> int:
+    """编排 spawner：转调 daemon spawn_agent，返回 agent_id。"""
+    payload = {
+        "target_cli": cli,
+        "prompt": prompt,
+        "cwd": cwd or os.getcwd(),
+        "permission_mode": "plan",
+        "max_turns": 8,
+        "session_id": _session_id(),
+    }
+    resp = _daemon_post("/api/agents/spawn", payload)
+    agent_id = resp.get("agent_id") if isinstance(resp, dict) else None
+    if agent_id is None:
+        raise RuntimeError(f"spawn 失败: {resp}")
+    return int(agent_id)
+
+
+def _daemon_waiter(agent_id: int) -> dict[str, Any]:
+    """编排 waiter：循环 wait_agent 直至终止态（单次 25s，总预算由外层控制）。"""
+    deadline = time.monotonic() + 600.0
+    while time.monotonic() < deadline:
+        resp = _daemon_post("/api/agents/wait", {
+            "agent_id": agent_id, "timeout": 25, "session_id": _session_id(),
+        }, http_timeout=_HTTP_TIMEOUT + 25)
+        status = str((resp or {}).get("status") or "running")
+        if status in ("terminated", "error", "cancelled", "incomplete"):
+            return {"status": status, "summary": str((resp or {}).get("summary") or "")}
+        time.sleep(0.5)
+    return {"status": "incomplete",
+            "summary": "编排等待超时（600s）。可继续 wait_agent 等待或 followup_task 续接。"}
+
+
+def _orchestrate_task(arguments: dict[str, Any]) -> dict[str, Any]:
+    """DAG 编排入口：声明任务图（含依赖/CLI/worktree/跨厂商审查），
+    阻塞执行全部子任务并返回汇总。tasks 元素：
+    {id, prompt, deps?, cli?, worktree?, review_by?}。"""
+    raw_tasks = arguments.get("tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        return {"valid": False, "failed": ["tasks 必须为非空数组"], "done": [],
+                "tasks": []}
+    orch = Orchestrator(spawner=_daemon_spawner, waiter=_daemon_waiter,
+                        base_dir=arguments.get("base_dir"),
+                        max_workers=int(arguments.get("max_workers") or 4))
+    for raw in raw_tasks:
+        if not isinstance(raw, dict) or not raw.get("id") or not raw.get("prompt"):
+            return {"valid": False, "failed": [f"任务项缺失 id/prompt: {raw}"],
+                    "done": [], "tasks": []}
+        orch.add_task(OrchestratedTask(
+            task_id=str(raw["id"]),
+            prompt=str(raw["prompt"]),
+            deps=[str(d) for d in (raw.get("deps") or [])],
+            cli=str(raw.get("cli") or "claude"),
+            worktree=bool(raw.get("worktree")),
+            review_by=str(raw["review_by"]) if raw.get("review_by") else None,
+        ))
+    result = orch.run()
+    # 落盘 worktree 注册表（网页工作区面板消费）：只记 worktree 任务
+    if result.get("valid") and any(
+            t.get("worktree_path") for t in result.get("tasks", [])):
+        _persist_workspaces(result["tasks"], orch.base_dir)
+    return result
+
+
+def _persist_workspaces(tasks: list[dict[str, Any]], base_dir: str | None) -> None:
+    """把编排产生的 worktree 写入 <state_dir>/workspaces.json。
+
+    状态语义（M1 修复）：任务 done 不代表已合并——worktree 仍存在且分支未合并，
+    标 clean（任务完成）；dirty（未完成/失败）。合并动作由网页面板 merge 按钮触发。"""
+    workspaces = []
+    for t in tasks:
+        path = t.get("worktree_path") or ""
+        if not path:
+            continue
+        workspaces.append({
+            "id": t.get("task_id"),
+            "path": path,
+            "status": "clean" if t.get("status") == "done" else "dirty",
+            "branch": f"agent-{t.get('task_id')}",
+            "task": (t.get("prompt") or "")[:120],
+            "base_dir": base_dir or "",
+        })
+    if not workspaces:
+        return
+    state_dir = state_dir_from_env()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    ws_file = state_dir / "workspaces.json"
+    existing: dict[str, Any] = {}
+    if ws_file.is_file():
+        try:
+            existing = json.loads(ws_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    registry = existing.get("workspaces") or []
+    by_id = {w.get("id"): w for w in registry}
+    for w in workspaces:
+        by_id[w["id"]] = w
+    merged = {"workspaces": list(by_id.values())}
+    tmp = ws_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False,
+                              separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, ws_file)
+
+
 # 本地工具注册表：name → (实现, 是否常驻保留)
 _LOCAL_TOOLS: dict[str, Any] = {
     "estimate_complexity": _estimate_complexity,
+    "orchestrate_task": _orchestrate_task,
 }
 
 
@@ -832,6 +1016,8 @@ def _daemon_post(path: str, payload: dict[str, Any],
 
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    # 策略 enforcement 位于 daemon（spawn/usage 数据源同进程，H1/H2 修复）：
+    # spawn/steer/orchestrate 由 daemon Dispatcher.spawn 拦截；这里不再本地评估。
     # 本地直算工具（零 token、不 spawn、不走 daemon）：estimate_complexity 等
     local = _LOCAL_TOOLS.get(name)
     if local is not None:

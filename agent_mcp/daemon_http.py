@@ -2,6 +2,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -11,6 +13,7 @@ from typing import Any
 
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 MAX_SSE_CLIENTS = 128
+MAX_SSE_BUFFER = 1000  # 每客户端缓冲事件上限（L6：防慢消费者内存增长）
 MAX_JSON_BYTES = 1_000_000
 HEARTBEAT_SECONDS = 15.0
 SNAPSHOT_EVENTS_PER_AGENT = 60
@@ -26,7 +29,128 @@ _API_METHODS = {
     "/api/usage": "usage",
     "/api/memory/store": "memory_store",
     "/api/memory/recall": "memory_recall",
+    "/api/policies/list": "policy_list",
+    "/api/policies/add": "policy_add",
+    "/api/policies/state": "policy_state",
 }
+# 需要 token 的 workspace 写操作（merge/discard 会执行 git 命令）
+_WORKSPACE_POST = {"/api/workspaces/merge": "merged",
+                   "/api/workspaces/discard": "discarded"}
+_WORKSPACES_FILE = "workspaces.json"
+_POLICIES_FILE = "policies.json"
+
+
+def _state_dir_of(server: "DaemonHTTPServer") -> Path | None:
+    """从 dispatcher 取 state_dir（无 dispatcher 时 None）。"""
+    dispatcher = getattr(server, "dispatcher", None)
+    if dispatcher is None:
+        return None
+    return getattr(dispatcher, "state_dir", None)
+
+
+def _read_json_file(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _policies_state_payload(server: "DaemonHTTPServer") -> dict[str, Any]:
+    """策略面板聚合：优先 dispatcher（daemon 内引擎唯一数据源，H1/H5 修复）；
+    无 dispatcher 时回退文件 + env。"""
+    dispatcher = getattr(server, "dispatcher", None)
+    if dispatcher is not None:
+        try:
+            return dispatcher.policy_state({})
+        except Exception:
+            pass  # 回退到文件聚合
+    state_dir = _state_dir_of(server)
+    file_state = _read_json_file(state_dir / _POLICIES_FILE if state_dir else None) or {}
+    try:
+        limit_usd = float(os.environ.get("AGENT_MCP_BUDGET_USD", "10.0"))
+    except ValueError:
+        limit_usd = 10.0
+    return {
+        "limit_usd": limit_usd,
+        "spent_usd": 0.0,
+        "spawns": 0,
+        "policies": file_state.get("policies") or [],
+        "log": file_state.get("log") or [],
+        "policy_configs": {},
+    }
+
+
+def _workspaces_payload(server: "DaemonHTTPServer") -> dict[str, Any]:
+    state_dir = _state_dir_of(server)
+    file_state = _read_json_file(state_dir / _WORKSPACES_FILE if state_dir else None) or {}
+    workspaces = file_state.get("workspaces") or []
+    return {"workspaces": workspaces}
+
+
+def _workspace_apply(server: "DaemonHTTPServer", body: dict[str, Any],
+                     action: str) -> dict[str, Any]:
+    """merge：git merge <branch>（在 base 工作区）+ worktree remove + branch -d。
+    discard：worktree remove --force + branch -D。更新 workspaces.json 状态。"""
+    ws_id = str(body.get("id") or "")
+    if not ws_id:
+        raise ValueError("id 必填")
+    state_dir = _state_dir_of(server)
+    if state_dir is None:
+        raise RuntimeError("state_dir 不可用")
+    ws_file = state_dir / _WORKSPACES_FILE
+    file_state = _read_json_file(ws_file) or {}
+    workspaces = file_state.get("workspaces") or []
+    target = next((w for w in workspaces if str(w.get("id")) == ws_id), None)
+    if target is None:
+        raise ValueError(f"workspace 不存在: {ws_id}")
+    path = target.get("path") or ""
+    base_dir = target.get("base_dir") or ""
+    branch = target.get("branch") or f"agent-{ws_id}"
+    if not path:
+        raise ValueError("workspace 缺少 path")
+    # 路径归属校验（L5）：path 必须位于 base_dir 下，且 base_dir 存在
+    if base_dir:
+        base_resolved = Path(base_dir).resolve()
+        path_resolved = Path(path).resolve()
+        if base_resolved not in path_resolved.parents:
+            raise ValueError("workspace path 不在 base_dir 内，拒绝操作")
+    try:
+        if action == "merged":
+            if not base_dir or not Path(base_dir).is_dir():
+                raise ValueError("merge 需要有效的 base_dir（git 仓库根）")
+            # 真合并：在 base 工作区 merge 分支（容忍空提交：--allow-unrelated-histories）
+            proc = subprocess.run(["git", "-C", base_dir, "merge", "--no-edit",
+                                   "--allow-unrelated-histories", branch],
+                                  capture_output=True, text=True, timeout=120)
+            if proc.returncode != 0:
+                raise RuntimeError(f"git merge 失败: {proc.stderr[:300] or proc.stdout[:300]}")
+            # 合并成功 → 删除 worktree 与分支
+            subprocess.run(["git", "-C", base_dir, "worktree", "remove", "--force", path],
+                           capture_output=True, text=True, timeout=60)
+            subprocess.run(["git", "-C", base_dir, "branch", "-d", branch],
+                           capture_output=True, text=True, timeout=60)
+        else:  # discard
+            subprocess.run(["git", "-C", base_dir, "worktree", "remove", "--force", path],
+                           capture_output=True, text=True, timeout=60)
+            subprocess.run(["git", "-C", base_dir, "branch", "-D", branch],
+                           capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        raise RuntimeError("git 不可用")
+    target["status"] = action
+    file_state["workspaces"] = workspaces
+    tmp = ws_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(file_state, ensure_ascii=False,
+                              separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, ws_file)
+    # M2：发布 workspace_status SSE 事件（面板实时更新徽章）
+    server.broadcaster.publish({"type": "workspace_status",
+                                "agent_id": ws_id,
+                                "payload": {"id": ws_id, "status": action}},
+                               seq=None)
+    return {"status": action, "id": ws_id}
 
 
 class EventBroadcaster:
@@ -62,7 +186,10 @@ class EventBroadcaster:
             clients = list(self._clients.values())
         for client in clients:
             if not client["closed"]:
+                # L6：客户端缓冲上限，防慢消费者无限增长（丢弃最旧）
                 client["buffer"].append(payload)
+                if len(client["buffer"]) > MAX_SSE_BUFFER:
+                    del client["buffer"][: len(client["buffer"]) - MAX_SSE_BUFFER]
 
     def drain(self, client: dict[str, Any]) -> str | None:
         """取出并清空缓冲（与 publish/heartbeat 同锁，避免 join 期间丢事件）。"""
@@ -131,10 +258,41 @@ class Handler(BaseHTTPRequestHandler):
                                   "write_auth": "url-fragment"})
         elif path == "/api/snapshot":
             self._send_snapshot()
+        elif path == "/api/policies/state":
+            if not self._check_token():
+                return
+            self._send_json(200, _policies_state_payload(self.server))
+        elif path == "/api/workspaces":
+            if not self._check_token():
+                return
+            self._send_json(200, _workspaces_payload(self.server))
+        elif path == "/api/agents/list":
+            # 协作泳道数据源：GET 形式（MCP 薄层仍走 POST /api/agents/list）
+            if not self._check_token():
+                return
+            if self.server.dispatcher is None:
+                self._send_json(503, {"error": "dispatcher not ready"})
+                return
+            self._send_json(200, self.server.dispatcher.list_agents({}))
+        elif path == "/api/agents/activity":
+            # 协作泳道活动流：无 agent_id → 按全部会话聚合（与 POST 同语义）
+            if not self._check_token():
+                return
+            if self.server.dispatcher is None:
+                self._send_json(503, {"error": "dispatcher not ready"})
+                return
+            self._send_json(200, self.server.dispatcher.activity({}))
         elif path == "/events":
             self._stream_events()
+        elif path == "/api/events":
+            # message 通道版：新面板消费（data 内嵌 type，无 event: 行）
+            self._stream_events(message_mode=True)
         elif path == "/" or path == "/index.html":
-            self._send_file("index.html")
+            self._send_index()
+        elif path.startswith("/panels/"):
+            self._send_file("panels/" + path[len("/panels/"):])
+        elif path.startswith("/css/"):
+            self._send_file("css/" + path[len("/css/"):])
         elif path.startswith("/static/"):
             self._send_file(path[len("/static/"):])
         else:
@@ -146,6 +304,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_token():
             return
         path = self.path.split("?")[0]
+        action = _WORKSPACE_POST.get(path)
+        if action is not None:
+            # workspace merge/discard：独立处理（不走 dispatcher 方法表）
+            body = self._read_json()
+            try:
+                result = _workspace_apply(self.server, body, action)
+            except (ValueError, RuntimeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(200, result)
+            return
         method = _API_METHODS.get(path)
         if method is None:
             self.send_error(404)
@@ -219,8 +388,11 @@ class Handler(BaseHTTPRequestHandler):
             "last_seq": events[-1]["seq"] if events else 0,
         })
 
-    def _stream_events(self):
+    def _stream_events(self, message_mode: bool = False):
         """SSE 直播流。last_seq 查询参数 / Last-Event-ID 头 → 先回放 SQLite 事件，再进入 live。
+
+        message_mode=False：命名事件流（event: <type> 行），index.html 消费（/events）。
+        message_mode=True：message 通道流（data 内嵌 type，无 event: 行），新面板消费（/api/events）。
 
         顺序：先 connect 再回放——connect 之后 publish 的事件都进本客户端缓冲；
         回放以连接时刻的 max_seq 为固定上界分页补发 (last_seq, boundary]，
@@ -248,9 +420,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             if last_seq > 0 and self.server.db is not None:
-                # 固定重连上界：回放只补 (last_seq, boundary]，boundary 之后的新写入
-                # 已在 live 缓冲（connect 先于 boundary 捕获），避免分页回放无限追逐持续插入。
-                # 每页至多 1000 条，多页直至上界，保证尾部不静默丢失。
                 boundary = self.server.db.max_seq()
                 cursor = last_seq
                 while cursor < boundary:
@@ -263,7 +432,7 @@ class Handler(BaseHTTPRequestHandler):
                         if seq is None:
                             continue
                         if seq > boundary:
-                            reached_boundary = True  # 边界后的新写入，交由 live 缓冲
+                            reached_boundary = True
                             break
                         event_payload = {
                             "type": ev["type"],
@@ -271,15 +440,12 @@ class Handler(BaseHTTPRequestHandler):
                             "payload": ev["payload"],
                             "seq": seq,
                         }
-                        payload = (
-                            f"id: {seq}\nevent: {ev['type']}\ndata: "
-                            f"{json.dumps(event_payload, ensure_ascii=False)}\n\n"
-                        )
+                        payload = self._frame(event_payload, seq, message_mode)
                         try:
                             self.wfile.write(payload.encode("utf-8"))
                             self.wfile.flush()
                         except (BrokenPipeError, OSError):
-                            return  # 连接已断，finally 中 close
+                            return
                         client["replayed"].add(seq)
                         cursor = seq
                     if reached_boundary or len(page) < 1000:
@@ -289,6 +455,8 @@ class Handler(BaseHTTPRequestHandler):
                 if chunk:
                     if client["replayed"]:
                         chunk = self._strip_replayed(chunk, client["replayed"])
+                    if message_mode and chunk:
+                        chunk = self._to_message_chunk(chunk)
                     if chunk:
                         try:
                             self.wfile.write(chunk.encode("utf-8"))
@@ -299,6 +467,30 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(0.1)
         finally:
             self.server.broadcaster.close(client)
+
+    @staticmethod
+    def _frame(event_payload: dict[str, Any], seq: int,
+               message_mode: bool) -> str:
+        """组 SSE 帧。message_mode：id: + data 内嵌 type（无 event: 行，供
+        Last-Event-ID 重连续传）；否则命名事件帧（id: + event: + data:）。"""
+        data = json.dumps(event_payload, ensure_ascii=False)
+        if message_mode:
+            return f"id: {seq}\ndata: {data}\n\n"
+        return f"id: {seq}\nevent: {event_payload['type']}\ndata: {data}\n\n"
+
+    @staticmethod
+    def _to_message_chunk(chunk: str) -> str:
+        """命名事件帧块 → message 通道帧块（剥 event: 行，保留 id:/data: 行；
+        data 已内嵌 type，前端按 data.type 处理；id 供 Last-Event-ID 重连）。"""
+        out: list[str] = []
+        for part in chunk.split("\n\n"):
+            if not part:
+                continue
+            lines = [ln for ln in part.split("\n")
+                     if not ln.startswith("event: ")]
+            if lines:
+                out.append("\n".join(lines))
+        return ("\n\n".join(out) + "\n\n") if out else ""
 
     @staticmethod
     def _strip_replayed(chunk: str, replayed: set[int]) -> str:
@@ -334,6 +526,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_index(self):
+        """发送 index.html 并注入面板 loader（幂等：已有注入标记则跳过）。"""
+        root = self.server.web_root.resolve()
+        path = root / "index.html"
+        if not path.is_file():
+            self.send_error(404)
+            return
+        data = path.read_bytes()
+        marker = b'<script type="module" src="/panels/loader.js"></script>'
+        if marker not in data:
+            if b"</body>" in data:
+                data = data.replace(b"</body>", marker + b"</body>", 1)
+            else:
+                data = data + marker
+        self.send_response(200)
+        self._security_headers()
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_file(self, name: str):
         root = self.server.web_root.resolve()
         path = (root / name).resolve()
@@ -343,7 +556,16 @@ class Handler(BaseHTTPRequestHandler):
         data = path.read_bytes()
         self.send_response(200)
         self._security_headers()
-        ctype = "text/html; charset=utf-8" if name.endswith(".html") else "application/octet-stream"
+        ctype = {
+            ".html": "text/html; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".mjs": "application/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+            ".svg": "image/svg+xml",
+            ".png": "image/png",
+            ".ico": "image/x-icon",
+        }.get(path.suffix.lower(), "application/octet-stream")
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()

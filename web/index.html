@@ -929,8 +929,9 @@ document.addEventListener("DOMContentLoaded",()=>{
   $("sess").addEventListener("change",e=>{S.session=e.target.value;loadSnapshot(true);});
   $("map-pane").addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!=" ")return;});
   renderAll();loadConfig();loadSnapshot(true);connect();setInterval(scheduleRender,10000);
-  /* running pulse 帧动画 */
-  if(!matchMedia("(prefers-reduced-motion:reduce)").matches)setInterval(()=>{if([...S.agents.values()].some(a=>a.status==="running"))scheduleRender();},500);
+  /* running pulse 已由 CSS 完成（.node.agent.st-running::after + nodePulse）——
+     移除 500ms 全量 renderAll 重绘：running 节点存在时每 0.5s 重建整个
+     对话图 DOM 导致页面闪烁，且 renderAll 开销大；CSS 动画同效果零重绘。 */
   maybeShowReplay();setInterval(maybeShowReplay,2000);
 });
 </script>

@@ -1,7 +1,9 @@
 # 四 CLI 能力矩阵（实测记录）
 
 > 更新原则：每项标 ✅=已实测 / ⏳=待实测。实现 Task 0 时逐项确认。
-> 2026-08-12 复核：新增适配器 codex/kimi/copilot/pi/zcode/cline（⏳ 待实测）；既有四 CLI 状态不变。
+> 2026-08-13 复核（v0.3 Phase 0）：新增适配器 codex/kimi/copilot/pi/zcode/cline 事件归一化
+> 已由 `tests/test_event_normalization.py` fixture 校准 ✅（zcode/cline 为降级文本捕获模式）；
+> 表中能力项 ⏳ 表示真实 CLI 环境待实测（fixture 不替代真实环境），不影响适配器归一化可信度。
 
 | 能力 | claude (2.1.220) | grok (0.2.118) | opencode (1.14.51) | omp(pi) |
 |---|---|---|---|---|
@@ -30,9 +32,9 @@
 
 | 适配器 | headless 命令 | 事件流 | resume | 权限 | 备注 |
 |---|---|---|---|---|---|
-| codex | `codex exec --json <prompt>` | JSONL：`thread.started`/`item.*`（assistant_message/command_execution…）/`turn.completed`（usage: input/cached→cache_read/output/reasoning） | `codex exec resume --last` / `<thread_id>` | 默认只读沙箱；`--sandbox workspace-write`；`--dangerously-bypass-approvals-and-sandbox` | 字段名有版本漂移（item_type→type），解析兼容两种 |
-| kimi | `kimi -p <prompt> --output-format stream-json` | JSONL（仿 claude/grok：assistant/result 行） | `-S/--session <id>`、`-c` 续最近 | `-p` 与 `--yolo/--auto/--plan` 互斥：非交互默认 auto | npm `@moonshot-ai/kimi-code` |
-| copilot | `copilot -p <PROMPT>` | 文本捕获（无 JSONL 文档化） | `--resume=<id>` / `-c` | `--allow all`（=COPILOT_ALLOW_ALL） | 新一代 github/copilot-cli；`gh copilot` 已弃用 |
-| pi | `pi --mode json <prompt>` | JSONL：首行 `session{id}` + `message_end`（权威 message）/`agent_end` | `pi -c` / `--session <id>` | ⏳ | **Pi 与 omp 是两个项目**；npm `@earendil-works/pi-coding-agent` |
-| zcode | `zcode --prompt <prompt>` | 文本捕获（headless 路径未实证） | `--session <id>`（⏳） | ⏳ | CLI 直连有 401 认证障碍；GUI 走 app-server 协议 |
-| cline | `cline --prompt <prompt>` | 文本捕获 | `--resume <id>`（⏳） | ⏳ | 主要 VS Code 扩展；独立 CLI headless 不明确 |
+| codex | `codex exec --json <prompt>` | JSONL：`thread.started`/`item.*`（assistant_message/command_execution…）/`turn.completed`（usage: input/cached→cache_read/output/reasoning） | `codex exec resume --last` / `<thread_id>` | 默认只读沙箱；`--sandbox workspace-write`；`--dangerously-bypass-approvals-and-sandbox` | 字段名有版本漂移（item_type→type），解析兼容两种；归一化 ✅（fixture） |
+| kimi | `kimi -p <prompt> --output-format stream-json` | JSONL（仿 claude/grok：assistant/result 行） | `-S/--session <id>`、`-c` 续最近 | `-p` 与 `--yolo/--auto/--plan` 互斥：非交互默认 auto | npm `@moonshot-ai/kimi-code`；归一化 ✅（fixture，复用 claude 解析） |
+| copilot | `copilot -p <PROMPT>` | 文本捕获（无 JSONL 文档化）+ `--resume=` 摘要回填 session | `--resume=<id>` / `-c` | `--allow all`（=COPILOT_ALLOW_ALL） | 新一代 github/copilot-cli；`gh copilot` 已弃用；归一化 ✅（fixture，降级文本模式） |
+| pi | `pi --mode json <prompt>` | JSONL：首行 `session{id}` + `message_end`（权威 message）/`agent_end` | `pi -c` / `--session <id>` | ⏳ | **Pi 与 omp 是两个项目**；npm `@earendil-works/pi-coding-agent`；归一化 ✅（fixture） |
+| zcode | `zcode --prompt <prompt>` | 文本捕获（headless 路径未实证；GUI 走 app-server 协议） | `--session <id>`（⏳） | ⏳ | CLI 直连有 401 认证障碍；**降级模式**：文本捕获（fixture ✅） |
+| cline | `cline --prompt <prompt>` | 文本捕获 | `--resume <id>`（⏳） | ⏳ | 主要 VS Code 扩展；独立 CLI headless 不明确；**降级模式**：文本捕获（fixture ✅） |

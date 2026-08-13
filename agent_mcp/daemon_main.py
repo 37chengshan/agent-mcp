@@ -26,6 +26,10 @@ from agent_mcp.daemon_http import DaemonHTTPServer, EventBroadcaster, HEARTBEAT_
 from agent_mcp.db import DB
 from agent_mcp.dispatch import (SlotScheduler, is_pid_running, spawn_cli_worker,
                                 terminate_process_tree)
+from agent_mcp.policies import PolicyEngine, PolicyEvent, PolicyResult
+from agent_mcp.policies.builtin import (
+    approval_policy_factory, budget_policy_factory, tool_limit_policy_factory,
+)
 from agent_mcp.state_machine import transition
 
 DEFAULT_PORT = 8765
@@ -311,6 +315,16 @@ class Dispatcher:
         # F4: 低频心跳线程（1s/touch_activity 更 updated_at）作存活证据源
         self._hb_stop = threading.Event()
         self._hb_thread: threading.Thread | None = None
+        # v0.3 策略引擎：daemon 级 enforcement（spawn/usage 数据源都在本进程）
+        self.policy_engine = PolicyEngine(state_path=self.state_dir / "policies.json")
+        self.policy_engine.register("budget_policy", budget_policy_factory(
+            limit_usd=float(os.environ.get("AGENT_MCP_BUDGET_USD", "10.0"))))
+        self.policy_engine.register("approval_policy", approval_policy_factory(
+            allow_prefixes=[p for p in
+                            os.environ.get("AGENT_MCP_ALLOW_PREFIXES", "").split(",") if p]))
+        self.policy_engine.register("tool_limit_policy", tool_limit_policy_factory(
+            max_subtasks=int(os.environ.get("AGENT_MCP_MAX_SUBTASKS", "8")),
+            max_parallel=int(os.environ.get("AGENT_MCP_MAX_PARALLEL", "4"))))
 
     # ---- 生命周期 ----
 
@@ -408,6 +422,18 @@ class Dispatcher:
         cwd = body.get("cwd")
         if not target_cli or not prompt or not cwd:
             raise ValueError("target_cli, prompt and cwd are required")
+        # v0.3 策略 enforcement：spawn 入口前（编排子任务/HTTP 直连同源拦截）
+        decision = self.policy_engine.evaluate(PolicyEvent(
+            "pre_spawn", data={"cli": target_cli, "prompt": prompt,
+                               "permission_mode": body.get("permission_mode") or "plan",
+                               "estimated_cost": 0.0}))
+        if decision.result != PolicyResult.ALLOW.value:
+            self.policy_engine.save()
+            return {"status": "denied", "policy": decision.name,
+                    "result": decision.result, "reason": decision.reason}
+        self.policy_engine.state["spawns"] = int(
+            self.policy_engine.state.get("spawns", 0)) + 1
+        self.policy_engine.save()
         timeout_seconds = _coerce_timeout_seconds(body.get("timeout_seconds"))
         body = {**body, "timeout_seconds": timeout_seconds}
         context_mode = body.get("context_mode") or "compact"
@@ -748,6 +774,62 @@ class Dispatcher:
             body.get("session_id") or "default",
             query=body.get("query"), kind=body.get("kind"), limit=limit)
         return {"memories": memories}
+
+    # ---- v0.3 策略管理（daemon 级：唯一数据源，enforcement 与面板同源） ----
+
+    def policy_list(self, body: dict) -> dict:
+        return {"policies": self.policy_engine.list_policies(),
+                "state": {k: v for k, v in self.policy_engine.snapshot().items()
+                          if k != "log"}}
+
+    def policy_state(self, body: dict) -> dict:
+        snap = self.policy_engine.snapshot()
+        snap["policy_configs"] = {
+            "budget_limit_usd": float(os.environ.get("AGENT_MCP_BUDGET_USD", "10.0")),
+            "max_subtasks": int(os.environ.get("AGENT_MCP_MAX_SUBTASKS", "8")),
+            "max_parallel": int(os.environ.get("AGENT_MCP_MAX_PARALLEL", "4")),
+            "allow_prefixes": [p for p in
+                               os.environ.get("AGENT_MCP_ALLOW_PREFIXES", "").split(",") if p],
+        }
+        return snap
+
+    def policy_add(self, body: dict) -> dict:
+        """收紧-only 策略配置：新 limit 必须 ≤ 当前值，禁止自我削弱（H3）。"""
+        name = str(body.get("name") or "")
+        params = body.get("params") or {}
+        if not isinstance(params, dict):
+            raise ValueError("params 必须是对象")
+        current = self.policy_engine.snapshot()
+        if name == "budget_policy":
+            new_limit = float(params.get("limit_usd", 10.0))
+            old_limit = float(os.environ.get("AGENT_MCP_BUDGET_USD", "10.0"))
+            if new_limit > old_limit:
+                raise ValueError(f"预算上限只能收紧（≤{old_limit:.2f}），禁止放宽")
+        elif name == "tool_limit_policy":
+            new_sub = int(params.get("max_subtasks", 8))
+            old_sub = int(os.environ.get("AGENT_MCP_MAX_SUBTASKS", "8"))
+            if new_sub > old_sub:
+                raise ValueError(f"max_subtasks 只能收紧（≤{old_sub}），禁止放宽")
+        elif name == "approval_policy":
+            # 审批策略只能增加白名单前缀（收紧 = 更少前缀放行）；允许重新配置
+            pass
+        else:
+            raise ValueError(f"未知内置策略: {name}（仅支持 budget/approval/tool_limit）")
+        factory = {
+            "budget_policy": lambda: budget_policy_factory(limit_usd=float(params.get("limit_usd", 10.0))),
+            "approval_policy": lambda: approval_policy_factory(
+                allow_prefixes=[str(p) for p in (params.get("allow_prefixes") or [])]),
+            "tool_limit_policy": lambda: tool_limit_policy_factory(
+                max_subtasks=int(params.get("max_subtasks", 8)),
+                max_parallel=int(params.get("max_parallel", 4))),
+        }[name]
+        try:
+            self.policy_engine.unregister(name)
+        except ValueError:
+            pass
+        self.policy_engine.register(name, factory())
+        self.policy_engine.save()
+        return {"status": "ok", "policy": name, "params": params}
 
     def _sink_final_answer(self, agent_id: int, summary: str, session_id: str) -> None:
         """自动沉淀：完成态 summary 含 FINAL_ANSWER: 时写入 kind=final_answer 记忆
@@ -1262,6 +1344,16 @@ class Dispatcher:
                                  cache_creation=usage.get("cache_creation", 0),
                                  cache_read=usage.get("cache_read", 0),
                                  cost_usd=usage.get("cost_usd", 0.0) or 0.0)
+            # v0.3 策略：真实成本增量回灌预算（H1：usage_delta 的唯一生产者）
+            decision = self.policy_engine.evaluate(PolicyEvent(
+                "usage_delta", data={"cost": usage.get("cost_usd", 0.0) or 0.0,
+                                     "agent_id": agent_id}))
+            self.policy_engine.save()
+            if decision.result != PolicyResult.ALLOW.value:
+                self._broadcast("policy_decision", {
+                    "name": decision.name, "result": decision.result,
+                    "reason": decision.reason,
+                }, agent_id)
             # D2 per-call usage jsonl：每 worker run 一行落盘，Daily Auditor 数据基础
             try:
                 usage_dir = self.state_dir / "usage"

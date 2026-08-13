@@ -70,6 +70,21 @@ def _paths(tmp_path):
         "kimi_skill": tmp_path / "kimi" / "skills" / "agent-mcp",
         "zcode_mcp": tmp_path / "zcode" / "config.json",
         "zcode_skill": tmp_path / "agents" / "skills" / "agent-mcp",
+        "grok_mcp": tmp_path / "grok" / "config.toml",
+        "cursor_mcp": tmp_path / "cursor" / "mcp.json",
+        "gemini_mcp": tmp_path / "gemini" / "settings.json",
+        "pi_mcp": tmp_path / "pi" / "mcp.json",
+        "copilot_mcp": tmp_path / "copilot" / "mcp-config.json",
+        "cline_mcp": tmp_path / "cline" / "mcp.json",
+        "qwen_mcp": tmp_path / "qwen" / "settings.json",
+        "devin_mcp": tmp_path / "devin" / "mcp_config.json",
+        "windsurf_mcp": tmp_path / "windsurf" / "mcp_config.json",
+        "amazonq_mcp": tmp_path / "amazonq" / "mcp.json",
+        "atomcode_mcp": tmp_path / "kilo" / "kilo.json",
+        "kiro_mcp": tmp_path / "kiro" / "mcp.json",
+        "goose_mcp": tmp_path / "goose" / "config.yaml",
+        "hermes_mcp": tmp_path / "hermes" / "config.yaml",
+        "crush_mcp": tmp_path / "crush" / "crushrc",
     }
 
 
@@ -409,7 +424,9 @@ def test_dry_run_all_hosts_changes_nothing(tmp_path, monkeypatch, capsys):
     assert main(["--install", "--host", "all", "--dry-run", str(script)]) == 0
     output = capsys.readouterr().out
     assert "codex" in output and "claude" in output and "omp" in output
-    assert "AtomCode" not in output and "atomcode" not in output
+    # v0.3 扩展 host 全部出现在 dry-run 输出（全覆盖）
+    assert "atomcode" in output and "goose" in output and "hermes" in output
+    assert "crush" in output and "cursor" in output
     for key, content in before.items():
         assert paths[key].read_bytes() == content
     assert not list(tmp_path.rglob("*" + BACKUP_SUFFIX + "*"))
