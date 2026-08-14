@@ -354,6 +354,49 @@ class DB:
                      + int(out.get("output_tokens") or 0) * 4)
         return out
 
+    def usage_series(self, hours: int = 24) -> list[dict[str, Any]]:
+        """按小时聚合 usage（最近 N 小时，缺失补 0），趋势图数据源。
+        数据源：state_dir/usage/*.jsonl（每 run 一行，含 ts 字段）。
+        每小时一行 {ts, input, output, cache_read, cost}。"""
+        try:
+            hours = max(1, min(int(hours), 168))
+        except (TypeError, ValueError):
+            hours = 24
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        buckets: dict[str, dict[str, Any]] = {}
+        for i in range(hours - 1, -1, -1):
+            h = now - datetime.timedelta(hours=i)
+            key = h.strftime("%Y-%m-%dT%H:00:00Z")
+            buckets[key] = {"ts": key, "input": 0, "output": 0,
+                            "cache_read": 0, "cost": 0.0}
+        usage_dir = self.path.parent / "usage"
+        if not usage_dir.is_dir():
+            return list(buckets.values())
+        try:
+            for f in usage_dir.glob("*.jsonl"):
+                try:
+                    for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if not line.strip():
+                            continue
+                        rec = json.loads(line)
+                        ts = str(rec.get("ts") or "")
+                        if not ts:
+                            continue
+                        key = ts[:13] + ":00:00Z"  # YYYY-MM-DDTHH:00:00Z
+                        if key not in buckets:
+                            continue
+                        b = buckets[key]
+                        b["input"] += int(rec.get("input_tokens") or 0)
+                        b["output"] += int(rec.get("output_tokens") or 0)
+                        b["cache_read"] += int(rec.get("cache_read") or 0)
+                        b["cost"] += float(rec.get("cost_usd") or 0.0)
+                except (OSError, json.JSONDecodeError):
+                    continue  # 坏行跳过
+        except Exception:
+            pass
+        return list(buckets.values())
+
     def agent_anomalies(self, agent_id: int) -> list[dict[str, Any]]:
         """D2: daemon 侧预计算异常 badge——stuck loop / 高失败率 / 静默 / 超时。
         前端免扫全事件流，snapshot 直挂 anomalies。口径宽松免漏报：

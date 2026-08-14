@@ -174,18 +174,44 @@ function laneEl(id){
   return `<div class="am-swimlane ${lane.status === "running" ? "run" : ""}" data-id="${esc(id)}">${head}${reviews}${act}</div>`;
 }
 
+/* 过滤器：all / running / done / bad */
+let filter = "all";
+
 function render(){
   if(disposed || !root) return;
+  if(!visible){ renderPending = true; return; }
+  renderPending = false;
+  const filterFn = {
+    all: () => true,
+    running: l => ["running","queued"].includes(l.status),
+    done: l => l.status === "terminated",
+    bad: l => ["error","cancelled","incomplete","needs_advisor"].includes(l.status),
+  }[filter] || (() => true);
+
   const ids = [...lanes.values()]
+    .filter(filterFn)
     .sort((a,b) => (b.created_at || 0) < (a.created_at || 0) ? -1
                   : (b.created_at || 0) > (a.created_at || 0) ? 1
                   : String(a.id).localeCompare(String(b.id), "zh"))
     .map(l => l.id);
   if(!ids.length){
-    root.innerHTML = '<div class="am-empty">暂无 agent 泳道，等待派发…</div>';
+    root.querySelector(".am-swimlanes").innerHTML = '<div class="am-empty">暂无 agent 泳道，等待派发…</div>';
     return;
   }
-  root.innerHTML = `<div class="am-swimlanes">${ids.map(laneEl).join("")}</div>`;
+  root.querySelector(".am-swimlanes").innerHTML = `<div class="am-swimlanes">${ids.map(laneEl).join("")}</div>`;
+}
+
+function bindFilter(){
+  const box = root.querySelector(".am-collab-filters");
+  if(!box || box.dataset.bound) return;
+  box.dataset.bound = "1";
+  box.addEventListener("click", e => {
+    const btn = e.target.closest("button[data-f]");
+    if(!btn) return;
+    filter = btn.dataset.f;
+    box.querySelectorAll("button").forEach(b => b.classList.toggle("active", b === btn));
+    render();
+  });
 }
 
 /* 面板数据量小（泳道最多几十条），直接同步渲染；
@@ -314,8 +340,18 @@ export function mount(container, sse, opts){
   unsubs = new Set();
   root = document.createElement("div");
   root.className = "am-panel";
-  root.innerHTML = '<div class="am-empty">加载泳道数据…</div>';
+  root.innerHTML = `
+    <div class="am-panel-hd"><span class="am-ph-title">协作泳道</span><span class="am-ph-sub">Collaboration</span>
+      <span class="am-ph-ops am-collab-filters">
+        <button class="am-chip active" data-f="all">全部</button>
+        <button class="am-chip" data-f="running">运行中</button>
+        <button class="am-chip" data-f="done">完成</button>
+        <button class="am-chip" data-f="bad">异常</button>
+      </span>
+    </div>
+    <div class="am-swimlanes"><div class="am-empty">加载泳道数据…</div></div>`;
   container.appendChild(root);
+  bindFilter();
 
   // 初始数据：list + activity 并行拉取
   Promise.all([fetchAgents(), fetchActivity()])
@@ -329,7 +365,8 @@ export function mount(container, sse, opts){
     })
     .catch(err => {
       if(disposed) return;
-      root.innerHTML = `<div class="am-err">泳道数据加载失败：${esc(err.message)}</div>`;
+      const box = root.querySelector(".am-swimlanes");
+      if(box) box.innerHTML = `<div class="am-err">泳道数据加载失败：${esc(err.message)}</div>`;
     });
 
   // SSE 订阅

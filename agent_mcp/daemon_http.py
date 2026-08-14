@@ -282,6 +282,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(503, {"error": "dispatcher not ready"})
                 return
             self._send_json(200, self.server.dispatcher.activity({}))
+        elif path == "/api/usage/series":
+            # 趋势图数据源：按小时 token/成本聚合（token 保护）
+            if not self._check_token():
+                return
+            db = getattr(self.server, "db", None)
+            if db is None:
+                self._send_json(503, {"error": "db not ready"})
+                return
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            try:
+                hours = int((query.get("hours") or ["24"])[0])
+            except ValueError:
+                hours = 24
+            self._send_json(200, {"series": db.usage_series(hours)})
         elif path == "/events":
             self._stream_events()
         elif path == "/api/events":
@@ -540,7 +554,7 @@ class Handler(BaseHTTPRequestHandler):
                         .encode("utf-8"))
         if token_script not in data:
             data = data.replace(b"</head>", token_script + b"</head>", 1)
-        marker = b'<script type="module" src="/panels/loader.js?v=v3"></script>'
+        marker = b'<script type="module" src="/panels/loader.js?v=v4"></script>'
         if marker not in data:
             if b"</body>" in data:
                 data = data.replace(b"</body>", marker + b"</body>", 1)

@@ -47,6 +47,11 @@ class FakeDB:
     def events_since(self, cursor, limit=1000):
         return []
 
+    def usage_series(self, hours=24):
+        # 6 个空桶（测试断言形状）
+        return [{"ts": f"2026-08-13T{22-i:02d}:00:00Z", "input": 0, "output": 0,
+                 "cache_read": 0, "cost": 0.0} for i in range(hours)]
+
 
 @pytest.fixture()
 def server(tmp_path):
@@ -185,7 +190,7 @@ def test_policies_and_workspaces_get_require_token(server):
 def test_index_injects_panel_loader(server):
     code, html = get(server, "/")
     assert code == 200
-    assert '<script type="module" src="/panels/loader.js?v=v3"></script>' in html
+    assert '<script type="module" src="/panels/loader.js?v=v4"></script>' in html
     assert "Conversation graph" in html  # 原页面内容保留
     assert "window.__amToken" in html  # token 注入（面板鉴权不再依赖 URL hash）
 
@@ -243,3 +248,23 @@ def test_events_named_stream_unchanged(server):
                        "payload": {"text": "hi"}})
     assert "event: agent.message" in chunk
     assert '"type": "agent.message"' in chunk
+
+
+# -- usage series 端点（趋势图数据源） --------------------------------------
+
+def test_usage_series_requires_token(server):
+    url = f"http://127.0.0.1:{server.server_address[1]}/api/usage/series"
+    req = urllib.request.Request(url)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 401
+
+
+def test_usage_series_shape(server, tmp_path):
+    """series 返回最近 hours 小时连续桶（缺失补 0），cost 为 float。"""
+    code, payload = get(server, "/api/usage/series?hours=6")
+    assert code == 200
+    series = payload["series"]
+    assert len(series) == 6
+    assert all(b["input"] >= 0 and isinstance(b["cost"], float) for b in series)
+    assert all({"ts", "input", "output", "cache_read", "cost"} <= set(b) for b in series)

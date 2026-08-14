@@ -376,3 +376,185 @@
   background:linear-gradient(90deg,var(--accent,#D96B4F),var(--amber,#C9A34F));
   transition:width .5s var(--ease,cubic-bezier(.22,.61,.36,1))}
 .am-tok-count{color:var(--ink-soft,#9B958A);font-size:10px;margin-left:auto}
+
+/* ============================================================
+ * v4 设计系统：完整仪表盘骨架（Header / 侧栏 / 底部条 / 图表 / 三态）
+ * ============================================================ */
+
+/* ---- v4 令牌（深色底 + 阴影 + 渐变） ---- */
+.am-stage{
+  --bg-deep:#0E0E0D; --bg-card:#161614; --bg-card-2:#1D1C19;
+  --ink:#EDE9DE; --ink-2:#B5B0A4; --ink-soft:#8B8678;
+  --line:#2C2B27; --line-soft:#23221F;
+  --accent:#D96B4F; --accent-deep:#E88A6B; --accent-soft:rgba(217,107,79,.13);
+  --grad-accent:linear-gradient(135deg,#D96B4F,#E0A458);
+  --shadow-soft:0 2px 10px rgba(0,0,0,.35); --shadow-pop:0 6px 24px rgba(0,0,0,.45);
+  --shadow-glow:0 0 24px -6px rgba(217,107,79,.4);
+  --r-sm:8px; --r:12px; --r-lg:16px; --r-xl:22px;
+  --ease:cubic-bezier(.22,.61,.36,1);
+  background:var(--bg-deep);
+}
+
+/* ---- 舞台骨架 ---- */
+.am-stage{position:fixed;inset:0;z-index:9990;display:flex;flex-direction:column;
+  opacity:0;visibility:hidden;transition:opacity .28s var(--ease),visibility .28s}
+.am-stage.open{opacity:1;visibility:visible}
+
+/* Header */
+.am-hdr{flex:0 0 auto;display:flex;align-items:center;gap:18px;padding:12px 20px;
+  border-bottom:1px solid var(--line);background:rgba(14,14,13,.72);backdrop-filter:blur(10px);z-index:5}
+.am-hdr-brand{display:flex;align-items:baseline;gap:8px;font:700 16px/1 var(--serif,Georgia,"Songti SC",serif);color:var(--ink)}
+.am-hdr-brand-sub{font:8px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-soft);letter-spacing:.16em;text-transform:uppercase}
+.am-hdr-caps{display:flex;gap:8px;align-items:center}
+.am-cap{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border:1px solid var(--line);
+  border-radius:999px;font:600 10.5px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-2)}
+.am-cap.run{color:var(--accent);border-color:rgba(217,107,79,.4)}
+.am-cap.err{color:var(--red,#D96B5C);border-color:rgba(217,92,92,.4)}
+.am-cap.mono{color:var(--ink-soft)}
+.am-cap-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:amBreathe 1.5s ease-in-out infinite}
+.am-hdr-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+
+/* 主体：侧栏 + 内容 */
+.am-body{flex:1 1 auto;min-height:0;display:flex}
+.am-nav{flex:0 0 150px;display:flex;flex-direction:column;gap:2px;padding:12px 10px;
+  border-right:1px solid var(--line);background:rgba(14,14,13,.5)}
+.am-nav-item{display:flex;align-items:center;gap:9px;padding:9px 11px;border:0;border-radius:10px;
+  background:transparent;color:var(--ink-2);cursor:pointer;text-align:left;position:relative;
+  font:600 11.5px/1 var(--sans,-apple-system,"PingFang SC",sans-serif);
+  transition:background .16s var(--ease),color .16s var(--ease),transform .16s var(--ease)}
+.am-nav-item:hover{background:var(--accent-soft);color:var(--ink)}
+.am-nav-item.active{background:var(--accent-soft);color:var(--accent-deep)}
+.am-nav-item.active::before{content:"";position:absolute;left:-10px;top:20%;bottom:20%;width:3px;
+  border-radius:2px;background:var(--grad-accent)}
+.am-nav-ico{width:18px;text-align:center;font-size:14px;opacity:.9}
+.am-nav-txt{white-space:nowrap}
+
+.am-panes{flex:1 1 auto;min-width:0;position:relative}
+.am-pane{position:absolute;inset:0;overflow-y:auto;overscroll-behavior:contain;display:none;padding:18px 22px 28px}
+.am-pane.active{display:block;animation:amPaneIn .3s var(--ease) backwards}
+.am-pane::-webkit-scrollbar{width:8px}
+.am-pane::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+
+/* 底部状态条 */
+.am-sb{flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:7px 20px;
+  border-top:1px solid var(--line);background:rgba(14,14,13,.72);font:9.5px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-soft)}
+.am-sb-item{display:flex;align-items:center;gap:7px;min-width:0}
+.am-sb-last{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw;color:var(--ink-2)}
+.am-sb-right{margin-left:auto}
+
+/* ---- 组件：统计卡（v4 升级：渐变字/阴影/趋势） ---- */
+.am-dash-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.am-dash-card{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg-card);
+  padding:16px 18px;position:relative;overflow:hidden;
+  transition:border-color .18s var(--ease),transform .18s var(--ease),box-shadow .18s var(--ease)}
+.am-dash-card:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:var(--shadow-glow)}
+.am-dash-card .am-dash-card-v{font:700 30px/1.05 var(--serif,Georgia,"Songti SC",serif);
+  font-variant-numeric:tabular-nums;letter-spacing:-.02em;color:var(--ink)}
+.am-dash-card .am-dash-card-k{margin-top:8px;font:700 9px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft)}
+.am-dash-card .am-dash-card-s{margin-top:4px;font-size:10.5px;color:var(--ink-soft)}
+.am-dash-card.run .am-dash-card-v{color:var(--accent)}
+.am-dash-card.err .am-dash-card-v{color:var(--red,#D96B5C)}
+.am-dash-card.ok .am-dash-card-v{color:var(--green,#6FA587)}
+.am-dash-card-v.am-live{animation:amBreathe 1.8s ease-in-out infinite}
+.am-spark{margin-top:10px}
+.am-spark-svg{display:block;width:100%;height:28px}
+
+/* ---- 组件：图表 ---- */
+.am-barstack{display:block}
+.am-bar-in{fill:var(--amber,#C9A34F);transition:height .5s var(--ease)}
+.am-bar-out{fill:var(--accent,#D96B4F);transition:height .5s var(--ease)}
+.am-bar-cache{fill:var(--green,#6FA587);transition:height .5s var(--ease)}
+.am-donut-seg{transition:stroke-dasharray .6s var(--ease),stroke-dashoffset .6s var(--ease)}
+
+/* ---- 组件：表格（v4） ---- */
+.am-dtable{width:100%;border-collapse:collapse;font-size:11px}
+.am-dtable th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);
+  color:var(--ink-soft);font:700 8.5px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  letter-spacing:.1em;text-transform:uppercase;cursor:pointer;user-select:none}
+.am-dtable th:hover{color:var(--accent)}
+.am-dtable th.num{text-align:right}
+.am-dtable td{padding:8px 10px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
+.am-dtable td.num{text-align:right;font:10.5px var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);font-variant-numeric:tabular-nums}
+.am-dtable tbody tr{transition:background .12s}
+.am-dtable tbody tr:hover{background:var(--accent-soft)}
+.am-dtable th.sorted{color:var(--accent)}
+
+/* ---- 组件：时间线 ---- */
+.am-timeline{display:flex;flex-direction:column}
+.am-tl-item{display:grid;grid-template-columns:10px 52px 76px minmax(80px,130px) 1fr;gap:8px;
+  align-items:baseline;padding:6px 2px;border-bottom:1px solid var(--line-soft);font-size:10.5px}
+.am-tl-dot{width:7px;height:7px;border-radius:50%;margin-top:4px;box-shadow:0 0 6px currentColor}
+.am-tl-time{font:9px var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-soft)}
+.am-tl-type{font:9px var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-2);letter-spacing:.04em}
+.am-tl-agent{font:10px var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--accent-deep,#E88A6B);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.am-tl-text{color:var(--ink-soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---- 组件：三态 ---- */
+.am-state{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;
+  padding:36px 0;color:var(--ink-soft);font-size:11.5px}
+.am-state .am-state-ico{font-size:22px;opacity:.55}
+.am-state.error{color:var(--red,#D96B5C)}
+.am-btn-retry{margin-top:4px;padding:5px 14px;border:1px solid var(--accent);border-radius:8px;
+  background:transparent;color:var(--accent);cursor:pointer;font:600 11px inherit}
+.am-btn-retry:hover{background:var(--accent);color:#fff}
+.am-shimmer{display:inline-block;width:120px;height:8px;border-radius:4px;margin-top:6px;
+  background:linear-gradient(90deg,var(--line-soft) 25%,var(--line) 50%,var(--line-soft) 75%);
+  background-size:200% 100%;animation:amShimmer 1.3s ease-in-out infinite}
+@keyframes amShimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+
+/* ---- 面板标题 ---- */
+.am-panel-hd{display:flex;align-items:baseline;gap:10px;margin:2px 0 14px}
+.am-panel-hd .am-ph-title{font:700 15px/1 var(--serif,Georgia,"Songti SC",serif);color:var(--ink);letter-spacing:-.01em}
+.am-panel-hd .am-ph-sub{font:9px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-soft);letter-spacing:.12em;text-transform:uppercase}
+.am-panel-hd .am-ph-ops{margin-left:auto;display:flex;gap:6px}
+
+/* 双栏布局 */
+.am-grid2{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:16px;align-items:start}
+.am-grid2 .am-col{min-width:0}
+@media (max-width:980px){.am-grid2{grid-template-columns:1fr}}
+@media (max-width:720px){.am-nav{flex:0 0 56px}.am-nav-txt{display:none}.am-nav-item{justify-content:center}}
+@media (prefers-reduced-motion:reduce){.am-stage *{animation:none!important;transition:none!important}}
+
+/* ---- v4 总览补充 ---- */
+.am-run-list{display:flex;flex-direction:column;gap:8px}
+.am-run-card{display:flex;align-items:center;gap:9px;padding:9px 12px;
+  border:1px solid var(--line);border-radius:var(--r);background:var(--bg-card);
+  transition:border-color .16s,transform .16s}
+.am-run-card:hover{border-color:var(--accent);transform:translateX(2px)}
+.am-run-bar{width:3px;align-self:stretch;border-radius:2px;flex:0 0 3px}
+.am-run-task{min-width:0;flex:1;font-size:11.5px;color:var(--ink);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.am-budget-big{display:flex;justify-content:center;padding:6px 0 10px}
+.am-budget-ring-wrap{position:relative;width:132px;height:132px;flex:0 0 auto}
+.am-budget-ring{width:100%;height:100%;transform:rotate(-90deg)}
+.am-budget-ring .am-ring-bg{fill:none;stroke:var(--line-soft);stroke-width:11}
+.am-budget-ring .am-ring-fg{fill:none;stroke:var(--grad-accent);stroke-width:11;stroke-linecap:round;
+  transition:stroke-dasharray .6s var(--ease)}
+.am-budget-ring .am-ring-fg.over{stroke:var(--red,#D96B5C);filter:drop-shadow(0 0 5px var(--red));animation:amRingBreath 1.6s ease-in-out infinite}
+.am-budget-num{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}
+.am-budget-num b{font:700 21px/1 var(--serif,Georgia,"Songti SC",serif);font-variant-numeric:tabular-nums;color:var(--ink)}
+.am-budget-num span{font:8.5px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-soft)}
+.am-donut-box{display:flex;flex-direction:column;align-items:center;gap:10px}
+.am-donut-legend{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;font-size:10.5px;color:var(--ink-2)}
+.am-donut-legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
+
+/* ---- v4 Token 页补充 ---- */
+.am-tok-chart{background:var(--bg-card);border:1px solid var(--line);border-radius:var(--r);padding:14px;overflow-x:auto}
+.am-tok-donut{display:flex;flex-direction:column;align-items:center;gap:10px;background:var(--bg-card);
+  border:1px solid var(--line);border-radius:var(--r);padding:14px}
+.am-chart-legend{display:flex;gap:14px;margin-top:10px;font-size:10px;color:var(--ink-soft)}
+.am-chart-legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
+
+/* ---- v4 协作：网格 + 过滤器 chips ---- */
+.am-swimlanes{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.am-swimlane{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg-card);
+  padding:13px 15px;transition:border-color .16s,transform .16s,box-shadow .16s}
+.am-swimlane:hover{border-color:var(--accent);transform:translateY(-2px);box-shadow:var(--shadow-glow)}
+.am-swimlane.run{border-color:rgba(217,107,79,.55)}
+.am-chip{padding:4px 11px;border:1px solid var(--line);border-radius:999px;background:transparent;
+  color:var(--ink-soft);font:600 10px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);cursor:pointer;
+  transition:border-color .14s,color .14s,background .14s}
+.am-chip:hover{color:var(--ink);border-color:var(--ink-soft)}
+.am-chip.active{background:var(--accent);border-color:var(--accent);color:#fff}
