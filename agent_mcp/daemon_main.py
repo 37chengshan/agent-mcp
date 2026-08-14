@@ -15,6 +15,9 @@ from typing import Any
 
 import psutil
 
+# 单行 JSON 会话转储里 FINAL_ANSWER 摘要后的结构边界（"}] / "}, / "], ）
+_JSON_BOUNDARY_RE = re.compile(r'"(?:]|}|,)')
+
 # 脚本直接启动（python agent_mcp/daemon_main.py 或 spawn_detached 拉起）时，
 # sys.path[0] 是脚本目录而非项目根，需手动补项目根才能 import agent_mcp 包
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -210,7 +213,7 @@ def _spawn_cache_key(body: dict, prompt: str) -> str:
 def _extract_final_answer(out_text: str, summary_chars: int = 600) -> str:
     """从 worker stdout 提 FINAL_ANSWER: 后摘要并按 summary_chars 裁剪。
 
-    找不到标记 → 回退 _tail(out_text) 末尾截断；主 agent 拿到的是摘要不是末尾。
+    找不到标记 → 回退 out_text 末尾截断；主 agent 拿到的是摘要不是末尾。
     """
     marker = "FINAL_ANSWER:"
     pos = out_text.rfind(marker)
@@ -222,8 +225,35 @@ def _extract_final_answer(out_text: str, summary_chars: int = 600) -> str:
             if epos >= 0:
                 snippet = snippet[:epos].strip()
                 break
+        # 单行场景（omp/atomcode 的 out 是单行巨型 JSON 会话转储）：FINAL_ANSWER 位于
+        # "text":"FINAL_ANSWER: ..." 里，摘要外是 JSON 结构边界（"}] 或 "}, 或 "]，）——
+        # 截掉 JSON 尾巴；多行文本场景摘要里正常含引号，不受影响。
+        if "\n" not in snippet:
+            json_boundary = _JSON_BOUNDARY_RE.search(snippet)
+            if json_boundary:
+                snippet = snippet[:json_boundary.start()].strip()
         return snippet[:summary_chars]
     return out_text[-summary_chars:]
+
+
+def _final_summary(path: Path | str, summary_chars: int = 600) -> str:
+    """从 worker out 文件提取终态摘要：优先 FINAL_ANSWER: 标记，找不到回退尾部截断。
+
+    omp 等 CLI 的 out 是单行巨型 JSON 会话转储——FINAL_ANSWER 位于文件中部、文件末尾
+    是 JSON 闭合（isTerminal），直接 _tail 会抓到工具结果碎片而非最终回答；因此只采样
+    文件尾部 256KB（标记总在最终 assistant 消息内，必落在此窗口），在其内 rfind 标记。
+    """
+    path = Path(path)
+    tail_bytes = 256 * 1024
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+            raw = fh.read()
+    except OSError:
+        return ""
+    return _extract_final_answer(raw.decode("utf-8", errors="replace"), summary_chars)
 
 
 # 角色预设 frontmatter 解析缓存：path -> frontmatter dict
@@ -658,7 +688,7 @@ class Dispatcher:
             with self._lock:
                 info = self._workers.get(agent_id)
             if info and _read_json(info["state_path"]).get("status") == "finished":
-                summary = _tail(info["out_path"])
+                summary = _final_summary(info["out_path"], summary_chars)
                 self._check_worker(agent_id)
                 agent = self.db.get_agent(agent_id)
                 if agent is None:
@@ -968,7 +998,7 @@ class Dispatcher:
                 self._offsets.pop(agent_id, None)
                 rc = state.get("process_status", 0)
                 timed_out = bool(state.get("timed_out"))
-                summary = _tail(info["out_path"])
+                summary = _final_summary(info["out_path"])
                 finished = True
             elif state.get("status") == "running" and not is_pid_running(info.get("worker_pid")):
                 # 孤儿检测：仅当 worker 已确认进入 running 态（state 写 running）
@@ -1021,7 +1051,8 @@ class Dispatcher:
         if timed_out:
             # 超时 → incomplete（可 resume/重派），事件沿用 agent.terminated + stop_reason
             # P5: 带 error_type=timeout + hint，结构化错误便主 agent 自动化处理
-            self._set_status(agent_id, "incomplete", stop_reason="timeout")
+            # 顺序：事件先落库再置终态——_set_status 的 ev.set() 唤醒 wait 后，
+            # 其 fast-path 兜底需能从 DB 取到 terminated 事件（事件晚于状态会取空）
             self._broadcast("agent.terminated", {"agent_id": agent_id,
                                                  "stop_reason": "timeout",
                                                  "error_type": "timeout",
@@ -1030,22 +1061,23 @@ class Dispatcher:
                                                          "(resume=true) or re-spawn "
                                                          "with context from last run",
                                                  "summary": summary}, agent_id)
+            self._set_status(agent_id, "incomplete", stop_reason="timeout")
         elif rc == 0:
             # E2 needs_advisor：子代理回 NEEDS_DECISION: + 理由 → 标 needs_advisor，主 agent wait 收到此态才介入
             needs_advisor_match = re.search(r"NEEDS_DECISION:\s*(.+?)(?:\n|$)",
                                             summary, re.DOTALL)
             if needs_advisor_match and "why" in summary.lower():
-                self._set_status(agent_id, "needs_advisor",
-                                stop_reason="needs_decision")
                 self._broadcast("agent.needs_advisor",
                                 {"agent_id": agent_id,
                                  "question": needs_advisor_match.group(1).strip()[:1000]},
                                 agent_id)
+                self._set_status(agent_id, "needs_advisor",
+                                stop_reason="needs_decision")
             else:
-                self._set_status(agent_id, "terminated", stop_reason="end_turn")
                 self._broadcast("agent.terminated", {"agent_id": agent_id,
                                                     "stop_reason": "end_turn",
                                                     "summary": summary}, agent_id)
+                self._set_status(agent_id, "terminated", stop_reason="end_turn")
                 # 记忆银行：完成态自动沉淀 FINAL_ANSWER → kind=final_answer 记忆
                 self._sink_final_answer(agent_id, summary, (agent or {}).get("session_id") or "default")
                 # C3 token_budget 降档：完成态后判超额，触发 followup 用低档 model 重跑（不运行中换）
@@ -1221,8 +1253,12 @@ class Dispatcher:
                      summary_chars: int = 600, return_ref: bool = False) -> dict:
         if agent["status"] == "terminated":
             # summary 兜底：与 monitor 竞争时从已落库的 terminated 事件取
+            # （按会话过滤 + 大 limit：events_since 默认取最早 limit 条，
+            # 真实库事件超 1000 后旧实现取不到最新事件 → summary 空）
             if not summary:
-                summary = self._last_event_payload(agent["id"], "agent.terminated").get("summary", "")
+                summary = self._last_event_payload(
+                    agent["id"], "agent.terminated",
+                    session_id=agent.get("session_id")).get("summary", "")
             final = _extract_final_answer(summary, summary_chars)
             # P2: 结构化返回——usage 五元组摘要 + events 压缩
             usage = self.db.usage_total(agent["id"])
@@ -1279,8 +1315,14 @@ class Dispatcher:
             result["next_seq"] = events[-1]["seq"] if events else since_seq
         return result
 
-    def _last_event_payload(self, agent_id: int, type_: str) -> dict:
-        for e in reversed(self.db.events_since(0)):
+    def _last_event_payload(self, agent_id: int, type_: str,
+                            session_id: str | None = None) -> dict:
+        """查指定 agent 最近一条 type_ 事件的 payload。
+
+        events_since 按 seq 升序且默认 limit=1000（最早 1000 条）——真实库事件
+        积累超限后须按会话过滤并放大 limit，否则取不到最新事件。
+        """
+        for e in reversed(self.db.events_since(0, session_id=session_id, limit=5000)):
             if e.get("agent_id") == agent_id and e.get("type") == type_:
                 return e.get("payload") or {}
         return {}
@@ -1399,7 +1441,8 @@ class Dispatcher:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Agent MCP daemon")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("AGENT_MCP_PORT", DEFAULT_PORT)))
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--web-root", type=Path, default=DEFAULT_WEB_ROOT)
     args = parser.parse_args()

@@ -1,5 +1,25 @@
 # Agent MCP
 
+## 🟦 原生支持 DeepSeek Harness（DSH）
+
+**在 DeepSeek Harness 的 AI 会话中直接用上 agent-mcp 的全部 16 个 MCP 工具**（`mcp__agentmcp__spawn_agent` / `wait_agent` / `estimate_complexity` / `steer_agent` / `followup_task` / `memory_store` / `memory_recall` …）：DSH 以 stdio transport 直连 `mcp_server.py`，**一行 `insert` patch 即接入**——零插件开发、零代码改造；daemon 未起时自动原子拉起，子进程崩溃自动指数退避重连，重启后会话可续接。协议层对齐 **MCP 2026-07-28 最新规范**（无状态核心、`server/discover`、tasks 扩展、structuredContent），同时兼容 2025-11-25（DSH SDK 1.29.0 实际协商版本）与 2025-03-26 legacy 客户端。
+
+```yaml
+# ~/.dsh/profiles/<name>/cordis.patch.yml（或 $DSH_HOME/cordis.patch.yml）—— 加入即启用
+- insert:
+    - id: mcp-agentmcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: agentmcp
+        transport: stdio
+        command: python3
+        args: ['/绝对路径/agent-mcp/mcp_server.py']
+```
+
+完整接入步骤、agent preset 平面模板与验证清单见 [docs/dsh-integration.md](docs/dsh-integration.md)。
+
+---
+
 **打通所有 Agent CLI 壁垒的多 Agent 编排基础设施** —— 在一个 MCP 协议内，把任意 Agent CLI 统一为可派发、可监控、可续接、可终止的子 Agent 工作池（**兼容任意 CLI**：内置 claude / grok / opencode / omp / atomcode / codex / kimi / copilot / pi / zcode / cline 十一款适配器，其余 CLI 写一份 JSON 配置即可接入，无需改代码），让主 Agent 只做拆解与汇合，执行与容错交给 Agent MCP。CLI 不再是孤岛：每个模型都能**驾驭最适配它的底座**——读密集探索交给快底座（omp/pi/grok），深推理规划交给强底座（claude），模型与底座按任务现场自由匹配，成本与质量自己说了算。
 
 > Agent MCP 的核心不是"多开几个 Agent"，而是把任意 CLI 统一收进**一个可派发、可监控、可续接、可终止的子 Agent 工作池**：主 Agent 只做拆解与汇合，执行与容错交给基础设施，模型与底座按任务现场自由匹配。**复杂度分级门**决定"要不要拆"，**任务级超时 / 队列 / 续接 / 降档**兜住"拆了怎么办"。
@@ -49,6 +69,7 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 
 | 能力 | 说明 |
 |---|---|
+| 🟦 **DeepSeek Harness 原生接入** | DSH stdio 直连 `mcp_server.py`：16 个工具以 `mcp__agentmcp__*` 全量注册（一行 `insert` patch）；协议层对齐 MCP 2026-07-28 最新规范并兼容 2025-11-25 / 2025-03-26，daemon 自动拉起 + 断线自动重连 + 会话可续接，详见 [docs/dsh-integration.md](docs/dsh-integration.md) |
 | 🧩 **任意 Agent CLI 统一派发** | `spawn_agent` 一个入口派发任意 CLI 子 Agent（内置 claude / grok / opencode / omp / atomcode / codex / kimi / copilot / pi / zcode / cline 适配器；其余 CLI 通过 `custom-clis/*.json` 配置接入，零改码）；适配器层各自归一化事件流、usage 与 session，上层无感 |
 | 🚦 **复杂度分级门** | `estimate_complexity` 本地直算（零 token、不 spawn），按 S/M/L 判级决定是否进入编排——**默认直接做，按需才拆**，杜绝过拆 |
 | ⏱️ **任务级超时** | `timeout_seconds`（1–1800s）到时终止整个进程树并标记 `incomplete/timeout`，可 resume 续跑；不等死、不悬空 |
@@ -181,6 +202,6 @@ tests/                   # 20+ 测试文件（含真实 stdio 与 CLI 集成冒�
 
 ## 📚 文档
 
-- [安装教程（AI 可读版）](docs/install-guide.md) · [CLI 选型指南](skill/cli-guide.md) · [验收清单](docs/acceptance.md) · [能力矩阵](docs/capability-matrix.md) · [自定义 CLI 适配器](docs/custom-cli.md) · [安装器覆盖调研](docs/research/installer-coverage-2026-08-13.md)
+- [DSH（DeepSeek Harness）接入指南](docs/dsh-integration.md) · [安装教程（AI 可读版）](docs/install-guide.md) · [CLI 选型指南](skill/cli-guide.md) · [验收清单](docs/acceptance.md) · [能力矩阵](docs/capability-matrix.md) · [自定义 CLI 适配器](docs/custom-cli.md) · [安装器覆盖调研](docs/research/installer-coverage-2026-08-13.md)
 - [设计文档](docs/plans/2026-08-03-agent-mcp-redesign-design.md) · [实现计划](docs/plans/2026-08-03-agent-mcp-implementation.md)
 - [编排 Skill 全文](skill/SKILL.md)

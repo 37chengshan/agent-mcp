@@ -28,10 +28,15 @@ from agent_mcp import SESSION_MISMATCH_MARK
 from agent_mcp.cli_adapters import adapter_names, load_custom_adapters
 from agent_mcp.orchestrator import Orchestrator, OrchestratedTask
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.2.0"
 LEGACY_PROTOCOL_VERSION = "2025-03-26"
+# 2025-11-25：官方 MCP 中间版本（SDK 1.29.0 的 LATEST，DSH 客户端所发版本），
+# 拥有 structuredContent / tasks 等 modern 特性但仍是 initialize 握手式会话协议。
+BRIDGE_PROTOCOL_VERSION = "2025-11-25"
+# 2026-07-28：最新规范，无状态核心（_meta 版本协商 + server/discover，无 initialize）。
 MODERN_PROTOCOL_VERSION = "2026-07-28"
-SUPPORTED_PROTOCOL_VERSIONS = [MODERN_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION]
+SUPPORTED_PROTOCOL_VERSIONS = [MODERN_PROTOCOL_VERSION, BRIDGE_PROTOCOL_VERSION,
+                               LEGACY_PROTOCOL_VERSION]
 PROTOCOL_VERSION = LEGACY_PROTOCOL_VERSION
 DAEMON_HOST = "127.0.0.1"
 DAEMON_PORT = int(os.environ.get("AGENT_MCP_PORT", "8765"))
@@ -66,6 +71,11 @@ MAX_WAIT_SECONDS = float(os.environ.get("AGENT_MCP_MAX_WAIT", "600"))
 
 _HOST = "unknown"
 _SESSION_ID: str | None = None
+# initialize 握手协商出的会话协议版本（2025-03-26/2025-11-25 客户端）；2026-07-28
+# 无状态客户端不设置，每请求从 _meta 读版本。
+_NEGOTIATED_PROTOCOL_VERSION: str | None = None
+# 2025-11-25 客户端在 initialize capabilities.tasks 声明的 tasks 能力（experimental）
+_CLIENT_TASKS_CAPABLE = False
 _DAEMON: tuple[str, str] | None = None  # (base_url, token) 缓存
 
 _DAEMON_PATHS = {
@@ -633,12 +643,37 @@ def rpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def _request_protocol(request: dict[str, Any]) -> str | None:
+    """2026-07-28 无状态协议：请求的 _meta 携带协议版本（每请求声明）。"""
     params = request.get("params")
     meta = params.get("_meta") if isinstance(params, dict) else None
     if not isinstance(meta, dict):
         return None
     version = meta.get("io.modelcontextprotocol/protocolVersion")
     return str(version) if version else None
+
+
+def _negotiate_version(request: dict[str, Any]) -> str:
+    """initialize 顶层 protocolVersion → 会话协商版本（2025-03-26/2025-11-25 客户端）。
+
+    客户端请求版本在支持集内则回显该版本；否则回 legacy 兜底（SDK 客户端会接受
+    服务端回显的任何受支持版本，不能像 _meta 无状态方式那样直接报错拒绝）。
+    会话版本记录在进程级 _NEGOTIATED_PROTOCOL_VERSION，供后续请求复用（stdio 单连接进程）。
+    """
+    global _NEGOTIATED_PROTOCOL_VERSION
+    params = request.get("params")
+    requested = params.get("protocolVersion") if isinstance(params, dict) else None
+    if isinstance(requested, str) and requested:
+        _NEGOTIATED_PROTOCOL_VERSION = (
+            requested if requested in SUPPORTED_PROTOCOL_VERSIONS else LEGACY_PROTOCOL_VERSION)
+    return _NEGOTIATED_PROTOCOL_VERSION or LEGACY_PROTOCOL_VERSION
+
+
+def _effective_version(request: dict[str, Any]) -> str | None:
+    """请求生效的协议版本：2026-07-28 客户端用 _meta 声明；否则用 initialize 协商的会话版本。"""
+    meta_version = _request_protocol(request)
+    if meta_version is not None:
+        return meta_version
+    return _NEGOTIATED_PROTOCOL_VERSION
 
 
 def _modern_meta() -> dict[str, Any]:
@@ -651,14 +686,18 @@ _TOOL_PRUNE_KEEP = {"spawn_agent", "wait_agent", "interrupt_agent", "estimate_co
 
 
 def _pruned_tools(request: dict[str, Any]) -> list[dict[str, Any]]:
-    """按 modern client capability 静态裁 tools/list：保留通用三件 + client 声明用过的。
-    不建表不记历史，纯按 handshake capability 决定，省主 agent 每回合 schema overhead。"""
+    """工具列表：默认返回全量 TOOLS；仅当 2026-07-28 无状态客户端在请求 _meta 的
+    clientCapabilities.extensions 里显式声明用过/需要的工具名时才按声明裁剪。
+
+    2025-03-26/2025-11-25 客户端（initialize 握手式，含 DSH 的 SDK 1.29.0）不发送
+    clientCapabilities extensions，一律返回全量——保证 DSH 工具目录完整可见。
+    """
     params = request.get("params")
     meta = params.get("_meta") if isinstance(params, dict) else None
     caps = (meta.get("io.modelcontextprotocol/clientCapabilities")
             if isinstance(meta, dict) else None)
     exts = caps.get("extensions") if isinstance(caps, dict) else None
-    # client 声明用过的工具名（custom capability extension 约定）
+    # client 声明用过的工具名（2026-07-28 custom capability extension 约定）
     declared = set()
     if isinstance(exts, dict):
         for key in ("io.modelcontextprotocol/agent-mcp.tools",
@@ -668,20 +707,17 @@ def _pruned_tools(request: dict[str, Any]) -> list[dict[str, Any]]:
                 names = v.get("used") or v.get("names")
                 if isinstance(names, list):
                     declared.update(str(n) for n in names)
-    kept = []
-    for tool in TOOLS:
-        name = tool.get("name")
-        if name in _TOOL_PRUNE_KEEP or name in declared:
-            kept.append(tool)
-    # 兜底也只返通用四件（spawn/wait/interrupt/estimate_complexity），不返全量 TOOLS，
-    # 省 legacy/未声明 client 每回合 schema overhead
-    return kept or [t for t in TOOLS if t.get("name") in _TOOL_PRUNE_KEEP]
+    if not declared:
+        return list(TOOLS)
+    kept = [t for t in TOOLS
+            if t.get("name") in _TOOL_PRUNE_KEEP or t.get("name") in declared]
+    return kept or list(TOOLS)
 
 
 def _modern_discover() -> dict[str, Any]:
     return {
         "resultType": "complete",
-        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
         "capabilities": {"tools": {"listChanged": False}, "extensions": {
             "io.modelcontextprotocol/tasks": {}}},
         "_meta": _modern_meta(),
@@ -699,11 +735,15 @@ def _unsupported_version(request_id: Any, requested: str) -> dict[str, Any]:
 
 
 def _tasks_supported(request: dict[str, Any]) -> bool:
+    """tasks 客户端能力：2026-07-28 无状态客户端在请求 _meta 的
+    clientCapabilities.extensions 声明 io.modelcontextprotocol/tasks；
+    2025-11-25 客户端在 initialize 的 capabilities.tasks 声明（会话级记录）。"""
     params = request.get("params")
     meta = params.get("_meta") if isinstance(params, dict) else None
     caps = meta.get("io.modelcontextprotocol/clientCapabilities") if isinstance(meta, dict) else None
     exts = caps.get("extensions") if isinstance(caps, dict) else None
-    return isinstance(exts, dict) and "io.modelcontextprotocol/tasks" in exts
+    return isinstance(exts, dict) and "io.modelcontextprotocol/tasks" in exts \
+        or _CLIENT_TASKS_CAPABLE
 
 
 def _agent_id_from_task(params: dict[str, Any]) -> int:
@@ -719,7 +759,13 @@ def _task_status(payload: dict[str, Any]) -> str:
             "error": "failed", "cancelled": "cancelled", "incomplete": "failed"}.get(status, "working")
 
 
-def _task_result(payload: dict[str, Any], *, result_type: str = "task") -> dict[str, Any]:
+def _task_result(payload: dict[str, Any], *, result_type: str = "complete") -> dict[str, Any]:
+    """任务对象（2025-11-25 tasks / 2026-07-28 tasks 扩展共用）。
+
+    字段名对齐官方 schema：ttl（number|null）、pollInterval（number）、
+    createdAt/lastUpdatedAt（ISO 字符串）；resultType 遵循 2026-07-28 枚举
+    （complete/input_required）——spawn 的任务句柄与 tasks/get 的最终结果一致用 complete。
+    """
     agent_id = int(payload["agent_id"])
     created = str(payload.get("created_at") or payload.get("updated_at") or "")
     updated = str(payload.get("updated_at") or created)
@@ -729,8 +775,8 @@ def _task_result(payload: dict[str, Any], *, result_type: str = "task") -> dict[
         "status": _task_status(payload),
         "createdAt": created,
         "lastUpdatedAt": updated,
-        "ttlMs": 604_800_000,
-        "pollIntervalMs": 1000,
+        "ttl": 604_800_000,
+        "pollInterval": 1000,
         "_meta": _modern_meta(),
     }
     if task["status"] == "completed":
@@ -1044,26 +1090,39 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 def handle(request: dict[str, Any], *, emit=send) -> None:
     request_id = request.get("id")
     method = request.get("method")
-    requested_version = _request_protocol(request)
-    modern = requested_version is not None
-    if modern and requested_version not in SUPPORTED_PROTOCOL_VERSIONS:
-        emit(_unsupported_version(request_id, requested_version))
+    # 2026-07-28 无状态客户端：每请求 _meta 声明版本，不匹配即拒绝（UnsupportedProtocolVersion）
+    meta_version = _request_protocol(request)
+    if meta_version is not None and meta_version not in SUPPORTED_PROTOCOL_VERSIONS:
+        emit(_unsupported_version(request_id, meta_version))
         return
     if method == "server/discover":
         emit({"jsonrpc": "2.0", "id": request_id, "result": _modern_discover()})
-    elif method == "initialize":
-        global _HOST
+        return
+    if method == "initialize":
+        global _HOST, _CLIENT_TASKS_CAPABLE
         params = request.get("params")
         if not isinstance(params, dict):
             params = {}
         _HOST = host_from_client_info(params.get("clientInfo"))
+        # 2025-11-25 客户端在 capabilities.tasks 声明 tasks 能力（experimental）
+        capabilities = params.get("capabilities")
+        _CLIENT_TASKS_CAPABLE = isinstance(
+            capabilities.get("tasks"), dict) if isinstance(capabilities, dict) else False
+        # 顶层 protocolVersion 协商：2025-03-26/2025-11-25 客户端（含 DSH SDK 1.29.0）。
+        # 请求版本在支持集内则回显；否则回 legacy 兜底（绝不回 2026-07-28——
+        # SDK 客户端只接受 SUPPORTED_PROTOCOL_VERSIONS 内版本）。
+        negotiated = _negotiate_version(request)
         emit({"jsonrpc": "2.0", "id": request_id, "result": {
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": negotiated,
             "serverInfo": {"name": "agent-mcp", "version": SERVER_VERSION},
             "capabilities": {"tools": {"listChanged": False}}},
         })
-    elif method == "tools/list":
-        # legacy 时 request 无 capability meta，_pruned_tools 返三通用兜底
+        return
+    # modern = 2025-11-25 或 2026-07-28（structuredContent/resultType/tasks 生效）；
+    # legacy 客户端（2025-03-26 无顶层版本）保持原行为。
+    modern = _effective_version(request) in (MODERN_PROTOCOL_VERSION, BRIDGE_PROTOCOL_VERSION)
+    if method == "tools/list":
+        # legacy/2025-11-25 客户端无 _meta capability 声明 → 默认返回全量工具
         listed: dict[str, Any] = {"tools": _pruned_tools(request)}
         if modern:
             listed.update({"resultType": "complete", "ttlMs": 300_000,
@@ -1094,7 +1153,8 @@ def handle(request: dict[str, Any], *, emit=send) -> None:
         if request_id is None:
             return  # 通知（无 id）不应返回响应
         if not modern or not _tasks_supported(request):
-            emit(rpc_error(request_id, -32023, "Missing required client capability: "
+            # 2026-07-28 错误码重编号：MissingRequiredClientCapability -32003 → -32021
+            emit(rpc_error(request_id, -32021, "Missing required client capability: "
                            "io.modelcontextprotocol/tasks"))
             return
         params = request.get("params") if isinstance(request.get("params"), dict) else {}

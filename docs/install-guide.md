@@ -17,6 +17,12 @@ Agent MCP 是一个 **MCP 服务器 + 编排 Skill**：
 
 ---
 
+## 0.5 DeepSeek Harness（DSH）接入
+
+DSH 是通用 MCP 客户端，无需 install.py 注册：在其 profile 组合层加一行 `@deepseek-ai/dsh-mcp-client` 的 insert patch 即可，16 个工具以 `mcp__agentmcp__*` 出现在 DSH 工具目录。完整步骤、host/agent preset 双平面模板与验证清单见 **[DSH 接入指南](dsh-integration.md)**。
+
+---
+
 ## 1. 六种内置 host（有专用安装工具）
 
 以下六个 agent 可用项目自带脚本一键安装（自动注册 MCP + 安装 skill，写配置前自动备份，`--rollback` 可恢复）：

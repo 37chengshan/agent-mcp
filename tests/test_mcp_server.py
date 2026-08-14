@@ -16,6 +16,8 @@ def _reset_state(monkeypatch, tmp_path):
     """重置模块级会话变量，避免测试间串扰；session 持久化文件隔离到临时目录。"""
     monkeypatch.setattr(mcp_server, "_SESSION_ID", None)
     monkeypatch.setattr(mcp_server, "_HOST", "unknown")
+    monkeypatch.setattr(mcp_server, "_NEGOTIATED_PROTOCOL_VERSION", None)
+    monkeypatch.setattr(mcp_server, "_CLIENT_TASKS_CAPABLE", False)
     monkeypatch.setattr(mcp_server, "_DAEMON", None)
     monkeypatch.setattr(mcp_server, "SESSION_ID_PREFIX", tmp_path / "session-id")
     for var in mcp_server._HOST_SESSION_ENV_VARS:
@@ -30,9 +32,66 @@ def test_initialize_returns_server_info():
                        "params": {"clientInfo": {"name": "codex"}}}, emit=out.append)
     msg = out[0]
     assert msg["id"] == 1
-    assert msg["result"]["serverInfo"] == {"name": "agent-mcp", "version": "2.1.0"}
+    assert msg["result"]["serverInfo"] == {"name": "agent-mcp", "version": "2.2.0"}
     assert msg["result"]["protocolVersion"] == "2025-03-26"
     assert mcp_server._HOST == "codex"
+
+
+def test_initialize_top_level_version_negotiation():
+    """2025-11-25 客户端（DSH SDK 1.29.0）：顶层 protocolVersion 回显，会话生效。"""
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25",
+                                  "clientInfo": {"name": "dsh-mcp-client", "version": "0.0.1"},
+                                  "capabilities": {}}}, emit=out.append)
+    assert out[0]["result"]["protocolVersion"] == "2025-11-25"
+    assert mcp_server._NEGOTIATED_PROTOCOL_VERSION == "2025-11-25"
+    # 后续请求复用会话版本：tools/list 带 modern 字段
+    out.clear()
+    mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, emit=out.append)
+    listed = out[0]["result"]
+    assert listed["resultType"] == "complete"
+    assert listed["ttlMs"] > 0 and listed["cacheScope"] == "public"
+
+
+def test_initialize_unsupported_top_level_version_falls_back_to_legacy():
+    """顶层版本不在支持集 → 回 legacy 兜底（SDK 客户端可接受），不报错。"""
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2024-11-05",
+                                  "clientInfo": {"name": "codex"}}}, emit=out.append)
+    assert out[0]["result"]["protocolVersion"] == "2025-03-26"
+    assert mcp_server._NEGOTIATED_PROTOCOL_VERSION == "2025-03-26"
+
+
+def test_tools_list_returns_full_set_without_declared_use():
+    """默认全量 16 工具：legacy 客户端与未声明 used 的客户端均完整可见。"""
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25"}}, emit=out.append)
+    out.clear()
+    mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, emit=out.append)
+    names = [t["name"] for t in out[0]["result"]["tools"]]
+    assert len(names) == 16
+    for expect in ("spawn_agent", "wait_agent", "estimate_complexity", "send_message",
+                   "steer_agent", "followup_task", "interrupt_agent", "list_agents",
+                   "get_agent_activity", "get_token_usage", "memory_store", "memory_recall",
+                   "orchestrate_task", "policy_list", "policy_add", "policy_state"):
+        assert expect in names
+
+
+def test_tools_list_2026_stateless_declared_use_prunes():
+    """2026-07-28 无状态客户端显式声明 used 时才裁剪，通用四件常驻。"""
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                       "params": {"_meta": {
+                           "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                           "io.modelcontextprotocol/clientCapabilities": {"extensions": {
+                               "io.modelcontextprotocol/tools": {"used": ["send_message"]}}}}}},
+                      emit=out.append)
+    names = [t["name"] for t in out[0]["result"]["tools"]]
+    assert set(names) == {"spawn_agent", "wait_agent", "interrupt_agent",
+                          "estimate_complexity", "send_message"}
 
 
 def test_tools_list_has_sixteen_tools_in_order():
@@ -81,7 +140,7 @@ def test_server_discover_advertises_dual_era_and_task_extension():
                                "io.modelcontextprotocol/tasks": {}}}}}}, emit=out.append)
     result = out[0]["result"]
     assert result["resultType"] == "complete"
-    assert result["supportedVersions"] == ["2026-07-28", "2025-03-26"]
+    assert result["supportedVersions"] == ["2026-07-28", "2025-11-25", "2025-03-26"]
     assert "io.modelcontextprotocol/tasks" in result["capabilities"]["extensions"]
     assert result["ttlMs"] > 0 and result["cacheScope"] == "public"
 
@@ -104,7 +163,7 @@ def test_modern_request_rejects_unsupported_protocol_version():
                            "io.modelcontextprotocol/protocolVersion": "1900-01-01",
                            "io.modelcontextprotocol/clientCapabilities": {}}}}, emit=out.append)
     assert out[0]["error"]["code"] == -32022
-    assert out[0]["error"]["data"]["supported"] == ["2026-07-28", "2025-03-26"]
+    assert out[0]["error"]["data"]["supported"] == ["2026-07-28", "2025-11-25", "2025-03-26"]
 
 
 def test_steer_agent_tool_maps_to_daemon():
@@ -129,12 +188,37 @@ def test_modern_spawn_with_tasks_capability_returns_flat_durable_task(monkeypatc
                            "target_cli": "claude", "prompt": "x", "cwd": "/tmp"},
                            "_meta": _modern_task_meta()}}, emit=out.append)
     task = out[0]["result"]
-    assert task["resultType"] == "task"
+    # 2026-07-28 resultType 枚举：complete/input_required（任务句柄用 complete，状态由 status 表达）
+    assert task["resultType"] == "complete"
     assert "task" not in task
     assert task["taskId"] == "agent:7"
     assert task["status"] == "working"
     assert task["createdAt"] == "2026-08-04T10:00:00+00:00"
     assert task["lastUpdatedAt"] == "2026-08-04T10:00:01+00:00"
+    # 字段名对齐官方 schema（2025-11-25 SDK：ttl / pollInterval）
+    assert task["ttl"] == 604_800_000
+    assert task["pollInterval"] == 1000
+
+
+def test_2025_11_25_client_capabilities_tasks_enables_task_methods(monkeypatch):
+    """2025-11-25 客户端在 initialize 的 capabilities.tasks 声明（experimental）→ tasks 方法可用。"""
+    monkeypatch.setattr(mcp_server, "call_tool", lambda name, args: {
+        "agent_id": 7, "status": "running",
+        "created_at": "2026-08-04T10:00:00+00:00",
+        "updated_at": "2026-08-04T10:00:01+00:00"})
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25",
+                                  "capabilities": {"tasks": {"list": {}, "cancel": {}}}}},
+                      emit=out.append)
+    assert mcp_server._CLIENT_TASKS_CAPABLE is True
+    out.clear()
+    mcp_server.handle({"jsonrpc": "2.0", "id": 12, "method": "tasks/get",
+                       "params": {"taskId": "agent:7"}}, emit=out.append)
+    task = out[0]["result"]
+    assert task["taskId"] == "agent:7"
+    assert task["resultType"] == "complete"
+    assert task["ttl"] == 604_800_000
 
 
 def test_tasks_get_is_complete_flat_task(monkeypatch):
@@ -175,7 +259,8 @@ def test_task_methods_require_negotiated_capability(method):
     out = []
     mcp_server.handle({"jsonrpc": "2.0", "id": method, "method": method,
                        "params": {"taskId": "agent:7"}}, emit=out.append)
-    assert out[0]["error"]["code"] == -32023
+    # 2026-07-28 错误码重编号：MissingRequiredClientCapability → -32021
+    assert out[0]["error"]["code"] == -32021
 
 
 @pytest.mark.parametrize("method", ["tasks/get", "tasks/update", "tasks/cancel"])
