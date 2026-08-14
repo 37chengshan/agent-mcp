@@ -76,6 +76,38 @@ function setSseDot(on){
 
 /* ---------- Header 胶囊（实时全局统计） ---------- */
 
+function applyTheme(theme){
+  // theme: "dark" | "light" | null（跟随系统）
+  const root = document.documentElement;
+  if(theme === "dark"){ root.dataset.theme = "dark"; }
+  else if(theme === "light"){ root.dataset.theme = "light"; }
+  else { delete root.dataset.theme; }
+  const btn = document.getElementById("am-theme-btn");
+  if(btn) btn.textContent = currentTheme() === "dark" ? "☀" : "☾";
+}
+
+function currentTheme(){
+  const t = document.documentElement.dataset.theme;
+  if(t) return t;
+  return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function bindThemeToggle(){
+  const btn = document.getElementById("am-theme-btn");
+  if(!btn) return;
+  btn.addEventListener("click", () => {
+    const next = currentTheme() === "dark" ? "light" : "dark";
+    localStorage.setItem("am-theme", next);
+    applyTheme(next);
+  });
+  // 初始化：localStorage 优先，其次跟随系统
+  const saved = localStorage.getItem("am-theme");
+  applyTheme(saved || null);
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if(!localStorage.getItem("am-theme")) applyTheme(null);
+  });
+}
+
 async function refreshHeaderCapsules(){
   if(!headerEl) return;
   try{
@@ -113,6 +145,7 @@ function buildDom(){
       <span class="am-hdr-brand">Agent MCP <span class="am-hdr-brand-sub">仪表盘</span></span>
       <span class="am-hdr-caps"></span>
       <span class="am-hdr-right">
+        <button class="am-theme-btn" id="am-theme-btn" type="button" title="切换明暗主题">☾</button>
         <span class="am-dot" title="SSE 未连接"></span>
         <button class="am-stage-close" id="am-stage-close" title="关闭仪表盘（Esc）">✕</button>
       </span>
@@ -225,6 +258,7 @@ export function init(){
   injectCss();
   buildDom();
   getSse();
+  bindThemeToggle();
   window.__amOpenDashboard = (key) => { openPane(key || currentKey || NAV[0].key); };
   const btn = document.getElementById("dashboard-btn");
   if(btn) btn.addEventListener("click", () => { openPane(currentKey || NAV[0].key); });

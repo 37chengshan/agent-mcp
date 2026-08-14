@@ -558,3 +558,28 @@
   transition:border-color .14s,color .14s,background .14s}
 .am-chip:hover{color:var(--ink);border-color:var(--ink-soft)}
 .am-chip.active{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* ---- v4 浅色主题覆盖（data-theme=light 时覆盖 v4 硬编码深色令牌） ---- */
+:root[data-theme="light"] .am-stage{
+  --bg-deep:#F2EFE8; --bg-card:#FFFFFF; --bg-card-2:#FAF8F4;
+  --ink:#2E2A22; --ink-2:#5A5448; --ink-soft:#8B867A;
+  --line:#E2DDD2; --line-soft:#ECE8DE;
+  --accent:#C0503A; --accent-deep:#9C3D2C; --accent-soft:rgba(192,80,58,.10);
+  --grad-accent:linear-gradient(135deg,#C0503A,#D08A4F);
+  --shadow-soft:0 2px 10px rgba(46,42,34,.08); --shadow-pop:0 6px 24px rgba(46,42,34,.12);
+  --shadow-glow:0 0 24px -6px rgba(192,80,58,.35);
+}
+:root[data-theme="light"] .am-hdr,
+:root[data-theme="light"] .am-sb{background:rgba(255,255,255,.75)}
+:root[data-theme="light"] .am-nav{background:rgba(255,255,255,.4)}
+:root[data-theme="light"] .am-tok-bar i{background:linear-gradient(90deg,#C0503A,#D08A4F)}
+
+/* 切换按钮 */
+.am-theme-btn{width:28px;height:28px;border-radius:50%;border:1px solid var(--line);
+  background:transparent;color:var(--ink-2);cursor:pointer;font-size:13px;line-height:1;
+  transition:border-color .15s,color .15s,transform .2s var(--ease)}
+.am-theme-btn:hover{border-color:var(--accent);color:var(--accent);transform:rotate(20deg)}
+
+/* 深浅过渡平滑 */
+.am-stage,.am-hdr,.am-sb,.am-nav,.am-dash-card,.am-tok-stat,.am-swimlane,.am-ws-row{
+  transition:background .25s var(--ease),border-color .25s var(--ease),color .25s var(--ease)}
