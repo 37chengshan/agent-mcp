@@ -6,7 +6,7 @@ import pytest
 from agent_mcp.cli_adapters import ResumeUnsupportedError
 
 from agent_mcp.daemon_http import EventBroadcaster
-from agent_mcp.daemon_main import Dispatcher, SELF_CHECK_REMINDER
+from agent_mcp.daemon_main import (_final_summary, Dispatcher, SELF_CHECK_REMINDER)
 from agent_mcp.db import DB
 
 
@@ -695,5 +695,81 @@ def test_orphan_with_queued_followup_still_chains(tmp_path):
         assert len(calls) >= baseline  # 孤儿检测未丢失 followup（已补位或刚补位）
         text = "".join(listener["buffer"])
         assert "agent.error" in text and "worker_died" in text
+    finally:
+        d.stop()
+
+
+# ---- 终态摘要提取（_final_summary：单行巨型 JSON 会话转储场景）----
+
+def test_final_summary_extracts_from_single_line_json(tmp_path):
+    """omp 式单行巨型 JSON：FINAL_ANSWER 位于文件中部、末尾是 JSON 闭合——
+    _tail 会抓到工具结果碎片，_final_summary 必须提取到标记后的纯净正文。"""
+    big = "x" * 500_000  # 超过 256KB 采样窗口
+    session = json.dumps({"type": "session", "messages": [
+        {"role": "assistant", "content": [{"type": "tool_result",
+                                           "text": "README 内容很长..."}]},
+        {"role": "assistant",
+         "content": [{"type": "text",
+                      "text": "FINAL_ANSWER: Agent MCP 是多 Agent 编排基础设施。"}]},
+        {"isTerminal": True}], "isTerminal": True}, ensure_ascii=False)
+    out = tmp_path / "omp-0.out.log"
+    out.write_text(big + session, encoding="utf-8")
+    s = _final_summary(out, 600)
+    assert s == "Agent MCP 是多 Agent 编排基础设施。", repr(s)
+
+
+def test_final_summary_falls_back_to_tail_without_marker(tmp_path):
+    out = tmp_path / "plain.out.log"
+    out.write_text("plain text output line1\nline2\n", encoding="utf-8")
+    assert _final_summary(out, 600) == "plain text output line1\nline2\n"
+
+
+def test_final_summary_keeps_quotes_in_multiline_text(tmp_path):
+    """多行文本（含换行）不触发单行 JSON 边界截断：引号原样保留。"""
+    out = tmp_path / "ml.out.log"
+    out.write_text("FINAL_ANSWER: 他说 \"你好\"，完成了。\nBLOCKED: 卡住\n", encoding="utf-8")
+    assert _final_summary(out, 600) == '他说 "你好"，完成了。'
+
+
+def test_final_summary_missing_file_returns_empty(tmp_path):
+    assert _final_summary(tmp_path / "nope.out.log", 600) == ""
+
+
+# ---- wait summary 兜底（_last_event_payload：事件量超 events_since 默认 limit）----
+
+def test_last_event_payload_finds_latest_beyond_events_since_limit(tmp_path):
+    """events_since 默认 limit=1000 取最早 1000 条；真实库事件超限后，
+    按会话过滤 + 大 limit 仍须取到最新的 terminated 事件。"""
+    fake, _ = _fake_spawn(tmp_path)
+    d, db, bc = _make(tmp_path, spawn_fn=fake)
+    d.start()
+    try:
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        aid = a["agent_id"]
+        sid = a["session_id"]
+        # 塞入 1050 条历史事件（覆盖 events_since 默认 limit）
+        for i in range(1050):
+            db.insert_event(agent_id=aid, type="agent.message",
+                            payload={"text": f"h{i}"}, session_id=sid)
+        # 最新 terminated 事件（真实兜底目标）
+        db.insert_event(agent_id=aid, type="agent.terminated",
+                        payload={"summary": "最新摘要"}, session_id=sid)
+        payload = d._last_event_payload(aid, "agent.terminated", session_id=sid)
+        assert payload.get("summary") == "最新摘要"
+    finally:
+        d.stop()
+
+
+def test_last_event_payload_without_session_still_works(tmp_path):
+    """缺省（session_id=None）保持原语义：可在全量事件中找到目标事件。"""
+    fake, _ = _fake_spawn(tmp_path)
+    d, db, bc = _make(tmp_path, spawn_fn=fake)
+    d.start()
+    try:
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        aid = a["agent_id"]
+        db.insert_event(agent_id=aid, type="agent.terminated",
+                        payload={"summary": "s"}, session_id=a["session_id"])
+        assert d._last_event_payload(aid, "agent.terminated").get("summary") == "s"
     finally:
         d.stop()

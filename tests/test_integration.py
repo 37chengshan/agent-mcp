@@ -41,10 +41,11 @@ MCP_TOOL_NAMES = ["spawn_agent", "send_message", "steer_agent", "followup_task",
                   "get_agent_activity", "get_token_usage", "estimate_complexity",
                   "memory_store", "memory_recall"]
 
-# D5 静态裁剪：未声明 capability 的 client 只发现通用四件（spawn/wait/interrupt/estimate）
-PRUNED_TOOL_NAMES = ["spawn_agent", "wait_agent", "interrupt_agent", "estimate_complexity"]
+# v2.2.0 起：未声明 capability 的 client 默认发现全量 16 工具（legacy/2025-11-25
+# 客户端不发送 _meta extensions——DSH 全量可见）；仅 2026-07-28 客户端显式声明
+# io.modelcontextprotocol/tools.used 时才按声明裁剪（通用四件常驻）。
 
-# tools/list 的 _meta capability 声明（modern client 扩展约定），使 _pruned_tools 保留全量
+# tools/list 的 _meta capability 声明（2026-07-28 扩展约定），按声明保留对应工具
 FULL_TOOLS_META = {
     "_meta": {
         "io.modelcontextprotocol/clientCapabilities": {
@@ -406,9 +407,11 @@ def test_mcp_stdio_end_to_end(mcp_proc):
 
 
 @pytest.mark.integration
-def test_mcp_tools_pruned_for_undeclared_client(mcp_proc):
-    """D5 契约：未声明 capability 的 client 在 tools/list 只发现通用四件；
-    但 tools/call 不拦截未声明工具（裁剪只影响发现，不影响调用）。"""
+def test_mcp_tools_full_for_undeclared_client(mcp_proc):
+    """v2.2.0 契约：未声明 capability 的 client 在 tools/list 发现全量 16 工具
+    （legacy/2025-11-25 客户端不发送 _meta extensions，默认全量——DSH 全量可见）；
+    仅 2026-07-28 客户端显式声明 used 时才裁剪（见 test_mcp_tools_pruned_by_declared_use）。
+    tools/call 始终不拦截任何工具（裁剪只影响发现，不影响调用）。"""
     proc, q = mcp_proc["proc"], mcp_proc["q"]
 
     init = _rpc(proc, q, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -418,7 +421,26 @@ def test_mcp_tools_pruned_for_undeclared_client(mcp_proc):
 
     tools = _rpc(proc, q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = [t["name"] for t in tools["result"]["tools"]]
-    assert names == PRUNED_TOOL_NAMES
+    assert len(names) == 16
+    for expect in MCP_TOOL_NAMES + ["orchestrate_task", "policy_list",
+                                    "policy_add", "policy_state"]:
+        assert expect in names
+
+
+@pytest.mark.integration
+def test_mcp_tools_pruned_by_declared_use(mcp_proc):
+    """2026-07-28 无状态客户端显式声明 tools.used 时按声明裁剪（通用四件常驻）。"""
+    proc, q = mcp_proc["proc"], mcp_proc["q"]
+
+    tools = _rpc(proc, q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                           "params": {"_meta": {
+                               "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                               "io.modelcontextprotocol/clientCapabilities": {"extensions": {
+                                   "io.modelcontextprotocol/tools": {
+                                       "used": ["send_message", "steer_agent"]}}}}}})
+    names = [t["name"] for t in tools["result"]["tools"]]
+    assert set(names) == {"spawn_agent", "wait_agent", "interrupt_agent",
+                          "estimate_complexity", "send_message", "steer_agent"}
 
 
 # ---- 性能：常驻内存 ----

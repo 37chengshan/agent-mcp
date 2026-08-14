@@ -820,3 +820,46 @@ def test_state_dir_prefers_agent_mcp_home_over_codex_home(monkeypatch):
     assert mcp_server.state_dir_from_env() == Path("/tmp/codexhome") / "agent-mcp"
     monkeypatch.setenv("AGENT_MCP_HOME", "/tmp/amh")
     assert mcp_server.state_dir_from_env() == Path("/tmp/amh") / "agent-mcp"
+
+
+# ---- 2025-11-25 协商后 tools/call 的 modern 结果 ----
+
+def test_2025_11_25_tools_call_has_structured_content(monkeypatch):
+    """2025-11-25 客户端（DSH）协商后：tools/call 结果带 structuredContent 与 resultType，
+    且普通工具（非 spawn+task）不返回 task handle。"""
+    monkeypatch.setattr(mcp_server, "call_tool", lambda name, args: {
+        "status": "ok", "level": "S", "rationale": "单文件小改"})
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25",
+                                  "clientInfo": {"name": "dsh-mcp-client"},
+                                  "capabilities": {}}}, emit=out.append)
+    assert out[0]["result"]["protocolVersion"] == "2025-11-25"
+    out.clear()
+    mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "estimate_complexity",
+                                  "arguments": {"task": "小改"}}}, emit=out.append)
+    result = out[0]["result"]
+    assert result["resultType"] == "complete"
+    assert result["structuredContent"] == {"status": "ok", "level": "S",
+                                           "rationale": "单文件小改"}
+    assert "taskId" not in result  # 未声明 tasks 能力 → 普通结果路径
+    assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "agent-mcp"
+
+
+def test_2025_11_25_tools_call_error_still_marks_is_error(monkeypatch):
+    """2025-11-25 下 daemon 错误仍走 isError=true（DSH 桥接层依赖该语义抛错）。"""
+    monkeypatch.setattr(mcp_server, "_daemon_post",
+                        lambda path, payload, http_timeout=None: {
+                            "status": "error", "summary": "boom",
+                            "next_actions": ["check"]})
+    out = []
+    mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25"}}, emit=out.append)
+    out.clear()
+    mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "interrupt_agent",
+                                  "arguments": {"agent_id": 1}}}, emit=out.append)
+    result = out[0]["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["status"] == "error"
