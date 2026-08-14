@@ -540,7 +540,7 @@ class Handler(BaseHTTPRequestHandler):
                         .encode("utf-8"))
         if token_script not in data:
             data = data.replace(b"</head>", token_script + b"</head>", 1)
-        marker = b'<script type="module" src="/panels/loader.js?v=v2"></script>'
+        marker = b'<script type="module" src="/panels/loader.js?v=v3"></script>'
         if marker not in data:
             if b"</body>" in data:
                 data = data.replace(b"</body>", marker + b"</body>", 1)

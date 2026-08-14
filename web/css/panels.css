@@ -296,3 +296,83 @@
 .am-topdock .am-tab{transition:color .15s,background .15s,transform .15s}
 .am-topdock .am-tab:hover{transform:translateY(-1px)}
 .am-topdock .am-tab.active{transform:none}
+
+/* ============================================================
+ * v3 完整仪表盘：总览卡片 / 运行中 / 活动流 / Token 用量
+ * ============================================================ */
+
+/* 统计卡片网格 */
+.am-dash-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.am-dash-card{
+  border:1px solid var(--line,#33322E);border-radius:var(--radius-sm,12px);
+  background:var(--card,#1E1D1A);padding:14px 16px;
+  animation:amReviewIn .3s var(--ease,cubic-bezier(.22,.61,.36,1)) backwards;
+  transition:border-color .18s,box-shadow .18s;
+}
+.am-dash-card:hover{border-color:var(--accent,#D96B4F)}
+.am-dash-card .am-dash-card-v{font:700 24px/1.1 var(--serif,Georgia,"Songti SC",serif);
+  font-variant-numeric:tabular-nums;color:var(--ink,#EAE6DC)}
+.am-dash-card .am-dash-card-k{margin-top:6px;font:9px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft,#9B958A)}
+.am-dash-card .am-dash-card-s{margin-top:4px;font-size:10px;color:var(--ink-soft,#9B958A)}
+.am-dash-card.run .am-dash-card-v{color:var(--accent,#D96B4F)}
+.am-dash-card.err .am-dash-card-v{color:var(--red,#D96B5C)}
+.am-dash-card.ok .am-dash-card-v{color:var(--green,#6FA587)}
+.am-dash-card-v.am-live{animation:amBreathe 1.8s ease-in-out infinite}
+
+/* 运行中 agent 行 */
+.am-dash-running{display:flex;flex-direction:column;gap:6px}
+.am-dash-run{display:flex;align-items:center;gap:8px;padding:8px 10px;
+  border:1px solid var(--line,#33322E);border-radius:10px;background:var(--card,#1E1D1A)}
+.am-dash-run .am-dot-live{display:inline-block;width:7px;height:7px;border-radius:50%;
+  background:var(--accent,#D96B4F);animation:amBreathe 1.4s ease-in-out infinite;flex:0 0 auto}
+.am-dash-run .am-dash-run-t{min-width:0;flex:1;font-size:11.5px;color:var(--ink,#EAE6DC);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 最近活动流 */
+.am-dash-events{display:flex;flex-direction:column}
+.am-ev-row{display:grid;grid-template-columns:58px 62px minmax(90px,140px) 1fr;gap:8px;
+  align-items:center;padding:6px 2px;border-bottom:1px solid var(--line-soft,#2A2925);
+  font-size:10.5px}
+.am-ev-row:last-child{border-bottom:0}
+.am-ev-time{font:9px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-soft,#9B958A)}
+.am-ev-type{font:9px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  color:var(--ink-soft,#9B958A);letter-spacing:.04em}
+.am-ev-agent{font:10px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.am-ev-text{color:var(--ink-soft,#9B958A);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Token 用量统计卡 */
+.am-tok-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.am-tok-stat{border:1px solid var(--line,#33322E);border-radius:var(--radius-sm,12px);
+  background:var(--card,#1E1D1A);padding:12px 14px;text-align:center;
+  animation:amReviewIn .3s var(--ease,cubic-bezier(.22,.61,.36,1)) backwards}
+.am-tok-stat b{display:block;font:700 17px/1.2 var(--serif,Georgia,"Songti SC",serif);
+  font-variant-numeric:tabular-nums;color:var(--ink,#EAE6DC)}
+.am-tok-stat span{display:block;margin-top:5px;font:8.5px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft,#9B958A)}
+.am-tok-stat.in b{color:var(--green,#6FA587)}
+.am-tok-stat.out b{color:var(--accent,#D96B4F)}
+.am-tok-stat.cache b{color:var(--amber,#C9A34F)}
+.am-tok-stat.sum b{color:var(--ink,#EAE6DC)}
+.am-tok-stat.cost b{color:var(--red,#D96B5C)}
+.am-tok-stat.et b{color:var(--opencode,#6FA587)}
+
+/* Token 明细表 */
+.am-tok-table{width:100%;border-collapse:collapse;font-size:10.5px}
+.am-tok-table th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line,#33322E);
+  color:var(--ink-soft,#9B958A);font:700 8.5px/1 var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  letter-spacing:.1em;text-transform:uppercase}
+.am-tok-table td{padding:7px 8px;border-bottom:1px solid var(--line-soft,#2A2925);vertical-align:middle}
+.am-tok-table tr:hover td{background:var(--accent-soft,#3A241E)}
+.am-tok-id{font:9.5px var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);color:var(--ink-soft,#9B958A)}
+.am-tok-task{display:flex;align-items:center;gap:6px;min-width:0;max-width:260px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink,#EAE6DC)}
+.am-tok-num{font:10px var(--mono,"SF Mono",ui-monospace,Menlo,Consolas,monospace);
+  font-variant-numeric:tabular-nums;color:var(--ink-soft,#9B958A);text-align:right}
+.am-tok-bar-cell{width:120px}
+.am-tok-bar{height:6px;border-radius:3px;background:var(--line-soft,#2A2925);overflow:hidden}
+.am-tok-bar i{display:block;height:100%;border-radius:3px;
+  background:linear-gradient(90deg,var(--accent,#D96B4F),var(--amber,#C9A34F));
+  transition:width .5s var(--ease,cubic-bezier(.22,.61,.36,1))}
+.am-tok-count{color:var(--ink-soft,#9B958A);font-size:10px;margin-left:auto}

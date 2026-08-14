@@ -185,7 +185,7 @@ def test_policies_and_workspaces_get_require_token(server):
 def test_index_injects_panel_loader(server):
     code, html = get(server, "/")
     assert code == 200
-    assert '<script type="module" src="/panels/loader.js?v=v2"></script>' in html
+    assert '<script type="module" src="/panels/loader.js?v=v3"></script>' in html
     assert "Conversation graph" in html  # 原页面内容保留
     assert "window.__amToken" in html  # token 注入（面板鉴权不再依赖 URL hash）
 

@@ -17,8 +17,10 @@ const CSS_URL = "/css/panels.css";
 const CSS_ID = "am-panels-css";
 // 面板模块版本化：daemon 已发 no-store，但浏览器可能仍持有 no-cache 头生效前的
 // 旧缓存响应——版本后缀保证 URL 变化必然绕过缓存（防旧模块/旧逻辑）
-const PANEL_V = "v2";
+const PANEL_V = "v3";
 const TAB_DEFS = [
+  { key: "dashboard",    label: "总览", module: `./dashboard.js?v=${PANEL_V}` },
+  { key: "tokens",       label: "Token 用量", module: `./tokens.js?v=${PANEL_V}` },
   { key: "collaboration", label: "协作泳道", module: `./collaboration.js?v=${PANEL_V}` },
   { key: "policies",      label: "策略可视化", module: `./policies.js?v=${PANEL_V}` },
   { key: "workspaces",    label: "工作区视图", module: `./workspaces.js?v=${PANEL_V}` },
