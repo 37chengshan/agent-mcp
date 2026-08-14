@@ -1,5 +1,7 @@
 # Agent MCP
 
+> **✅ 现已支持 DeepSeek Harness（DSH）** —— 16 个 MCP 工具可直接在 DSH AI 会话中使用（`mcp__agentmcp__*`），一行 patch 即接入。
+
 ## 🟦 原生支持 DeepSeek Harness（DSH）
 
 **在 DeepSeek Harness 的 AI 会话中直接用上 agent-mcp 的全部 16 个 MCP 工具**（`mcp__agentmcp__spawn_agent` / `wait_agent` / `estimate_complexity` / `steer_agent` / `followup_task` / `memory_store` / `memory_recall` …）：DSH 以 stdio transport 直连 `mcp_server.py`，**一行 `insert` patch 即接入**——零插件开发、零代码改造；daemon 未起时自动原子拉起，子进程崩溃自动指数退避重连，重启后会话可续接。协议层对齐 **MCP 2026-07-28 最新规范**（无状态核心、`server/discover`、tasks 扩展、structuredContent），同时兼容 2025-11-25（DSH SDK 1.29.0 实际协商版本）与 2025-03-26 legacy 客户端。
