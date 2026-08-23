@@ -1,6 +1,6 @@
-# Agent MCP
+# Agent MCP v1.0.0 (Major Release)
 
-> **✅ 现已支持 DeepSeek Harness（DSH）** —— 16 个 MCP 工具可直接在 DSH AI 会话中使用（`mcp__agentmcp__*`），一行 patch 即接入。
+> **✅ 现已支持 DeepSeek Harness（DSH）与企业级多 Agent 协作** —— 动态编排、自动演进、P2P 协作信箱、隔离沙箱、混合召回记忆系统、MCP 资源与提示词全协议对齐。
 
 ## 🟦 原生支持 DeepSeek Harness（DSH）
 

@@ -109,3 +109,45 @@ def sandbox_env_for(cli: str, policy_env: str = "readonly") -> dict[str, Any]:
     args = map_sandbox(policy_env, cli)
     limits = process_fallback_args() if requires_process_fallback(cli, policy_env) else {}
     return {"args": args, "process_limits": limits, "cli": cli, "env": policy_env}
+
+
+def build_container_sandbox_command(
+    cmd_args: list[str],
+    *,
+    engine: str = "docker",  # docker or podman
+    image: str = "python:3.12-slim",
+    cwd: str = "/workspace",
+    read_only: bool = False,
+    network_disabled: bool = False,
+    memory_limit: str = "2g",
+    cpus: float = 2.0,
+    mount_cwd: str | None = None,
+) -> list[str]:
+    """将普通 CLI 命令包装为 Docker/Podman 容器化隔离执行命令。
+
+    设计原则：
+    - 支持 docker / podman 双引擎
+    - --rm: 退出即销毁容器
+    - -v {host_dir}:{container_dir}:rw/ro: 挂载目标工作区
+    - --read-only: 容器根文件系统只读（可选）
+    - --network=none: 禁用外网（可选，用于严格只读/离线安全审计）
+    - --memory / --cpus: 硬件配额硬限制
+    """
+    container_cmd = [engine, "run", "--rm", "-i"]
+    if mount_cwd:
+        mode = "ro" if read_only else "rw"
+        container_cmd.extend(["-v", f"{os.path.abspath(mount_cwd)}:{cwd}:{mode}"])
+    container_cmd.extend(["-w", cwd])
+
+    if read_only:
+        container_cmd.append("--read-only")
+    if network_disabled:
+        container_cmd.extend(["--network", "none"])
+    if memory_limit:
+        container_cmd.extend(["--memory", memory_limit])
+    if cpus:
+        container_cmd.extend(["--cpus", str(cpus)])
+
+    container_cmd.append(image)
+    container_cmd.extend(cmd_args)
+    return container_cmd

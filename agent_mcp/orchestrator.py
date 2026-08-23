@@ -46,6 +46,12 @@ class OrchestratedTask:
     review: str = ""
     error: str = ""
     worktree_path: str = ""
+    # v0.4 动态自优化与自愈
+    max_retries: int = 0
+    retry_count: int = 0
+    refinement_prompt: str | None = None  # 审查未通过时的二次修正提示模版
+    on_complete_hook: Callable[[OrchestratedTask, list[OrchestratedTask]], None] | None = None
+
 
     def to_dict(self) -> dict[str, Any]:
         return {k: (v if not isinstance(v, list) else list(v))
@@ -155,22 +161,49 @@ class Orchestrator:
             task.status = STATUS_FAILED
             self._cleanup_worktree(task)
 
-    def _review_task(self, task: OrchestratedTask) -> None:
-        """跨厂商审查：把写者输出摘要交给 review_by 指定的不同厂商 cli。"""
+    def _review_and_refine_task(self, task: OrchestratedTask) -> None:
+        """跨厂商审查与自动反馈闭环 (Auto-Refinement loop)。"""
         if not task.review_by or task.status != STATUS_DONE:
             return
         prompt = (f"请审查以下 agent 输出（写者 CLI: {task.cli}）。"
                   f"输出摘要：\n{task.output[:2000]}\n"
-                  f"请给出：1) 正确性结论 2) 问题清单 3) 改进建议。")
+                  f"请给出：1) 正确性结论 2) 问题清单 3) 改进建议。"
+                  f"若存在严重缺陷且需要返工，请在回复首行输出 [REJECT]，否则输出 [APPROVE]。")
         try:
             agent_id = self.spawner(prompt, task.review_by, None)
             result = self.waiter(agent_id)
-            task.review = str(result.get("summary") or "")
+            review_text = str(result.get("summary") or "")
+            task.review = review_text
+            
+            # 如果审查拒绝且允许重试修正
+            if "[REJECT]" in review_text and task.retry_count < task.max_retries:
+                task.retry_count += 1
+                refine_prompt = (
+                    f"前次执行未通过跨厂商审查（审查者: {task.review_by}）。\n"
+                    f"审查意见：\n{review_text[:1500]}\n"
+                    f"原始需求：\n{task.prompt}\n"
+                    f"请根据审查意见进行针对性修复并重新完成任务。"
+                )
+                cwd = task.worktree_path or None
+                new_agent_id = self.spawner(refine_prompt, task.cli, cwd)
+                new_result = self.waiter(new_agent_id)
+                new_summary = str(new_result.get("summary") or "")
+                new_status = str(new_result.get("status") or "error")
+                if new_status in ("terminated", "completed"):
+                    task.output = new_summary
+                    task.agent_id = new_agent_id
+                    # 递归二次审查
+                    self._review_and_refine_task(task)
+                else:
+                    task.error = f"重试修复失败: {new_summary}"
+                    task.status = STATUS_FAILED
+                    self._cleanup_worktree(task)
         except Exception as exc:  # noqa: BLE001
             task.review = f"审查失败: {exc}"
 
     def run(self) -> dict[str, Any]:
         """执行全部任务：按依赖拓扑推进，就绪任务并行 spawn。
+        支持在节点完成时动态挂载新任务（Dynamic Task Injection）。
         返回 {tasks: [...], failed: [...], done: [...]}。"""
         errors = self._validate()
         if errors:
@@ -191,9 +224,19 @@ class Orchestrator:
                 break
             with ThreadPoolExecutor(max_workers=min(self.max_workers, len(ready))) as pool:
                 list(pool.map(self._spawn_one, ready))
-            # 审查阶段（写者完成后串行补审）
+            # 审查与自动精炼阶段
             for t in ready:
-                self._review_task(t)
+                self._review_and_refine_task(t)
+                if t.status == STATUS_DONE and t.on_complete_hook:
+                    new_tasks: list[OrchestratedTask] = []
+                    try:
+                        t.on_complete_hook(t, new_tasks)
+                        for nt in new_tasks:
+                            if nt.task_id not in self.tasks:
+                                self.tasks[nt.task_id] = nt
+                                pending.add(nt.task_id)
+                    except Exception as exc:  # noqa: BLE001
+                        t.error = f"on_complete_hook 执行异常: {exc}"
             pending -= {t.task_id for t in ready}
 
         return {

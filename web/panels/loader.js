@@ -12,7 +12,7 @@
 const SSE_URL = "/api/events";
 const CSS_URL = "/css/panels.css";
 const CSS_ID = "am-panels-css";
-const PANEL_V = "v4";
+const PANEL_V = "v5";
 
 const NAV = [
   { key: "dashboard",     label: "总览",       icon: "◧", module: `./dashboard.js?v=${PANEL_V}` },
@@ -20,6 +20,7 @@ const NAV = [
   { key: "collaboration", label: "协作泳道",   icon: "≋", module: `./collaboration.js?v=${PANEL_V}` },
   { key: "policies",      label: "策略可视化", icon: "◈", module: `./policies.js?v=${PANEL_V}` },
   { key: "workspaces",    label: "工作区视图", icon: "▤", module: `./workspaces.js?v=${PANEL_V}` },
+  { key: "mailbox",       label: "信箱与治理", icon: "✉", module: `./mailbox.js?v=${PANEL_V}` },
 ];
 
 let inited = false;

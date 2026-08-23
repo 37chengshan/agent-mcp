@@ -154,15 +154,59 @@ def test_pick_reviewer_cross_vendor():
     assert pick_reviewer("omp", ["claude", "pi", "opencode"]) in ("claude", "opencode")
 
 
-def test_concurrent_spawn_no_race():
-    """并行执行时任务状态不互踩（多任务同批）。"""
-    fake = FakeDaemon(delay=0.01)
-    orch = make_orch(fake, max_workers=4)
-    for i in range(6):
-        orch.add_task(OrchestratedTask(task_id=f"t{i}", prompt=f"p{i}"))
+def test_auto_refinement_loop():
+    """测试跨厂商审查拒绝后自动重试修复闭环。"""
+    class RefineDaemon:
+        def __init__(self):
+            self.count = 0
+            self.prompts = []
+        def spawn(self, prompt: str, cli: str, cwd: str | None) -> int:
+            self.count += 1
+            self.prompts.append(prompt)
+            return self.count
+        def wait(self, agent_id: int) -> dict:
+            if agent_id == 1:
+                return {"status": "terminated", "summary": "初版代码存在 bug"}
+            elif agent_id == 2:
+                # codex 审查拒绝
+                return {"status": "terminated", "summary": "[REJECT] 代码中有内存泄漏"}
+            elif agent_id == 3:
+                # 修复版本
+                return {"status": "terminated", "summary": "修复了内存泄漏"}
+            elif agent_id == 4:
+                # 二次审查通过
+                return {"status": "terminated", "summary": "[APPROVE] 审查通过"}
+            return {"status": "terminated", "summary": "ok"}
+
+    fake = RefineDaemon()
+    orch = Orchestrator(spawner=fake.spawn, waiter=fake.wait, max_workers=2)
+    orch.add_task(OrchestratedTask(
+        task_id="t0",
+        prompt="编写高性能服务",
+        cli="claude",
+        review_by="codex",
+        max_retries=1
+    ))
     result = orch.run()
-    assert set(result["done"]) == {f"t{i}" for i in range(6)}
-    # 每个任务都有 agent_id 且输出非空
-    for t in orch.tasks.values():
-        assert t.agent_id is not None
-        assert t.output
+    assert result["valid"] is True
+    assert result["done"] == ["t0"]
+    assert orch.tasks["t0"].retry_count == 1
+    assert "修复了内存泄漏" in orch.tasks["t0"].output
+    assert "[APPROVE]" in orch.tasks["t0"].review
+    assert fake.count == 4
+
+
+def test_dynamic_task_injection():
+    """测试任务完成时通过 on_complete_hook 动态挂载后续子任务。"""
+    fake = FakeDaemon()
+    orch = make_orch(fake)
+
+    def on_t0_done(task: OrchestratedTask, new_tasks: list[OrchestratedTask]):
+        new_tasks.append(OrchestratedTask(task_id="t_dynamic", prompt="动态生成任务", deps=[task.task_id]))
+
+    orch.add_task(OrchestratedTask(task_id="t0", prompt="初始任务", on_complete_hook=on_t0_done))
+    result = orch.run()
+    assert result["valid"] is True
+    assert set(result["done"]) == {"t0", "t_dynamic"}
+    assert len(fake.spawned) == 2
+

@@ -52,6 +52,28 @@ CREATE TABLE IF NOT EXISTS project_memory (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_session_kind ON project_memory(session_id, kind);
 CREATE INDEX IF NOT EXISTS idx_memory_session_created ON project_memory(session_id, created_at);
+CREATE TABLE IF NOT EXISTS file_diffs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  change_type TEXT NOT NULL,
+  diff_content TEXT NOT NULL,
+  applied INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_file_diffs_agent ON file_diffs(agent_id);
+CREATE TABLE IF NOT EXISTS agent_mailbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  team_id TEXT NOT NULL,
+  from_agent_id INTEGER NOT NULL,
+  to_agent_id INTEGER,
+  message TEXT NOT NULL,
+  msg_type TEXT NOT NULL DEFAULT 'text',
+  read_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mailbox_team_to ON agent_mailbox(team_id, to_agent_id);
 """
 
 # F7: verbose 层 payload 超 2KB 存 gzip 压缩；authority 层不压（查频高）
@@ -100,7 +122,7 @@ class DB:
                 except OSError:
                     pass
 
-    # ---- F2: 每线程独立连接池 ----
+    # ---- F2: 每线程独立连接池与并发安全 ----
 
     def _new_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), check_same_thread=False)
@@ -111,19 +133,16 @@ class DB:
         return conn
 
     def _conn(self) -> sqlite3.Connection:
-        """取本线程连接；无则建并注册（上限 _MAX_DB_CONNECTIONS，超限退回共享 init_conn）。"""
+        """取本线程独占连接；若无则新建并注册。"""
         c = getattr(self._local, "conn", None)
         if c is not None:
             return c
         with self._conn_lock:
-            if len(self._conns) < _MAX_DB_CONNECTIONS:
-                c = self._new_conn()
-                self._conns[id(c)] = c
-                self._conn_last_used[id(c)] = time.monotonic()
-                self._local.conn = c
-                return c
-        # 池满：退回 schema 初始化连接（仍由 self._lock 写锁串行保护）
-        return self._init_conn
+            c = self._new_conn()
+            self._conns[id(c)] = c
+            self._conn_last_used[id(c)] = time.monotonic()
+            self._local.conn = c
+            return c
 
     def _close_idle_conns(self) -> None:
         """低频清理：关闭空闲超 _DB_CONN_IDLE_TIMEOUT 的非本线程连接。"""
@@ -507,24 +526,80 @@ class DB:
 
     def recall_memories(self, session_id: str, *, query: str | None = None,
                         kind: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
-        """检索记忆：query 关键词 LIKE 命中 content/key/tags，可按 kind 过滤，
-        按 created_at DESC 收敛 limit 条（同 session 隔离）。"""
+        """检索记忆：支持多关键词加权打分与 SQL 混合召回，按匹配分 + 时间排序（同 session 隔离）。"""
         where = ["session_id=?"]
         params: list[Any] = [session_id]
-        if query:
-            like = f"%{query}%"
-            where.append("(content LIKE ? OR key LIKE ? OR tags LIKE ?)")
-            params += [like, like, like]
         if kind:
             where.append("kind=?")
             params.append(kind)
+
         conn = self._conn()
+        if not query:
+            rows = conn.execute(
+                "SELECT id, kind, key, content, tags, created_at, source FROM project_memory"
+                " WHERE " + " AND ".join(where)
+                + " ORDER BY created_at DESC, id DESC LIMIT ?",
+                params + [limit]).fetchall()
+            return [dict(r) for r in rows]
+
+        keywords = [kw.strip().lower() for kw in query.split() if kw.strip()]
+        if not keywords:
+            rows = conn.execute(
+                "SELECT id, kind, key, content, tags, created_at, source FROM project_memory"
+                " WHERE " + " AND ".join(where)
+                + " ORDER BY created_at DESC, id DESC LIMIT ?",
+                params + [limit]).fetchall()
+            return [dict(r) for r in rows]
+
+        # 候选集筛选：使用 OR LIKE 在 SQL 层初步过滤，并限制最多 200 条候选以防止全表载入内存
+        kw_conditions = []
+        kw_params: list[Any] = []
+        for kw in keywords:
+            kw_conditions.append("(key LIKE ? OR tags LIKE ? OR content LIKE ?)")
+            kw_params.extend([f"%{kw}%", f"%{kw}%", f"%{kw}%"])
+
+        candidate_where = list(where)
+        candidate_where.append("(" + " OR ".join(kw_conditions) + ")")
+        candidate_params = params + kw_params
+
         rows = conn.execute(
             "SELECT id, kind, key, content, tags, created_at, source FROM project_memory"
-            " WHERE " + " AND ".join(where)
-            + " ORDER BY created_at DESC, id DESC LIMIT ?",
-            params + [limit]).fetchall()
-        return [dict(r) for r in rows]
+            " WHERE " + " AND ".join(candidate_where)
+            + " ORDER BY created_at DESC, id DESC LIMIT 200",
+            candidate_params).fetchall()
+
+        memories = [dict(r) for r in rows]
+        if not memories:
+            return []
+
+        # 内存精排：基于关键词匹配字段加权
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for mem in memories:
+            score = 0.0
+            content_lower = (mem.get("content") or "").lower()
+            key_lower = (mem.get("key") or "").lower()
+            tags_lower = (mem.get("tags") or "").lower()
+
+            for kw in keywords:
+                # 键名精确命中权重最高
+                if kw == key_lower:
+                    score += 10.0
+                elif kw in key_lower:
+                    score += 5.0
+                # 标签精确命中权重高
+                if kw in tags_lower:
+                    score += 4.0
+                # 内容包含
+                if kw in content_lower:
+                    count = content_lower.count(kw)
+                    score += 1.0 + min(count * 0.5, 3.0)
+
+            if score > 0:
+                scored.append((score, mem))
+
+        # 按打分降序排列，分数相同时按时间倒序
+        scored.sort(key=lambda x: (x[0], x[1]["created_at"]), reverse=True)
+        return [item[1] for item in scored[:limit]]
 
     def spawn_cache_get(self, key: str) -> dict[str, Any] | None:
         """命中返回 {result: dict, agent_id: int}；过期/缺失返回 None，并惰清过期项。"""
@@ -624,6 +699,108 @@ class DB:
         conn.commit()
         # F2: 顺手清理空闲超阈的非本线程连接
         self._close_idle_conns()
+
+    def record_file_diff(self, agent_id: int, session_id: str, file_path: str,
+                         change_type: str, diff_content: str, *,
+                         applied: bool = True) -> int:
+        """记录 Agent 产生的文件变更 Diff。"""
+        now = self._utc()
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO file_diffs (agent_id, session_id, file_path, change_type, diff_content, applied, created_at)"
+                    " VALUES (?,?,?,?,?,?,?)",
+                    (agent_id, session_id, file_path, change_type, diff_content, 1 if applied else 0, now))
+                conn.commit()
+                return int(cur.lastrowid)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_file_diffs(self, *, agent_id: int | None = None, session_id: str | None = None) -> list[dict[str, Any]]:
+        """查询文件 Diff 记录。"""
+        where = []
+        params: list[Any] = []
+        if agent_id is not None:
+            where.append("agent_id=?")
+            params.append(agent_id)
+        if session_id is not None:
+            where.append("session_id=?")
+            params.append(session_id)
+        conn = self._conn()
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        rows = conn.execute(
+            f"SELECT id, agent_id, session_id, file_path, change_type, diff_content, applied, created_at FROM file_diffs{clause} ORDER BY id ASC",
+            params).fetchall()
+        return [dict(r) for r in rows]
+
+    def mailbox_send(self, team_id: str, from_agent_id: int, message: str, *,
+                     to_agent_id: int | None = None, msg_type: str = "text") -> int:
+        """往信箱发送一条消息。"""
+        now = self._utc()
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO agent_mailbox (team_id, from_agent_id, to_agent_id, message, msg_type, created_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (team_id, from_agent_id, to_agent_id, message, msg_type, now))
+                conn.commit()
+                return int(cur.lastrowid)
+            except Exception:
+                conn.rollback()
+                raise
+
+    def mailbox_fetch(self, team_id: str, agent_id: int, *,
+                      unread_only: bool = True, limit: int = 50) -> list[dict[str, Any]]:
+        """获取目标 agent 的收件箱（包括私信和组内广播）。"""
+        where = ["team_id=?", "(to_agent_id=? OR to_agent_id IS NULL)"]
+        params: list[Any] = [team_id, agent_id]
+        if unread_only:
+            where.append("read_at IS NULL")
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT id, team_id, from_agent_id, to_agent_id, message, msg_type, read_at, created_at FROM agent_mailbox"
+            " WHERE " + " AND ".join(where) + " ORDER BY id ASC LIMIT ?",
+            params + [limit]).fetchall()
+        return [dict(r) for r in rows]
+
+    def mailbox_fetch_team_messages(self, team_id: str, *, msg_type: str | None = None) -> list[dict[str, Any]]:
+        """获取团队的所有信箱记录（供共识统计/回溯）。"""
+        where = ["team_id=?"]
+        params: list[Any] = [team_id]
+        if msg_type:
+            where.append("msg_type=?")
+            params.append(msg_type)
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT id, team_id, from_agent_id, to_agent_id, message, msg_type, read_at, created_at FROM agent_mailbox"
+            " WHERE " + " AND ".join(where) + " ORDER BY id ASC",
+            params).fetchall()
+        return [dict(r) for r in rows]
+
+    def mailbox_mark_read(self, message_ids: list[int]) -> int:
+        """批量标记消息为已读。"""
+        if not message_ids:
+            return 0
+        now = self._utc()
+        placeholders = ",".join("?" for _ in message_ids)
+        with self._lock:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    f"UPDATE agent_mailbox SET read_at=? WHERE id IN ({placeholders}) AND read_at IS NULL",
+                    [now] + message_ids)
+                conn.commit()
+                return cur.rowcount or 0
+            except Exception:
+                conn.rollback()
+                raise
+
 
 def _json_dumps(payload: dict) -> str:
     import json

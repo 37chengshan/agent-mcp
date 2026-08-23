@@ -12,6 +12,7 @@ from typing import Any
 import psutil
 
 from agent_mcp.cli_adapters import get_adapter
+from agent_mcp.sandbox import build_container_sandbox_command, requires_process_fallback
 
 
 class SlotScheduler:
@@ -177,11 +178,13 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
                      max_turns: int = 8, resume: str | None = None,
                      state_dir: Path,
                      timeout_seconds: float | None = None,
-                     env: dict[str, str] | None = None) -> dict[str, Any]:
+                     env: dict[str, str] | None = None,
+                     sandbox_container: str | None = None,
+                     sandbox_network: str = "none") -> dict[str, Any]:
     """spawn 一个 CLI 任务 worker（T9 daemon 用）。
 
     流程：get_adapter → binary() 检查（缺失抛结构化 ValueError）→
-    build_command → build_worker_command → spawn_detached。
+    build_command → (可选 build_container_sandbox_command) → build_worker_command → spawn_detached。
     返回 {"worker_pid", "command_summary", "state_path", "out_path", "err_path"}；
     state_dir 下按任务生成 {cli}-{tag}.json / .out.log / .err.log（并发安全）。
     timeout_seconds 透传给 worker（超时由 worker 终止进程树并标 timed_out）。
@@ -194,6 +197,14 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
     cli_cmd = adapter.build_command(prompt=prompt, cwd=cwd, model=model,
                                     permission_mode=permission_mode,
                                     max_turns=max_turns, resume=resume)
+    if sandbox_container:
+        cli_cmd = build_container_sandbox_command(
+            cli_cmd,
+            cwd=cwd,
+            image=sandbox_container,
+            network=sandbox_network,
+            read_only=(permission_mode == "plan"),
+        )
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":

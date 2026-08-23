@@ -23,6 +23,8 @@ _JSON_BOUNDARY_RE = re.compile(r'"(?:]|}|,)')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent_mcp import SESSION_MISMATCH_MARK
+from agent_mcp.audit import compute_workspace_diff, snapshot_workspace
+from agent_mcp.mailbox import MailboxManager
 from agent_mcp.cli_adapters import (ResumeUnsupportedError, get_adapter,
                                     load_custom_adapters)
 from agent_mcp.daemon_http import DaemonHTTPServer, EventBroadcaster, HEARTBEAT_SECONDS
@@ -805,6 +807,51 @@ class Dispatcher:
             query=body.get("query"), kind=body.get("kind"), limit=limit)
         return {"memories": memories}
 
+    # ---- P2P 信箱与共识投票 ----
+
+    def mailbox_send(self, body: dict) -> dict:
+        mgr = MailboxManager(self.db)
+        team = body.get("team") or "default"
+        from_agent_id = int(body.get("from_agent_id") or 0)
+        to_agent_id = body.get("to_agent_id")
+        to_id = int(to_agent_id) if to_agent_id is not None else None
+        msg_type = body.get("msg_type") or "message"
+        payload = body.get("payload")
+        message = str(body.get("message") or "")
+        mid = mgr.send_message(team=team, from_agent_id=from_agent_id, to_agent_id=to_id,
+                               msg_type=msg_type, payload=payload, message=message)
+        return {"id": mid, "status": "sent"}
+
+    def mailbox_fetch(self, body: dict) -> dict:
+        mgr = MailboxManager(self.db)
+        team = body.get("team") or "default"
+        agent_id = body.get("agent_id")
+        aid = int(agent_id) if agent_id is not None else None
+        unread_only = bool(body.get("unread_only", True))
+        limit = min(max(int(body.get("limit") or 20), 1), 100)
+        msgs = mgr.fetch_messages(team=team, agent_id=aid, unread_only=unread_only, limit=limit)
+        return {"messages": msgs}
+
+    def consensus_vote(self, body: dict) -> dict:
+        mgr = MailboxManager(self.db)
+        team = body.get("team") or "default"
+        from_agent_id = int(body.get("from_agent_id") or 0)
+        action = body.get("action") or "vote"  # "propose" | "vote" | "tally"
+        if action == "propose":
+            proposal = str(body.get("proposal") or "")
+            mid = mgr.broadcast(team=team, from_agent_id=from_agent_id, message=proposal, msg_type="proposal")
+            return {"id": mid, "status": "proposed"}
+        elif action == "vote":
+            vote_val = bool(body.get("vote", True))
+            reason = str(body.get("reason") or "")
+            mid = mgr.send_vote(team=team, from_agent_id=from_agent_id, vote=vote_val, reason=reason)
+            return {"id": mid, "status": "voted"}
+        elif action == "tally":
+            res = mgr.tally_votes(team=team)
+            return {"tally": res}
+        else:
+            raise ValueError(f"Unknown action {action}")
+
     # ---- v0.3 策略管理（daemon 级：唯一数据源，enforcement 与面板同源） ----
 
     def policy_list(self, body: dict) -> dict:
@@ -896,7 +943,12 @@ class Dispatcher:
             }
             if body.get("env") is not None:
                 worker_options["env"] = body["env"]
+            # 审计快照：记录启动前工作区状态
+            initial_snapshot = snapshot_workspace(cwd)
             info = self._spawn_fn(target_cli, **worker_options)
+            info["initial_snapshot"] = initial_snapshot
+            info["cwd"] = cwd
+            info["body"] = body
         except ResumeUnsupportedError as exc:
             self._fail(agent_id, stop_reason="resume_unsupported", message=str(exc))
             return self._agent_result(agent_id, status="error", error=str(exc))
@@ -1018,6 +1070,23 @@ class Dispatcher:
             return
         if not finished:
             return
+        # 审计 Diff 结算：生成工作区变更 Diff 并入库
+        try:
+            initial_snap = info.get("initial_snapshot") or {}
+            cwd = info.get("cwd") or (self.db.get_agent(agent_id) or {}).get("cwd")
+            if cwd and os.path.exists(cwd):
+                final_snap = snapshot_workspace(cwd)
+                diffs = compute_workspace_diff(initial_snap, final_snap)
+                for d in diffs:
+                    self.db.add_audit_diff(
+                        agent_id=agent_id,
+                        file_path=d["path"],
+                        change_type=d["change_type"],
+                        diff_text=d.get("diff_text", ""),
+                    )
+        except Exception as audit_exc:
+            print(f"[audit] diff capture failed for agent {agent_id}: {audit_exc}", file=sys.stderr)
+
         agent = self.db.get_agent(agent_id)
         if agent is not None:
             self._ingest_output(agent_id, agent["cli"], info["out_path"],

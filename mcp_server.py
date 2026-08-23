@@ -90,6 +90,9 @@ _DAEMON_PATHS = {
     "get_token_usage": "/api/usage",
     "memory_store": "/api/memory/store",
     "memory_recall": "/api/memory/recall",
+    "mailbox_send": "/api/mailbox/send",
+    "mailbox_fetch": "/api/mailbox/fetch",
+    "consensus_vote": "/api/consensus/vote",
     "policy_list": "/api/policies/list",
     "policy_add": "/api/policies/add",
     "policy_state": "/api/policies/state",
@@ -427,6 +430,57 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True},
     },
+    {
+        "name": "mailbox_send",
+        "description": "Agent 间点对点/广播信箱：发送消息或协同指令到指定 team/agent。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string", "description": "团队隔离标识（默认 default）。"},
+                "from_agent_id": {"type": "integer", "description": "发送者 Agent ID。"},
+                "to_agent_id": {"type": "integer", "description": "接收者 Agent ID（空则为广播）。"},
+                "message": {"type": "string", "description": "消息正文。"},
+                "msg_type": {"type": "string", "description": "消息类型（message/proposal/artifact）。"},
+                "payload": {"type": "object", "description": "可选结构化载荷。"},
+            },
+            "required": ["message"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "mailbox_fetch",
+        "description": "收取信箱消息：按团队与 Agent ID 获取未读/历史消息。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string", "description": "团队隔离标识（默认 default）。"},
+                "agent_id": {"type": "integer", "description": "收取者 Agent ID（空则获取广播）。"},
+                "unread_only": {"type": "boolean", "default": True, "description": "是否仅收取未读消息。"},
+                "limit": {"type": "integer", "default": 20, "description": "拉取条数上限。"},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "consensus_vote",
+        "description": "团队共识投票：发起提案、投票表决或结算统计票数。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "team": {"type": "string", "description": "团队隔离标识。"},
+                "from_agent_id": {"type": "integer", "description": "投票者 Agent ID。"},
+                "action": {"type": "string", "enum": ["propose", "vote", "tally"], "description": "动作类型。"},
+                "proposal": {"type": "string", "description": "提案内容（action=propose 时必填）。"},
+                "vote": {"type": "boolean", "description": "赞成(true)或反对(false)（action=vote 时填）。"},
+                "reason": {"type": "string", "description": "投票理由。"},
+            },
+            "required": ["team", "action"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
 ]
 
 
@@ -568,6 +622,8 @@ def _orchestrate_task(arguments: dict[str, Any]) -> dict[str, Any]:
             cli=str(raw.get("cli") or "claude"),
             worktree=bool(raw.get("worktree")),
             review_by=str(raw["review_by"]) if raw.get("review_by") else None,
+            max_retries=int(raw.get("max_auto_refine") or raw.get("max_retries") or 0),
+            refinement_prompt=str(raw["refine_prompt"]) if raw.get("refine_prompt") else None,
         ))
     result = orch.run()
     # 落盘 worktree 注册表（网页工作区面板消费）：只记 worktree 任务
@@ -1115,7 +1171,11 @@ def handle(request: dict[str, Any], *, emit=send) -> None:
         emit({"jsonrpc": "2.0", "id": request_id, "result": {
             "protocolVersion": negotiated,
             "serverInfo": {"name": "agent-mcp", "version": SERVER_VERSION},
-            "capabilities": {"tools": {"listChanged": False}}},
+            "capabilities": {
+                "tools": {"listChanged": False},
+                "resources": {"subscribe": False, "listChanged": False},
+                "prompts": {"listChanged": False}
+            }},
         })
         return
     # modern = 2025-11-25 或 2026-07-28（structuredContent/resultType/tasks 生效）；
@@ -1128,6 +1188,59 @@ def handle(request: dict[str, Any], *, emit=send) -> None:
             listed.update({"resultType": "complete", "ttlMs": 300_000,
                            "cacheScope": "public", "_meta": _modern_meta()})
         emit({"jsonrpc": "2.0", "id": request_id, "result": listed})
+    elif method == "resources/list":
+        res_list = [
+            {"uri": "agent-mcp://agents/status", "name": "Agents Status", "mimeType": "application/json"},
+            {"uri": "agent-mcp://policies/current", "name": "Active Policies", "mimeType": "application/json"},
+            {"uri": "agent-mcp://stats/tokens", "name": "Token Usage Stats", "mimeType": "application/json"}
+        ]
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"resources": res_list}})
+    elif method == "resources/read":
+        params = request.get("params") or {}
+        uri = params.get("uri", "")
+        if uri == "agent-mcp://agents/status":
+            data = call_tool("list_agents", {})
+        elif uri == "agent-mcp://policies/current":
+            data = call_tool("policy_list", {})
+        elif uri == "agent-mcp://stats/tokens":
+            data = call_tool("get_token_usage", {})
+        else:
+            emit(rpc_error(request_id, -32602, f"Resource not found: {uri}"))
+            return
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "contents": [{"uri": uri, "mimeType": "application/json", "text": json.dumps(data, ensure_ascii=False)}]
+        }})
+    elif method == "prompts/list":
+        prompt_list = [
+            {
+                "name": "dag_orchestration",
+                "description": "Template for multi-agent DAG task orchestration",
+                "arguments": [{"name": "task", "description": "High level task goal", "required": True}]
+            },
+            {
+                "name": "cross_vendor_review",
+                "description": "Template for cross-vendor LLM code review pipeline",
+                "arguments": [{"name": "files", "description": "Files to review", "required": True}]
+            }
+        ]
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"prompts": prompt_list}})
+    elif method == "prompts/get":
+        params = request.get("params") or {}
+        p_name = params.get("name")
+        p_args = params.get("arguments", {})
+        if p_name == "dag_orchestration":
+            t_goal = p_args.get("task", "Analyze and implement the feature")
+            content = f"Please use orchestrate_task to decompose and execute the following task with DAG dependencies:\n{t_goal}"
+        elif p_name == "cross_vendor_review":
+            t_files = p_args.get("files", "")
+            content = f"Please run cross-vendor multi-angle code review on the following files:\n{t_files}"
+        else:
+            emit(rpc_error(request_id, -32602, f"Prompt template not found: {p_name}"))
+            return
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {
+            "description": f"Prompt for {p_name}",
+            "messages": [{"role": "user", "content": {"type": "text", "text": content}}]
+        }})
     elif method == "notifications/progress" and request_id is None:
         # E1 progress 到 MCP：子代理 message_delta 通过此通道推给 client spinner
         # 请求无 id（通知），不需返响应；legacy 静默不报错
