@@ -14,21 +14,20 @@ import hashlib
 import json
 import os
 import re
+import http.client
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
 
-from agent_mcp import SESSION_MISMATCH_MARK
+from agent_mcp import SESSION_MISMATCH_MARK, __version__
 from agent_mcp.cli_adapters import adapter_names, load_custom_adapters
 from agent_mcp.orchestrator import Orchestrator, OrchestratedTask
 
-SERVER_VERSION = "2.2.0"
+SERVER_VERSION = __version__
 LEGACY_PROTOCOL_VERSION = "2025-03-26"
 # 2025-11-25：官方 MCP 中间版本（SDK 1.29.0 的 LATEST，DSH 客户端所发版本），
 # 拥有 structuredContent / tasks 等 modern 特性但仍是 initialize 握手式会话协议。
@@ -76,7 +75,34 @@ _SESSION_ID: str | None = None
 _NEGOTIATED_PROTOCOL_VERSION: str | None = None
 # 2025-11-25 客户端在 initialize capabilities.tasks 声明的 tasks 能力（experimental）
 _CLIENT_TASKS_CAPABLE = False
-_DAEMON: tuple[str, str] | None = None  # (base_url, token) 缓存
+_DAEMON: tuple[int, str] | None = None  # (daemon 端口, token) 缓存；host 恒为 DAEMON_HOST 常量
+
+
+def _request_daemon(method: str, port: int, path: str, *, token: str | None = None,
+                    payload: dict[str, Any] | None = None,
+                    timeout: float | None = None) -> tuple[int, bytes]:
+    """受控回环请求（SSRF 收敛，v3.0）：host 恒为 DAEMON_HOST 常量、port 为
+    int、path 必须是以 / 开头的字面量——全链路不构造任何 URL 字符串。
+    返回 (status, body_bytes)；连接类异常向上抛给调用方。"""
+    assert DAEMON_HOST in ("127.0.0.1", "localhost"), "daemon 仅允许绑定回环"
+    if not isinstance(port, int) or not 0 < port < 65536:
+        raise ValueError(f"bad daemon port: {port!r}")
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError(f"bad daemon path: {path!r}")
+    conn = http.client.HTTPConnection(DAEMON_HOST, port,
+                                      timeout=timeout or _HTTP_TIMEOUT)
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Auth-Token"] = token
+    body = None
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    status = resp.status
+    conn.close()
+    return status, data
 
 _DAEMON_PATHS = {
     "spawn_agent": "/api/agents/spawn",
@@ -144,6 +170,20 @@ TOOLS = [
                                  "description": "token 预算上限（0=不限，默认 0）。"},
                 "verify_command": {"type": "string",
                                    "description": "完成后验证命令（空=不验证，默认空）。"},
+                "downgrade_chain": {
+                    "type": "array", "minItems": 1, "maxItems": 5,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "cli": {"type": "string", "enum": _CLI_NAMES},
+                            "model": {"type": "string"},
+                        },
+                        "required": ["cli"],
+                        "additionalProperties": False,
+                    },
+                    "description": "B3 可选：用户预声明的跨底座降档链（opt-in）。"
+                                    "token_budget 超额时按链逐步提示下一跳组合；"
+                                    "不传则沿用同 CLI 降一档的默认行为，系统永不擅自换底座。"},
                 "max_fix_attempts": {"type": "integer", "minimum": 0, "maximum": 10,
                                      "default": 0,
                                      "description": "验证失败后自动修复尝试次数（默认 0=不修）。"},
@@ -180,7 +220,12 @@ TOOLS = [
                                          "description": "在独立 git worktree 中运行。"},
                             "review_by": {"type": "string",
                                           "description": "跨厂商审查者 CLI（须与 cli 不同厂商）。"},
-                        },
+                            "max_auto_refine": {"type": "integer", "minimum": 0, "maximum": 5,
+                                                "default": 0,
+                                                "description": "审查 REJECT 后自动精炼重跑的次数上限（0=不自动精炼）。"},
+                            "refine_prompt": {"type": "string",
+                                               "description": "自定义精炼提示词前缀，置于审查意见与原始需求之前。"},
+                         },
                         "required": ["id", "prompt"],
                         "additionalProperties": False,
                     },
@@ -269,6 +314,11 @@ TOOLS = [
             "properties": {
                 "agent_id": {"type": "integer", "description": "要 followup 的 agent。"},
                 "prompt": {"type": "string", "description": "新任务提示词。"},
+                "target_cli": {"type": "string", "enum": _CLI_NAMES,
+                               "description": "可选：跨底座续跑时显式切换执行 CLI"
+                                              "（B3 降档链的执行入口；不传沿用原 CLI）。"},
+                "model": {"type": "string",
+                          "description": "可选：本次 turn 覆盖模型（配合 target_cli 使用）。"},
                 "interrupt": {"type": "boolean", "default": False,
                               "description": "先终止运行中的 agent 再重派。"},
                 "env": {"type": "object", "additionalProperties": {"type": "string"},
@@ -811,8 +861,11 @@ def _agent_id_from_task(params: dict[str, Any]) -> int:
 
 def _task_status(payload: dict[str, Any]) -> str:
     status = payload.get("status")
+    # B5：needs_advisor（子代理回 NEEDS_DECISION）升为协议级 input_required，
+    # 与 tasks/update 的 inputResponses→steer_agent 形成双向闭环
     return {"running": "working", "queued": "working", "terminated": "completed",
-            "error": "failed", "cancelled": "cancelled", "incomplete": "failed"}.get(status, "working")
+            "error": "failed", "cancelled": "cancelled", "incomplete": "failed",
+            "needs_advisor": "input_required"}.get(status, "working")
 
 
 def _task_result(payload: dict[str, Any], *, result_type: str = "complete") -> dict[str, Any]:
@@ -838,6 +891,18 @@ def _task_result(payload: dict[str, Any], *, result_type: str = "complete") -> d
     if task["status"] == "completed":
         task["result"] = {"resultType": "complete", "content": [{"type": "text",
             "text": json.dumps(payload, ensure_ascii=False)}], "isError": False}
+    elif task["status"] == "input_required":
+        # B5：把需要决策的问题透出给 host，等待 tasks/update(inputResponses)
+        question = ""
+        summary = str(payload.get("summary") or "")
+        marker = "NEEDS_DECISION:"
+        if marker in summary:
+            question = summary.split(marker, 1)[1].strip()
+        task["result"] = {"resultType": "input_required",
+                          "content": [{"type": "text",
+                                       "text": question or str(payload.get("stop_reason") or
+                                                               "agent needs decision")}],
+                          "isError": False}
     elif task["status"] == "failed":
         task["error"] = {"code": -32010, "message": payload.get("message") or
                          payload.get("stop_reason") or "agent failed", "data": payload}
@@ -879,49 +944,38 @@ def host_from_client_info(info: dict[str, Any] | None) -> str:
         return "omp"
     return "unknown"
 
-def _probe_legacy_daemon(base: str, token: str) -> bool:
+def _probe_legacy_daemon(port: int, token: str) -> bool:
     """Authenticate a legacy daemon whose public health payload lacks identity fields."""
     if not token:
         return False
-    payload = json.dumps(
-        {"session_id": "agent-mcp-compatibility-probe"},
-        ensure_ascii=False,
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        base + "/api/agents/list",
-        data=payload,
-        method="POST",
-        headers={
-            "X-Auth-Token": token,
-            "Content-Type": "application/json",
-        },
-    )
     try:
-        with urllib.request.urlopen(request, timeout=1) as response:
-            if response.status != 200:
-                return False
-            body = json.loads(response.read().decode("utf-8"))
-            return isinstance(body, dict) and isinstance(body.get("agents"), list)
+        status, data = _request_daemon(
+            "POST", port, "/api/agents/list", token=token,
+            payload={"session_id": "agent-mcp-compatibility-probe"}, timeout=1)
     except Exception:
         return False
+    if status != 200:
+        return False
+    body = json.loads(data.decode("utf-8"))
+    return isinstance(body, dict) and isinstance(body.get("agents"), list)
 
 
-def _probe(base: str) -> bool:
+def _probe(port: int) -> bool:
     token = _read_token()
     try:
-        with urllib.request.urlopen(base + "/health", timeout=1) as resp:
-            if resp.status != 200:
-                return False
-            body = json.loads(resp.read().decode("utf-8"))
-            if body.get("service") == "agent-mcp-daemon":
-                fingerprint = body.get("token_sha256")
-                expected = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
-                return bool(expected and fingerprint == expected)
-            if body.get("ok") is True and body.get("version") == 1:
-                return _probe_legacy_daemon(base, token)
-            return False
+        status, data = _request_daemon("GET", port, "/health", timeout=1)
     except Exception:
         return False
+    if status != 200:
+        return False
+    body = json.loads(data.decode("utf-8"))
+    if body.get("service") == "agent-mcp-daemon":
+        fingerprint = body.get("token_sha256")
+        expected = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else ""
+        return bool(expected and fingerprint == expected)
+    if body.get("ok") is True and body.get("version") == 1:
+        return _probe_legacy_daemon(port, token)
+    return False
 
 
 def _read_token() -> str:
@@ -971,24 +1025,24 @@ def _spawn_detached(command: list[str], *, env: dict[str, str] | None = None) ->
 _STARTUP_LOCK = threading.Lock()
 
 
-def ensure_daemon() -> tuple[str, str]:
+def ensure_daemon() -> tuple[int, str]:
     """原子拉起：探测 /health（10×0.5s）→ 无则补 token 文件 → spawn_detached(daemon_main)
-    → 轮询 /health。锁文件残留校验在 daemon_main 内部，薄层不重复。返回 (base_url, token)。
+    → 轮询 /health。锁文件残留校验在 daemon_main 内部，薄层不重复。返回 (daemon 端口, token)。
     进程级 _STARTUP_LOCK 串行化探测+拉起：多线程并发调用只拉起一个 daemon。"""
-    base = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
     with _STARTUP_LOCK:
         token = _read_token()
         spawned = False
         for _ in range(_PROBE_ATTEMPTS):
-            if _probe(base):
-                return base, token
+            if _probe(DAEMON_PORT):
+                return DAEMON_PORT, token
             if not spawned:
                 token = _ensure_token_file()
                 _spawn_detached([sys.executable, str(DAEMON_SCRIPT),
                                  "--port", str(DAEMON_PORT), "--state-dir", str(STATE_DIR)])
                 spawned = True
             time.sleep(_PROBE_INTERVAL)
-        raise RuntimeError(f"agent-mcp daemon failed to start on {base} within "
+        raise RuntimeError(f"agent-mcp daemon failed to start on "
+                           f"{DAEMON_HOST}:{DAEMON_PORT} within "
                            f"{_PROBE_ATTEMPTS * _PROBE_INTERVAL:.0f}s")
 
 
@@ -1059,23 +1113,19 @@ def _http_error_payload(code: int, detail: str) -> dict[str, Any]:
             "next_actions": next_actions}
 
 
-def _post_once(base: str, token: str, path: str, payload: dict[str, Any],
+def _post_once(port: int, token: str, path: str, payload: dict[str, Any],
                http_timeout: float | None = None) -> dict[str, Any] | None:
     """单次 HTTP POST；连接失败返回 None（触发重拉），HTTP 错误转结构化错误。
     http_timeout 缺省用 _HTTP_TIMEOUT；wait_agent 会按请求的 timeout 叠加余量。"""
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        base + path, data=body, method="POST",
-        headers={"X-Auth-Token": token, "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=http_timeout or _HTTP_TIMEOUT) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:400]
-        return _http_error_payload(exc.code, detail)
-    except (urllib.error.URLError, OSError, TimeoutError):
+        status, data = _request_daemon("POST", port, path, token=token,
+                                       payload=payload,
+                                       timeout=http_timeout or _HTTP_TIMEOUT)
+    except (OSError, TimeoutError, http.client.HTTPException):
         return None
+    if status != 200:
+        return _http_error_payload(status, data.decode("utf-8", "replace")[:400])
+    return json.loads(data.decode("utf-8")) if data else {}
 
 
 def _daemon_post(path: str, payload: dict[str, Any],
@@ -1096,20 +1146,20 @@ def _daemon_post(path: str, payload: dict[str, Any],
                     "root_cause_hint": str(exc),
                     "next_actions": ["start the daemon manually: "
                                      "python agent_mcp/daemon_main.py"]}
-    base, token = _DAEMON
-    out = _post_once(base, token, path, payload, http_timeout=http_timeout)
+    port, token = _DAEMON
+    out = _post_once(port, token, path, payload, http_timeout=http_timeout)
     if out is not None:
         return out
     _DAEMON = None  # daemon 可能已退出，重新拉起
     try:
-        base, token = ensure_daemon()
+        port, token = ensure_daemon()
     except RuntimeError as exc:
         print(f"agent-mcp: daemon still unreachable: {exc}", file=sys.stderr)
         return {"status": "error", "summary": "agent-mcp daemon is not reachable",
                 "root_cause_hint": str(exc),
                 "next_actions": ["start the daemon manually: "
                                  "python agent_mcp/daemon_main.py"]}
-    out = _post_once(base, token, path, payload, http_timeout=http_timeout)
+    out = _post_once(port, token, path, payload, http_timeout=http_timeout)
     if out is None:
         return {"status": "error", "summary": "agent-mcp daemon unreachable after relaunch",
                 "root_cause_hint": "daemon started but connection failed",

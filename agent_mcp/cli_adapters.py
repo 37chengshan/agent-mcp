@@ -14,6 +14,13 @@ class ResumeUnsupportedError(ValueError):
 
 class BaseAdapter:
     cli_name = ""
+    # B2 usage 结算语义声明（daemon 统一结算的依据，禁止各处凭感觉处理）：
+    # - "authoritative"：适配器产出的最后一条非空 usage 即该 run 的权威总量，
+    #   daemon 可整体覆盖；尾随空/零总量不得覆盖既有累计（防清账）。
+    # - "cumulative"  ：每条 usage 为"至今累计"，daemon 取最新覆盖即可；
+    #   同样禁止在 daemon 层二次累加（会双计）。
+    # 仅允许这两个值，见 tests/test_b2_usage_contract.py。
+    usage_semantics: str = "authoritative"
     def build_command(self, *, prompt: str, cwd: str, model: str | None,
                       permission_mode: str, max_turns: int, resume: str | None) -> list[str]:
         raise NotImplementedError
@@ -162,6 +169,8 @@ class GrokAdapter(ClaudeAdapter):
 class OpencodeAdapter(ClaudeAdapter):
     cli_name = "opencode"
     _BIN = ["opencode"]
+    # B2：opencode 的 usage 为逐 turn 累计口径（实测），daemon 取最新覆盖
+    usage_semantics = "cumulative"
     # opencode 无 permission-mode CLI flag（权限走配置文件 allow 规则），
     # 仅 fullAccess 对应 --dangerously-skip-permissions（实测 1.14.51）
     PERMISSION_FLAGS = {
@@ -239,6 +248,8 @@ class OpencodeAdapter(ClaudeAdapter):
 class OmpAdapter(ClaudeAdapter):
     cli_name = "omp"
     _BIN = ["omp", str(HOME / ".bun/bin/omp")]
+    # B2：omp 的 usage 为逐 turn 累计口径（实测），daemon 取最新覆盖
+    usage_semantics = "cumulative"
     # omp 无 max-turns flag（有 --max-time），max_turns 参数按接口保留但忽略；
     # 权限映射基于 --approval-mode (always-ask|write|yolo) / --auto-approve
     PERMISSION_FLAGS = {
@@ -902,6 +913,13 @@ class GenericAdapter(BaseAdapter):
         self._cmd = config.get("command") or {}
         self._parse = config.get("parse") or {}
         self.first_start_seconds = float(config.get("first_start_seconds") or 10)
+        # B2：usage 结算语义可在配置中声明（缺省 authoritative）
+        semantics = str(config.get("usage_semantics") or "authoritative")
+        if semantics not in ("authoritative", "cumulative"):
+            raise ValueError(
+                f"custom CLI {self.cli_name}: usage_semantics must be "
+                f"'authoritative' or 'cumulative', got {semantics!r}")
+        self.usage_semantics = semantics
 
     def binary(self) -> str | None:
         for cand in self._bins:

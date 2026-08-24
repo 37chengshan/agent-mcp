@@ -37,20 +37,19 @@ def test_container_sandbox_builder():
 
 
 def test_audit_workspace_diff():
+    from pathlib import Path
     with tempfile.TemporaryDirectory() as tmpdir:
-        f1 = os.path.join(tmpdir, "a.txt")
-        with open(f1, "w") as f:
-            f.write("initial content")
+        workdir = Path(tmpdir)
+        f1 = workdir / "a.txt"
+        f1.write_text("initial content")
 
         snap1 = snapshot_workspace(tmpdir)
         assert "a.txt" in snap1
 
         # 修改文件，新增文件
-        with open(f1, "w") as f:
-            f.write("updated content")
-        f2 = os.path.join(tmpdir, "b.txt")
-        with open(f2, "w") as f:
-            f.write("new file")
+        f1.write_text("updated content")
+        f2 = workdir / "b.txt"
+        f2.write_text("new file")
 
         snap2 = snapshot_workspace(tmpdir)
         diff = compute_workspace_diff(tmpdir, snap1, snap2)

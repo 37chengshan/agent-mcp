@@ -238,9 +238,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(400, "bad host")
         return False
 
-    def _check_token(self) -> bool:
+    def _supplied_token(self) -> str:
+        """A6: 令牌提取——优先 X-Auth-Token 头；GET/SSE 无法自定义 header，
+        回退 URL ?token= 查询参数（与前端 #token= hash 通道同源的明文通道，
+        仅用于回环监控页）。"""
         supplied = self.headers.get("X-Auth-Token") or ""
-        if hmac.compare_digest(supplied, self.server.token):
+        if supplied:
+            return supplied
+        if "?" in self.path:
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
+            values = query.get("token") or []
+            if values:
+                return str(values[0])
+        return ""
+
+    def _has_valid_token(self) -> bool:
+        return hmac.compare_digest(self._supplied_token(), self.server.token)
+
+    def _check_token(self) -> bool:
+        if self._has_valid_token():
             return True
         self.send_error(401, "unauthorized")
         return False
@@ -260,6 +276,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"max_message_chars": 20_000,
                                   "write_auth": "url-fragment"})
         elif path == "/api/snapshot":
+            # A6：读端点纳入鉴权（header 或 ?token= 均可）
+            if not self._check_token():
+                return
             self._send_snapshot()
         elif path == "/api/policies/state":
             if not self._check_token():
@@ -300,9 +319,14 @@ class Handler(BaseHTTPRequestHandler):
                 hours = 24
             self._send_json(200, {"series": db.usage_series(hours)})
         elif path == "/events":
+            # A6：SSE 纳入鉴权（EventSource 走 ?token= 查询通道）
+            if not self._check_token():
+                return
             self._stream_events()
         elif path == "/api/events":
             # message 通道版：新面板消费（data 内嵌 type，无 event: 行）
+            if not self._check_token():
+                return
             self._stream_events(message_mode=True)
         elif path == "/" or path == "/index.html":
             self._send_index()
@@ -545,17 +569,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_index(self):
         """发送 index.html 并注入面板 loader（幂等：已有注入标记则跳过）。
-        同时注入 __amToken：面板鉴权不再依赖 URL hash（hash 易丢失/手动打开无 hash），
-        从页面全局变量读取，回退 hash。"""
+
+        A6 安全收敛：__amToken 只在请求本身携带有效令牌（header 或 ?token=）
+        时才注入真实值；未授权请求注入 null——修复此前"任意本机进程 GET /
+        即可从 HTML 提取明文 token 获得完整控制面"的凭据泄露。
+        正常入口是 start_agent_mcp --open 生成的 /#token=... 链接。"""
         root = self.server.web_root.resolve()
         path = root / "index.html"
         if not path.is_file():
             self.send_error(404)
             return
         data = path.read_bytes()
-        token_script = (f'<script>window.__amToken={json.dumps(self.server.token)};</script>'
+        token_value = self.server.token if self._has_valid_token() else None
+        token_script = (f'<script>window.__amToken={json.dumps(token_value)};</script>'
                         .encode("utf-8"))
-        if token_script not in data:
+        if b"window.__amToken=" not in data:
             data = data.replace(b"</head>", token_script + b"</head>", 1)
         marker = b'<script type="module" src="/panels/loader.js?v=v4"></script>'
         if marker not in data:

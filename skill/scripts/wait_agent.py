@@ -22,8 +22,6 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 DEFAULT_PORT = 8765
@@ -57,15 +55,29 @@ def read_port(state_dir: Path) -> int:
         return DEFAULT_PORT
 
 
-def wait_once(base_url: str, token: str, agent_id: int, timeout: float) -> dict:
-    """POST /api/agents/wait 一次；返 daemon 结果 dict。非 JSON 响应抛 ValueError。"""
-    body = json.dumps({"agent_id": agent_id, "timeout": timeout}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base_url}/api/agents/wait", data=body, method="POST",
-        headers={"Content-Type": "application/json", "X-Auth-Token": token},
-    )
-    with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
-        raw = resp.read().decode("utf-8")
+class WaitHTTPError(OSError):
+    """daemon 返回非 200；code/body 供上层分类提示。"""
+
+    def __init__(self, code: int, body: str):
+        super().__init__(f"HTTP {code}")
+        self.code = code
+        self.body = body
+
+
+def wait_once(port: int, token: str, agent_id: int, timeout: float) -> dict:
+    """POST /api/agents/wait 一次；返 daemon 结果 dict。非 JSON 响应抛 ValueError。
+    受控回环请求（SSRF 收敛）：host 恒为 127.0.0.1 常量、port 为 int、
+    路径为字面量——不构造任何 URL 字符串。非 200 抛 WaitHTTPError。"""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout + 5)
+    conn.request("POST", "/api/agents/wait",
+                 body=json.dumps({"agent_id": agent_id, "timeout": timeout}).encode("utf-8"),
+                 headers={"Content-Type": "application/json", "X-Auth-Token": token})
+    resp = conn.getresponse()
+    raw = resp.read().decode("utf-8")
+    conn.close()
+    if resp.status != 200:
+        raise WaitHTTPError(resp.status, raw[:300])
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
@@ -101,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
     state_dir = args.state_dir or find_state_dir()
     token = read_token(state_dir)
     port = read_port(state_dir)
-    base_url = f"http://127.0.0.1:{port}"
 
     if not token:
         print(f"error: daemon token 缺失（{state_dir}/daemon.json）；先启动 daemon", file=sys.stderr)
@@ -113,10 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         while time.monotonic() < deadline:
             try:
-                last = wait_once(base_url, token, args.agent_id, args.interval)
+                last = wait_once(port, token, args.agent_id, args.interval)
                 retries = 0  # 连接成功后重置重试计数
-            except urllib.error.HTTPError as exc:
-                err = exc.read().decode("utf-8", "replace")[:300]
+            except WaitHTTPError as exc:
+                err = exc.body[:300]
                 if exc.code == 401:
                     print(f"error: 401 未授权——daemon 可能已重启换 token；"
                           f"重新运行 start_agent_mcp.py 或读 {state_dir}/daemon.json 的新 token", file=sys.stderr)
@@ -128,13 +139,13 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 2
-            except (urllib.error.URLError, OSError) as exc:
+            except OSError as exc:
                 # 连接抖动/daemon 瞬时重启：重试几次再退出
                 retries += 1
                 if retries <= CONNECT_RETRIES and time.monotonic() < deadline:
                     time.sleep(CONNECT_RETRY_DELAY)
                     continue
-                print(f"error: 无法连接 daemon（{base_url}，重试 {retries - 1} 次）：{exc}", file=sys.stderr)
+                print(f"error: 无法连接 daemon（127.0.0.1:{port}，重试 {retries - 1} 次）：{exc}", file=sys.stderr)
                 return 3
             status = last.get("status")
             if status in TERMINAL:

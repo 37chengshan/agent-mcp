@@ -44,6 +44,7 @@
 | `cli_name` | ✅ | `spawn_agent` / `followup_task` 使用的 `target_cli` 名字 |
 | `bins` | — | 二进制探测顺序（PATH 优先，可写 `~` 绝对路径兜底）；缺省 `[cli_name]` |
 | `first_start_seconds` | — | 返回给主 Agent 的 `min_expected_seconds`（缺省 10） |
+| `usage_semantics` | — | usage 结算语义：`authoritative`（最后一条非空 usage 即权威总量，默认）或 `cumulative`（每条为至今累计）。daemon 据此统一结算，禁止二次累加。完整示例见 [custom-cli-examples/](custom-cli-examples/) |
 | `command.prefix` | — | 固定前置参数；`{cwd}` 占位替换为工作目录 |
 | `command.permission_flags` | — | 按 `permission_mode`（plan/acceptEdits/fullAccess）追加的参数 |
 | `command.model_flag` | — | 传 `model` 时追加；`{value}` 替换为模型名 |

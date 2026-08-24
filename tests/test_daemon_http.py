@@ -37,13 +37,41 @@ def _make_server(tmp_path):
     return srv
 
 
+def _request_json(srv, path: str):
+    """受控 GET（http.client + 纯字面量路径）：返回 (status, bytes)。"""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read()
+    status = resp.status
+    conn.close()
+    return status, body
+
+
+def _http(srv, method: str, path: str, body: bytes | None = None,
+          headers: dict | None = None):
+    """受控请求（SSRF 约束）：host/port 走独立参数，path 必须为以 / 开头的
+    字面量；返回 (status, headers, bytes)，不抛 HTTP 错误。"""
+    import http.client
+    assert srv.server_address[0] == "127.0.0.1"
+    assert isinstance(path, str) and path.startswith("/")
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1],
+                                      timeout=5)
+    conn.request(method, path, body=body, headers=headers or {})
+    resp = conn.getresponse()
+    data = resp.read()
+    status = resp.status
+    conn.close()
+    return status, resp.headers, data
+
+
 def test_health_endpoint(tmp_path):
     srv = _make_server(tmp_path)
     try:
-        resp = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/health")
-        assert resp.status == 200
-        body = json.loads(resp.read())
-        assert body["ok"] is True
+        status, _, body = _http(srv, "GET", "/health")
+        assert status == 200
+        assert json.loads(body)["ok"] is True
     finally:
         srv.shutdown()
 
@@ -51,8 +79,8 @@ def test_health_identifies_daemon_without_exposing_token(tmp_path):
     import hashlib
     srv = _make_server(tmp_path)
     try:
-        resp = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/health")
-        body = json.loads(resp.read())
+        _, _, body = _http(srv, "GET", "/health")
+        body = json.loads(body)
         assert body["service"] == "agent-mcp-daemon"
         assert body["token_sha256"] == hashlib.sha256(b"t").hexdigest()
         assert "token" not in body
@@ -63,9 +91,9 @@ def test_health_identifies_daemon_without_exposing_token(tmp_path):
 def test_config_endpoint_never_exposes_write_token(tmp_path):
     srv = _make_server(tmp_path)
     try:
-        resp = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/api/config")
-        body = json.loads(resp.read())
-        assert body == {"max_message_chars": 20_000, "write_auth": "url-fragment"}
+        _, _, body = _http(srv, "GET", "/api/config")
+        assert json.loads(body) == {"max_message_chars": 20_000,
+                                    "write_auth": "url-fragment"}
     finally:
         srv.shutdown()
 
@@ -75,26 +103,22 @@ def test_html_and_json_responses_send_security_headers(tmp_path):
     srv = _make_server(tmp_path)
     try:
         for path in ("/", "/health"):
-            resp = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}{path}")
-            assert resp.headers["X-Frame-Options"] == "DENY"
-            assert "frame-ancestors 'none'" in resp.headers["Content-Security-Policy"]
-            assert resp.headers["X-Content-Type-Options"] == "nosniff"
+            _, headers, _ = _http(srv, "GET", path)
+            assert headers["X-Frame-Options"] == "DENY"
+            assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+            assert headers["X-Content-Type-Options"] == "nosniff"
     finally:
         srv.shutdown()
 
 
 
 def test_bad_host_rejected(tmp_path):
-    # 显式无代理 opener：本机系统代理会拦截 evil Host 头的连接，干扰测试
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    """Host 头白名单：evil Host → 400（http.client 直连，不经系统代理）。"""
     srv = _make_server(tmp_path)
     try:
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{srv.server_address[1]}/health",
-            headers={"Host": "evil.example.com"})
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            opener.open(req)
-        assert exc.value.code == 400
+        status, _, _ = _http(srv, "GET", "/health",
+                             headers={"Host": "evil.example.com"})
+        assert status == 400
     finally:
         srv.shutdown()
 
@@ -102,12 +126,8 @@ def test_bad_host_rejected(tmp_path):
 def test_post_without_token_unauthorized(tmp_path):
     srv = _make_server(tmp_path)
     try:
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{srv.server_address[1]}/api/agents/spawn",
-            data=b"{}")
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(req)
-        assert exc.value.code == 401
+        status, _, _ = _http(srv, "POST", "/api/agents/spawn", body=b"{}")
+        assert status == 401
     finally:
         srv.shutdown()
 
@@ -115,16 +135,24 @@ def test_post_without_token_unauthorized(tmp_path):
 def test_post_with_token_dispatcher_not_ready(tmp_path):
     srv = _make_server(tmp_path)
     try:
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{srv.server_address[1]}/api/agents/spawn",
-            data=b"{}", headers={"X-Auth-Token": "t"})
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(req)
-        assert exc.value.code == 503
-        body = json.loads(exc.value.read())
-        assert body["error"] == "dispatcher not ready"
+        status, _, body = _http(srv, "POST", "/api/agents/spawn", body=b"{}",
+                                headers={"X-Auth-Token": "t"})
+        assert status == 503
+        assert json.loads(body)["error"] == "dispatcher not ready"
     finally:
         srv.shutdown()
+
+
+def _request_json(srv, path: str):
+    """受控 GET（http.client + 纯字面量路径）：返回 (status, bytes)。"""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read()
+    status = resp.status
+    conn.close()
+    return status, body
 
 
 def test_snapshot_returns_agents_events_usage(tmp_path):
@@ -138,9 +166,9 @@ def test_snapshot_returns_agents_events_usage(tmp_path):
         srv.db.upsert_usage(agent_id=aid, model="aggregate", input_tokens=10,
                             output_tokens=5, cache_creation=0, cache_read=2,
                             cost_usd=0.1)
-        resp = urllib.request.urlopen(
-            f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot?session_id=snap1")
-        body = json.loads(resp.read())
+        status, body = _request_json(srv, "/api/snapshot?session_id=snap1&token=t")
+        assert status == 200
+        body = json.loads(body)
         assert [a["id"] for a in body["agents"]] == [aid]
         assert body["agents"][0]["status"] == "terminated"
         assert body["agents"][0]["stop_reason"] == "end_turn"
@@ -153,20 +181,20 @@ def test_snapshot_returns_agents_events_usage(tmp_path):
         srv.shutdown()
 
 
-def test_snapshot_no_token_and_session_filter(tmp_path):
+def test_snapshot_auth_and_session_filter(tmp_path):
+    """A6 收紧后语义：无令牌 401；?token= 放行；session 过滤照旧。"""
     srv = _make_server(tmp_path)
     try:
         srv.db.insert_agent(parent_id=None, session_id="only", task_name="a",
                             cli="claude", model=None, cwd=str(tmp_path))
-        resp = urllib.request.urlopen(
-            f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot")
-        body = json.loads(resp.read())
+        status, _ = _request_json(srv, "/api/snapshot")
+        assert status == 401
+        status, body = _request_json(srv, "/api/snapshot?token=t")
+        assert status == 200
+        body = json.loads(body)
         assert [a["task_name"] for a in body["agents"]] == ["a"]
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{srv.server_address[1]}/api/snapshot?session_id=nope")
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(req)
-        assert exc.value.code == 400
+        status, _ = _request_json(srv, "/api/snapshot?token=t&session_id=nope")
+        assert status == 400
     finally:
         srv.shutdown()
 
@@ -185,7 +213,7 @@ def test_events_last_seq_replays_persisted_events_then_live(tmp_path):
 
         def read():
             conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
-            conn.request("GET", "/events?last_seq=1")
+            conn.request("GET", "/events?last_seq=1&token=t")
             resp = conn.getresponse()
             got.append(resp.read1(65536))  # 回放段即时写出
             time.sleep(0.6)
@@ -227,7 +255,7 @@ def test_events_replays_over_1000_persisted_events_tail_delivered(tmp_path):
 
         def read():
             conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
-            conn.request("GET", "/events?last_seq=3")
+            conn.request("GET", "/events?last_seq=3&token=t")
             resp = conn.getresponse()
             deadline = time.time() + 25
             while time.time() < deadline:
@@ -273,7 +301,7 @@ def test_events_replay_over_1000_with_live_publish_race_no_dup(tmp_path):
 
         def read():
             conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=10)
-            conn.request("GET", "/events?last_seq=3")
+            conn.request("GET", "/events?last_seq=3&token=t")
             resp = conn.getresponse()
             deadline = time.time() + 25
             while time.time() < deadline:

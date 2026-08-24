@@ -191,11 +191,20 @@ def test_installed_session_hook_starts_daemon_and_opens_monitor(tmp_path):
         body = ""
         while time.time() < deadline:
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as response:
-                    if response.status == 200:
-                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=0.5) as page:
-                            body = page.read().decode()
-                        break
+                import http.client as _hc
+                conn = _hc.HTTPConnection("127.0.0.1", port, timeout=0.5)
+                conn.request("GET", "/health")
+                response = conn.getresponse()
+                if response.status == 200:
+                    response.read()
+                    conn.close()
+                    conn2 = _hc.HTTPConnection("127.0.0.1", port, timeout=0.5)
+                    conn2.request("GET", "/")
+                    page = conn2.getresponse()
+                    body = page.read().decode()
+                    conn2.close()
+                    break
+                conn.close()
             except OSError:
                 time.sleep(0.1)
         assert "Agent MCP" in body

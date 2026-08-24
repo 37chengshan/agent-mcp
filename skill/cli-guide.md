@@ -3,6 +3,9 @@
 > **本文件是派发选型的唯一权威参考**：`spawn_agent(target_cli=...)` / `followup_task` 选载体、选模型、估等待节奏时对照本表。
 > **时效**：2026-08 快照（模型/分数随发布变动，用前可复查）；分数为第三方或厂商自报基准，仅供参考。
 > **用法**：先按「任务类型 → 首选/次选」表快速定位，再看各 CLI 能力详情确认，最后回 SKILL.md §3 匹配 target_cli。
+> **客观基准快照**：第三方聚合指数（Artificial Analysis via OpenRouter，as_of 2026-08-19）与成本档位速查见
+> [docs/research/harness-model-benchmarks-2026-08-24.md](../docs/research/harness-model-benchmarks-2026-08-24.md)——
+> 数据仅供参考，最终 CLI × 模型组合始终由调用方显式指定。
 
 ---
 

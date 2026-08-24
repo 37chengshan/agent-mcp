@@ -51,6 +51,8 @@ class OrchestratedTask:
     retry_count: int = 0
     refinement_prompt: str | None = None  # 审查未通过时的二次修正提示模版
     on_complete_hook: Callable[[OrchestratedTask, list[OrchestratedTask]], None] | None = None
+    # B4: daemon 审计链产出的变更清单（file_path/change_type），供 diff-based 审查
+    file_diffs: list[dict[str, Any]] = field(default_factory=list)
 
 
     def to_dict(self) -> dict[str, Any]:
@@ -123,7 +125,8 @@ class Orchestrator:
             return None
         branch = f"agent-{safe_id}"
         path = f"{self.base_dir.rstrip('/')}/.worktrees/{safe_id}"
-        code, out = self.git_runner(["git", "worktree", "add", "-b", branch, path])
+        # -C base_dir：绑定用户指定的仓库，而非 daemon 进程 cwd 所在仓库
+        code, out = self.git_runner(["git", "-C", self.base_dir, "worktree", "add", "-b", branch, path])
         if code != 0:
             task.error = f"git worktree add 失败: {out[:300]}"
             return None
@@ -134,7 +137,8 @@ class Orchestrator:
         """M8：任务失败/结束时清理 worktree（分支残留由用户决定，仅移除 worktree）。"""
         if not task.worktree_path or not self.base_dir:
             return
-        self.git_runner(["git", "worktree", "remove", "--force", task.worktree_path])
+        self.git_runner(["git", "-C", self.base_dir, "worktree", "remove", "--force",
+                         task.worktree_path])
 
     def _spawn_one(self, task: OrchestratedTask) -> None:
         cwd = self._prepare_worktree(task)
@@ -153,6 +157,10 @@ class Orchestrator:
         result = self.waiter(task.agent_id)
         summary = str(result.get("summary") or "")
         status = str(result.get("status") or "error")
+        # B4: 透传 daemon 审计链的变更清单，供 diff-based 审查
+        diffs = result.get("file_diffs")
+        if isinstance(diffs, list):
+            task.file_diffs = diffs
         if status in ("terminated", "completed"):
             task.output = summary
             task.status = STATUS_DONE
@@ -162,11 +170,19 @@ class Orchestrator:
             self._cleanup_worktree(task)
 
     def _review_and_refine_task(self, task: OrchestratedTask) -> None:
-        """跨厂商审查与自动反馈闭环 (Auto-Refinement loop)。"""
+        """跨厂商审查与自动反馈闭环 (Auto-Refinement loop)。
+
+        B4 升级：reviewer 输入从"输出摘要截断"升级为"摘要 + 审计变更清单"，
+        让审查者能对照真实文件改动核对结论（数据来自 A1 修复的 file_diffs）。"""
         if not task.review_by or task.status != STATUS_DONE:
             return
+        diff_lines = [f"- [{d.get('change_type')}] {d.get('file_path')}"
+                      for d in task.file_diffs[:20] if isinstance(d, dict)]
+        diff_block = ("\n工作区变更清单（daemon 审计，请对照摘要核实）：\n"
+                      + "\n".join(diff_lines)) if diff_lines else ""
         prompt = (f"请审查以下 agent 输出（写者 CLI: {task.cli}）。"
                   f"输出摘要：\n{task.output[:2000]}\n"
+                  f"{diff_block}\n"
                   f"请给出：1) 正确性结论 2) 问题清单 3) 改进建议。"
                   f"若存在严重缺陷且需要返工，请在回复首行输出 [REJECT]，否则输出 [APPROVE]。")
         try:
@@ -179,6 +195,8 @@ class Orchestrator:
             if "[REJECT]" in review_text and task.retry_count < task.max_retries:
                 task.retry_count += 1
                 refine_prompt = (
+                    f"{task.refinement_prompt}\n" if task.refinement_prompt else ""
+                ) + (
                     f"前次执行未通过跨厂商审查（审查者: {task.review_by}）。\n"
                     f"审查意见：\n{review_text[:1500]}\n"
                     f"原始需求：\n{task.prompt}\n"

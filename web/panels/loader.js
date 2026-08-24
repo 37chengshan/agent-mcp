@@ -41,12 +41,21 @@ function injectCss(){
 
 /* ---------- SSE ---------- */
 
+/* A6：令牌读取——daemon 注入的全局变量优先，回退 URL hash（#token=...）。
+   SSE EventSource 无法带 header，统一走 ?token= 查询通道。 */
+function amToken(){
+  if(window.__amToken) return window.__amToken;
+  const m = location.hash.match(/token=([^&]+)/);
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
 function getSse(){
   const existing = window.__amSse;
   if(existing && (existing.readyState === EventSource.CONNECTING || existing.readyState === EventSource.OPEN)){
     sse = existing;
   }else{
-    sse = new EventSource(SSE_URL);
+    const tk = amToken();
+    sse = new EventSource(tk ? `${SSE_URL}?token=${encodeURIComponent(tk)}` : SSE_URL);
     window.__amSse = sse;
   }
   sse.onopen = () => setSseDot(true);
@@ -130,7 +139,8 @@ async function refreshHeaderCapsules(){
 
 function apiFetchSafe(path){
   const headers = {};
-  if(window.__amToken) headers["X-Auth-Token"] = window.__amToken;
+  const t = amToken();
+  if(t) headers["X-Auth-Token"] = t;
   return fetch(path, { headers }).then(r => r.json().catch(() => ({}))).catch(() => ({}));
 }
 function fmtUsdSafe(v){ return "$" + (Number(v)||0).toFixed(2); }

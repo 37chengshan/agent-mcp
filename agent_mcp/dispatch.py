@@ -200,9 +200,10 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
     if sandbox_container:
         cli_cmd = build_container_sandbox_command(
             cli_cmd,
-            cwd=cwd,
             image=sandbox_container,
-            network=sandbox_network,
+            mount_cwd=cwd,
+            network_disabled=str(sandbox_network).strip().lower()
+            not in ("", "false", "0", "off"),
             read_only=(permission_mode == "plan"),
         )
     state_dir = Path(state_dir)

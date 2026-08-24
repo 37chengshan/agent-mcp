@@ -11,7 +11,7 @@ EVENT_TYPES = frozenset({
     # 异常/运维路径（daemon 广播但不在常规链路；需持久化 + 前端可见）
     "agent.orphaned", "agent.needs_advisor",
     "agent.verify_failed", "agent.verify_passed",
-    "agent.budget_downgrade", "agent.ingest_failed",
+    "agent.budget_downgrade", "agent.ingest_failed", "agent.audit_failed",
 })
 NON_PERSISTED = frozenset({"agent.message_delta"})
 

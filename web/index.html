@@ -327,7 +327,7 @@ h2.aname{letter-spacing:-.015em}
  * 单文件零依赖。canvas pan/zoom + 增量渲染 + SSE 退避重连
  * + Gantt + token 面板 + replay scrubber + template 详情 + 异常 badges + 明暗主题
  * ============================================================ */
-const EVENT_TYPES=["agent.spawned","agent.user_turn","agent.running","agent.message","agent.message_delta","agent.tool_use","agent.tool_result","agent.usage","agent.thread_message_sent","agent.thread_message_received","agent.idle","agent.terminated","agent.error","agent.cancelled","agent.orphaned","agent.needs_advisor","agent.verify_failed","agent.verify_passed","agent.budget_downgrade","agent.ingest_failed"];
+const EVENT_TYPES=["agent.spawned","agent.user_turn","agent.running","agent.message","agent.message_delta","agent.tool_use","agent.tool_result","agent.usage","agent.thread_message_sent","agent.thread_message_received","agent.idle","agent.terminated","agent.error","agent.cancelled","agent.orphaned","agent.needs_advisor","agent.verify_failed","agent.verify_passed","agent.budget_downgrade","agent.ingest_failed","agent.audit_failed"];
 const SEQ_KEY="amcp_last_seq",SEL_KEY="amcp_sel",MSG_PAGE=40;
 
 /* 全局状态 */
@@ -384,7 +384,7 @@ async function loadSnapshot(reset){
   if(reset)clearState();
   const q=S.session!=="all"?"?session_id="+encodeURIComponent(S.session):"";
   try{
-    const r=await fetch("/api/snapshot"+q);
+    const r=await fetch("/api/snapshot"+q,{headers:{"X-Auth-Token":S.token}});
     if(!r.ok){S.snapErr="快照不可用 ("+r.status+")";scheduleRender();return;}
     applySnapshot(await r.json(),reset);S.snapErr="";
   }catch(e){S.snapErr="无法连接 daemon";scheduleRender();}
@@ -427,7 +427,11 @@ function scheduleSnapshot(){
 /* U4: 1s/2s/5s 退避重连，断线期间标 BUFFERED */
 function connect(){
   const last=localStorage.getItem(SEQ_KEY);
-  const es=new EventSource("/events"+(last?"?last_seq="+last:""));
+  /* A6：SSE 需鉴权，EventSource 无法带 header → 走 ?token= 查询通道 */
+  const qs=new URLSearchParams();
+  if(last)qs.set("last_seq",last);
+  if(S.token)qs.set("token",S.token);
+  const es=new EventSource("/events"+(qs.toString()?"?"+qs.toString():""));
   S.sseEs=es;S.sse="connecting";S.sseRetry=0;
   es.onopen=()=>{S.sse="connected";S.sseRetry=0;scheduleRender();};
   es.onerror=()=>{

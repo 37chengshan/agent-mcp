@@ -130,7 +130,8 @@ def test_worktree_created_and_spawn_cwd_points_there():
     orch.add_task(OrchestratedTask(task_id="w1", prompt="p0", worktree=True))
     result = orch.run()
     assert result["valid"] is True
-    assert any(cmd[:4] == ["git", "worktree", "add", "-b"] for cmd in git_calls)
+    assert any(cmd[:6] == ["git", "-C", "/repo", "worktree", "add", "-b"]
+               for cmd in git_calls)
     # spawn cwd 指向 worktree 路径
     assert fake.spawned[0][2] == "/repo/.worktrees/w1"
     assert orch.tasks["w1"].worktree_path == "/repo/.worktrees/w1"

@@ -108,6 +108,17 @@ class DB:
             self._init_conn.execute("ALTER TABLE events ADD COLUMN payload_z BLOB")
         except sqlite3.OperationalError:
             pass  # 列已存在
+        # A5 生命周期闭环：queued 任务参数与 worker spawn 信息落库（重启可恢复）
+        try:
+            self._init_conn.execute(
+                "ALTER TABLE agents ADD COLUMN pending_params TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+        try:
+            self._init_conn.execute(
+                "ALTER TABLE agents ADD COLUMN worker_info TEXT")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         self.max_events = max_events
         self.retention_days = retention_days
         self.max_messages_per_agent = max_messages_per_agent
@@ -204,6 +215,29 @@ class DB:
                 conn.rollback()
                 raise
 
+    def set_cli(self, agent_id: int, cli: str) -> None:
+        """B3: 跨底座续跑时更新 agent 的 CLI 归属（画像与监控页口径一致）。"""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("UPDATE agents SET cli=? WHERE id=?", (cli, agent_id))
+            conn.commit()
+
+    def set_pending_params(self, agent_id: int, params_json: str | None) -> None:
+        """A5: queued 任务的 spawn 参数持久化（重启后可恢复派发）；开始运行时清空。"""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("UPDATE agents SET pending_params=? WHERE id=?",
+                         (params_json, agent_id))
+            conn.commit()
+
+    def set_worker_info(self, agent_id: int, info_json: str | None) -> None:
+        """A5: worker spawn 关键信息（pid/state/out/err 路径）落库，供 daemon 重启后收尸认领。"""
+        with self._lock:
+            conn = self._conn()
+            conn.execute("UPDATE agents SET worker_info=? WHERE id=?",
+                         (info_json, agent_id))
+            conn.commit()
+
     def set_status(self, agent_id: int, status: str, *, stop_reason: str | None = None,
                    pid: int | None = None, cli_session_id: str | None = None) -> None:
         with self._lock:
@@ -239,17 +273,24 @@ class DB:
 
     def agents_by_session(self, session_id: str | None) -> list[dict[str, Any]]:
         """F3:一条 LEFT JOIN 取 agents + 每个 agent 最后一条 message（last_message 字段），
-        消除 N+1（旧逐行 messages_for(size=1)）。无消息时 last_message=''。"""
-        sql = ("SELECT a.*, COALESCE(m.content, '') AS last_message FROM agents a"
-               " LEFT JOIN (SELECT agent_id, content FROM messages WHERE id IN"
-               " (SELECT MAX(id) FROM messages GROUP BY agent_id)) m"
-               " ON m.agent_id = a.id")
+        消除 N+1（旧逐行 messages_for(size=1)）。无消息时 last_message=''。
+        两条 SQL 均为字面量；session_id 经占位符参数化。"""
         conn = self._conn()
         if session_id is None:
-            rows = conn.execute(sql + " ORDER BY a.id").fetchall()
+            rows = conn.execute(
+                "SELECT a.*, COALESCE(m.content, '') AS last_message FROM agents a"
+                " LEFT JOIN (SELECT agent_id, content FROM messages WHERE id IN"
+                " (SELECT MAX(id) FROM messages GROUP BY agent_id)) m"
+                " ON m.agent_id = a.id"
+                " ORDER BY a.id").fetchall()
         else:
-            rows = conn.execute(sql + " WHERE a.session_id=? ORDER BY a.id",
-                                (session_id,)).fetchall()
+            rows = conn.execute(
+                "SELECT a.*, COALESCE(m.content, '') AS last_message FROM agents a"
+                " LEFT JOIN (SELECT agent_id, content FROM messages WHERE id IN"
+                " (SELECT MAX(id) FROM messages GROUP BY agent_id)) m"
+                " ON m.agent_id = a.id"
+                " WHERE a.session_id=? ORDER BY a.id",
+                (session_id,)).fetchall()
         return [dict(r) for r in rows]
 
     def insert_event(self, *, agent_id: int, type: str, payload: dict,

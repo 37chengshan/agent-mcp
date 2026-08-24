@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 import threading
 import time
@@ -76,9 +77,25 @@ _MEMORY_KINDS = ("decision", "lesson", "convention", "final_answer")
 
 
 def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[bool, str]:
-    """daemon 自跑 verify_command，返回 (ok, output)。超时计失败。"""
+    """daemon 自跑 verify_command，返回 (ok, output)。超时计失败。
+
+    A6 安全收敛：shell=False + shlex 切词执行——不再经 shell 解释 ;|&$ 等
+    元字符（verify_command 来自 LLM/用户输入，此前等价于以 daemon 权限执行
+    任意 shell）。无法安全切词时判失败并说明，不静默降级。
+    可选白名单：AGENT_MCP_VERIFY_ALLOW_PREFIXES（逗号分隔）非空时，
+    首个 token 必须命中前缀之一。"""
     try:
-        proc = subprocess.run(verify_command, shell=True, cwd=cwd,
+        cmd = shlex.split(verify_command)
+    except ValueError as exc:
+        return False, f"[verify command rejected: cannot safely parse ({exc})]"
+    if not cmd:
+        return False, "[verify command rejected: empty command]"
+    allow = [p for p in os.environ.get("AGENT_MCP_VERIFY_ALLOW_PREFIXES", "").split(",") if p]
+    if allow and not any(cmd[0] == p or cmd[0].startswith(p) for p in allow):
+        return False, (f"[verify command rejected: '{cmd[0]}' not in "
+                       f"AGENT_MCP_VERIFY_ALLOW_PREFIXES allowlist]")
+    try:
+        proc = subprocess.run(cmd, shell=False, cwd=cwd,
                               capture_output=True, text=True, timeout=timeout)
         output = (proc.stdout or "") + (proc.stderr or "")
         return proc.returncode == 0, output
@@ -336,6 +353,7 @@ class Dispatcher:
         self._monitor_interval = monitor_interval
         self._workers: dict[int, dict[str, Any]] = {}   # agent_id -> spawn info
         self._pending: dict[int, tuple[str, str, str, dict]] = {}  # 排队中的 spawn 参数
+        self._EVENTS_CAP = 512  # A5: _events 容量上限（超限淘汰已 set 的最旧条目）
         self._offsets: dict[int, dict[str, int]] = {}  # agent_id -> {path: 已 tail 字节数}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -360,9 +378,35 @@ class Dispatcher:
 
     # ---- 生命周期 ----
 
+    def _take_pending(self, agent_id: int) -> tuple | None:
+        """A5: 弹出内存排队参数并清掉 DB 持久化副本（开始运行即无需再恢复）。
+
+        所有"从 _pending 取参开跑"的路径必须经此方法，保证内存与落库副本一致。"""
+        with self._lock:
+            params = self._pending.pop(agent_id, None)
+        try:
+            self.db.set_pending_params(agent_id, None)
+        except Exception as exc:
+            print(f"[dispatcher] clear pending failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
+        return params
+
+    def _cap_events_locked(self) -> None:
+        """A5: _events 容量回收——超上限时淘汰已 set（终态已信号）的最旧条目。
+
+        长驻 daemon 此前永不回收，属内存泄漏。必须在持有 self._lock 时调用。
+        迟到的 wait 者不受影响：wait_agent 有 GRACE/超时兜底，会回落 DB 终态查询。"""
+        overflow = len(self._events) - self._EVENTS_CAP
+        if overflow <= 0:
+            return
+        for k in [k for k, v in self._events.items() if v.is_set()][:overflow]:
+            self._events.pop(k, None)
+
     def start(self) -> None:
         # D2: 启动前扫 DB 所有 running 状态的 agent，worker_pid 不存活则标 incomplete
         self._recover_orphans()
+        # A5: 恢复重启前排队中的任务（pending_params 落库副本）
+        self._rehydrate_queue()
         if self._thread is None:
             self._thread = threading.Thread(target=self._monitor, daemon=True,
                                             name="dispatcher-monitor")
@@ -376,8 +420,14 @@ class Dispatcher:
             self._hb_thread.start()
 
     def _recover_orphans(self) -> None:
-        """D2: 扫 DB 所有 running 状态的 agent，worker_pid 不存活（daemon 崩溃后孤儿）
-        则标 incomplete + 孤儿日志事件。"""
+        """D2+A5: 扫 DB 所有 running 状态的 agent，按 worker_pid 存活与否分流。
+
+        - pid 不存活（daemon 崩溃后孤儿）→ 标 incomplete + 孤儿事件（原 D2 行为）；
+        - pid 仍存活 → 旧 daemon 的 watcher 已丢失，据落库 worker_info 重建 info
+          并重新挂 psutil watcher「认领」，退出后照常走 _check_worker。
+          认领的 run 无 initial_snapshot/body：审计结算与 verify 回投自动跳过，
+          属诚实降级而非静默丢失。
+        """
         try:
             agents = self.db.agents_by_session(None)
         except Exception:
@@ -386,14 +436,67 @@ class Dispatcher:
             if agent.get("status") != "running":
                 continue
             pid = agent.get("pid")
-            if is_pid_running(pid):
-                continue  # worker 仍活，不回收
             agent_id = agent["id"]
-            self._set_status(agent_id, "incomplete", stop_reason="orphaned")
-            self._broadcast("agent.orphaned", {
-                "agent_id": agent_id, "worker_pid": pid,
-                "message": "daemon restarted; worker_pid no longer alive"
+            if not is_pid_running(pid):
+                self._set_status(agent_id, "incomplete", stop_reason="orphaned")
+                self._broadcast("agent.orphaned", {
+                    "agent_id": agent_id, "worker_pid": pid,
+                    "message": "daemon restarted; worker_pid no longer alive"
+                }, agent_id)
+                continue
+            # A5: 认领仍存活的 worker
+            info: dict[str, Any] = {"adopted": True, "cwd": agent.get("cwd") or ""}
+            try:
+                raw = agent.get("worker_info")
+                if raw:
+                    info.update(json.loads(raw))
+            except (TypeError, ValueError):
+                pass  # worker_info 损坏按最小 info 认领；state_path 缺失时完成检测走孤儿分支
+            with self._lock:
+                self._workers[agent_id] = info
+                t = threading.Thread(target=self._worker_watcher, args=(agent_id,),
+                                     daemon=True, name=f"worker-watch-{agent_id}")
+                self._watchers[agent_id] = t
+            t.start()
+            self._broadcast("agent.running", {
+                "agent_id": agent_id, "pid": pid, "adopted": True,
+                "message": "daemon restarted; surviving worker re-adopted"
             }, agent_id)
+
+    def _rehydrate_queue(self) -> None:
+        """A5: 恢复上次 daemon 退出时排队中的任务（agents.pending_params 落库副本）。
+
+        有空槽则立即开跑；无空槽则回内存 _pending + SlotScheduler 排队，
+        由既有补位机制（_release_and_promote → _start_queued）在槽位释放时接续。
+        落库参数损坏的记录标失败，避免永久滞留 queued。"""
+        try:
+            agents = self.db.agents_by_session(None)
+        except Exception:
+            return
+        for agent in agents:
+            if agent.get("status") != "queued" or not agent.get("pending_params"):
+                continue
+            agent_id = agent["id"]
+            try:
+                loaded = json.loads(agent["pending_params"])
+                if not (isinstance(loaded, list) and len(loaded) == 4):
+                    raise ValueError("bad shape")
+                params: tuple = tuple(loaded)
+            except (TypeError, ValueError):
+                self._fail(agent_id, stop_reason="queued_params_corrupted",
+                           message="persisted pending_params unparseable after restart",
+                           error_type="state_corrupted",
+                           hint="respawn the task with spawn_agent")
+                continue
+            with self._lock:
+                self._pending[agent_id] = params
+                self._events.setdefault(agent_id, threading.Event())
+                self._cap_events_locked()
+            body = params[3] if isinstance(params[3], dict) else {}
+            is_write = (body.get("permission_mode") or "plan") in ("acceptEdits", "fullAccess")
+            if self._scheduler.acquire(str(agent_id), is_write=is_write):
+                self._take_pending(agent_id)
+                self._run_worker(agent_id, *params)
 
     def stop(self) -> None:
         self._stop.set()
@@ -401,14 +504,22 @@ class Dispatcher:
         if self._hb_thread is not None:
             self._hb_thread.join(timeout=2)
             self._hb_thread = None
+        # A5：停机前把策略引擎脏状态刷盘（热路径已去同步写，靠此兜底）
+        try:
+            self.policy_engine.save_if_dirty()
+        except Exception as exc:
+            print(f"[dispatcher] policy save on stop failed: {exc}", file=sys.stderr)
         if self._thread is not None:
             self._thread.join(timeout=2)
             self._thread = None
 
     def _heartbeat_loop(self) -> None:
         """F4: 低频心跳线程——1s/touch_activity 更 updated_at，作存活证据源；
-        空闲 daemon CPU≈0（仅 sleep+轻量 UPDATE）。"""
+        空闲 daemon CPU≈0（仅 sleep+轻量 UPDATE）。A5：每 30s 顺带把策略引擎
+        的脏状态落盘（save_if_dirty），替代原先 usage 结算热路径的同步写。"""
+        tick = 0
         while not self._hb_stop.wait(1.0):
+            tick += 1
             with self._lock:
                 ids = list(self._workers)
             for agent_id in ids:
@@ -416,6 +527,11 @@ class Dispatcher:
                     self.db.touch_activity(agent_id)
                 except Exception:
                     pass  # 心跳失败不致命，下一轮重试
+            if tick % 30 == 0:
+                try:
+                    self.policy_engine.save_if_dirty()
+                except Exception as exc:
+                    print(f"[dispatcher] policy save failed: {exc}", file=sys.stderr)
 
     def _monitor(self) -> None:
         # F6: worker 终态由 _worker_watcher（proc.wait 阜塞）驱动，不再轮询 _check_worker；
@@ -505,10 +621,16 @@ class Dispatcher:
         params = (target_cli, prompt, cwd, body)
         with self._lock:
             self._pending[agent_id] = params
+            self._cap_events_locked()
+        # A5: 排队参数落库，daemon 重启后可恢复派发
+        try:
+            self.db.set_pending_params(agent_id, json.dumps(params, ensure_ascii=False))
+        except Exception as exc:
+            print(f"[dispatcher] persist pending failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
         is_write = (body.get("permission_mode") or "plan") in ("acceptEdits", "fullAccess")
         if self._scheduler.acquire(str(agent_id), is_write=is_write):
-            with self._lock:
-                self._pending.pop(agent_id, None)
+            self._take_pending(agent_id)
             res = self._run_worker(agent_id, *params)
         else:
             res = self._agent_result(agent_id, status="queued", pid=None)
@@ -578,15 +700,31 @@ class Dispatcher:
             "resume": resume,
         }
         params = (agent["cli"], merged, agent["cwd"], body)
+        # B3: followup 允许显式 target_cli 跨底座续跑（用户/主 Agent 指定，
+        # 系统不擅自更换）；切换即更新 DB 归属，保证画像与监控口径一致
+        override_cli = str(body.get("target_cli") or "").strip()
+        if override_cli and override_cli != agent["cli"]:
+            get_adapter(override_cli)  # 未注册适配器 → ValueError 结构化报错
+            params = (override_cli, merged, agent["cwd"], body)
+            self.db.set_cli(agent_id, override_cli)
+            self._broadcast("agent.user_turn", {
+                "text": f"target_cli switched to {override_cli} (user-declared)",
+                "kind": "harness_switch"}, agent_id)
         # L3: expected_end_seconds——按当前 run 的 timeout_seconds 推估结束时间戳
         expected_end = (time.time() + timeout_seconds) if timeout_seconds else None
         with self._lock:
             self._pending[agent_id] = params
+            self._cap_events_locked()
+        # A5: followup 排队参数同样落库
+        try:
+            self.db.set_pending_params(agent_id, json.dumps(params, ensure_ascii=False))
+        except Exception as exc:
+            print(f"[dispatcher] persist pending failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
         # 终态 agent 续跑：先释放旧槽位（watcher 退出时可能未清），否则 acquire 返 False 误 queued
         self._scheduler.remove(str(agent_id))
         if self._scheduler.acquire(str(agent_id)):
-            with self._lock:
-                self._pending.pop(agent_id, None)
+            self._take_pending(agent_id)
             res = self._run_worker(agent_id, *params)
             res["merged_messages"] = len(pending_msgs)
             res["resumed_session_id"] = resume
@@ -720,7 +858,14 @@ class Dispatcher:
                                       usage_incomplete=False)
         with self._lock:
             info = self._workers.pop(agent_id, None)
-            self._pending.pop(agent_id, None)
+            cancelled_pending = self._pending.pop(agent_id, None)
+        if cancelled_pending is not None:
+            # A5：取消排队任务时同步清掉落库副本
+            try:
+                self.db.set_pending_params(agent_id, None)
+            except Exception as exc:
+                print(f"[dispatcher] clear pending failed for agent {agent_id}: {exc}",
+                      file=sys.stderr)
         if info and info.get("worker_pid"):
             terminate_process_tree(info["worker_pid"])
             self._release_and_promote(str(agent_id))
@@ -809,45 +954,68 @@ class Dispatcher:
 
     # ---- P2P 信箱与共识投票 ----
 
+    def _require_mailbox_member(self, body: dict) -> int:
+        """A6: mailbox/consensus 身份校验——from_agent_id 必须是真实存在的 agent；
+        调用方提供 session_id 时还须同会话，防跨会话/伪造身份投票与广播。
+        会话不符的报错文案复用 SESSION_MISMATCH_MARK 短语供 MCP 层分流。"""
+        raw = body.get("from_agent_id")
+        try:
+            agent_id = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError("from_agent_id 必须是整数 agent id")
+        agent = self.db.get_agent(agent_id)
+        if agent is None:
+            raise ValueError(f"from_agent_id {agent_id} 不存在（拒绝伪造身份）")
+        session_id = body.get("session_id")
+        if session_id and agent.get("session_id") != session_id:
+            raise ValueError(f"agent {agent_id} does not belong to session {session_id}")
+        return agent_id
+
     def mailbox_send(self, body: dict) -> dict:
         mgr = MailboxManager(self.db)
-        team = body.get("team") or "default"
-        from_agent_id = int(body.get("from_agent_id") or 0)
+        team = str(body.get("team") or "default")
+        from_agent_id = self._require_mailbox_member(body)
         to_agent_id = body.get("to_agent_id")
         to_id = int(to_agent_id) if to_agent_id is not None else None
-        msg_type = body.get("msg_type") or "message"
+        msg_type = str(body.get("msg_type") or "text")
         payload = body.get("payload")
         message = str(body.get("message") or "")
-        mid = mgr.send_message(team=team, from_agent_id=from_agent_id, to_agent_id=to_id,
-                               msg_type=msg_type, payload=payload, message=message)
+        mid = mgr.send(team_id=team, from_agent_id=from_agent_id, to_agent_id=to_id,
+                       msg_type=msg_type, payload=payload, message=message)
         return {"id": mid, "status": "sent"}
 
     def mailbox_fetch(self, body: dict) -> dict:
         mgr = MailboxManager(self.db)
-        team = body.get("team") or "default"
+        team = str(body.get("team") or "default")
         agent_id = body.get("agent_id")
-        aid = int(agent_id) if agent_id is not None else None
+        if agent_id is None:
+            raise ValueError("agent_id 必填（收件箱归属的 agent）")
+        aid = int(agent_id)
         unread_only = bool(body.get("unread_only", True))
         limit = min(max(int(body.get("limit") or 20), 1), 100)
-        msgs = mgr.fetch_messages(team=team, agent_id=aid, unread_only=unread_only, limit=limit)
+        msgs = mgr.fetch_inbox(team_id=team, agent_id=aid, unread_only=unread_only, limit=limit)
         return {"messages": msgs}
 
     def consensus_vote(self, body: dict) -> dict:
         mgr = MailboxManager(self.db)
-        team = body.get("team") or "default"
-        from_agent_id = int(body.get("from_agent_id") or 0)
+        team = str(body.get("team") or "default")
         action = body.get("action") or "vote"  # "propose" | "vote" | "tally"
         if action == "propose":
+            from_agent_id = self._require_mailbox_member(body)
             proposal = str(body.get("proposal") or "")
-            mid = mgr.broadcast(team=team, from_agent_id=from_agent_id, message=proposal, msg_type="proposal")
+            mid = mgr.broadcast(team_id=team, from_agent_id=from_agent_id, message=proposal,
+                                msg_type="proposal")
             return {"id": mid, "status": "proposed"}
         elif action == "vote":
+            from_agent_id = self._require_mailbox_member(body)
             vote_val = bool(body.get("vote", True))
             reason = str(body.get("reason") or "")
-            mid = mgr.send_vote(team=team, from_agent_id=from_agent_id, vote=vote_val, reason=reason)
+            topic = body.get("topic")
+            mid = mgr.send_vote(team_id=team, from_agent_id=from_agent_id,
+                                vote=vote_val, topic=topic, reason=reason)
             return {"id": mid, "status": "voted"}
         elif action == "tally":
-            res = mgr.tally_votes(team=team)
+            res = mgr.tally_votes(team_id=team, topic=body.get("topic"))
             return {"tally": res}
         else:
             raise ValueError(f"Unknown action {action}")
@@ -926,6 +1094,46 @@ class Dispatcher:
             print(f"[dispatcher] memory sink failed for agent {agent_id}: {exc}",
                   file=sys.stderr)
 
+    def _settle_workspace_audit(self, agent_id: int, info: dict) -> None:
+        """审计 Diff 结算：把 spawn 前快照与完成态快照比对入库（best-effort）。
+
+        失败必须留痕：写 agent.audit_failed 事件并广播，不得静默吞掉。
+        """
+        try:
+            initial_snap = info.get("initial_snapshot") or {}
+            cwd = info.get("cwd") or (self.db.get_agent(agent_id) or {}).get("cwd")
+            if not cwd or not os.path.exists(cwd) or not initial_snap:
+                return
+            final_snap = snapshot_workspace(cwd)
+            result = compute_workspace_diff(cwd, initial_snap, final_snap)
+            agent = self.db.get_agent(agent_id) or {}
+            session_id = str(agent.get("session_id") or "")
+            change_of: dict[str, str] = {}
+            for rel_path in result["modified"]:
+                change_of[rel_path] = "modified"
+            for rel_path in result["added"]:
+                change_of[rel_path] = "added"
+            for rel_path in result["deleted"]:
+                change_of[rel_path] = "deleted"
+            for rel_path in sorted(change_of):
+                self.db.record_file_diff(
+                    agent_id=agent_id, session_id=session_id,
+                    file_path=rel_path, change_type=change_of[rel_path],
+                    diff_content=result["diffs"].get(rel_path, ""))
+        except Exception as audit_exc:
+            try:
+                agent = self.db.get_agent(agent_id) or {}
+                seq = self.db.insert_event(
+                    agent_id=agent_id, type="agent.audit_failed",
+                    payload={"stage": "workspace_diff", "error": str(audit_exc)[:300]},
+                    session_id=str(agent.get("session_id") or ""))
+                self.broadcaster.publish(
+                    {"type": "agent.audit_failed", "agent_id": agent_id,
+                     "payload": {"error": str(audit_exc)[:200]}, "seq": seq}, seq=seq)
+            except Exception:
+                print(f"[audit] diff capture failed for agent {agent_id}: {audit_exc}",
+                      file=sys.stderr)
+
     # ---- 内部 ----
 
     def _run_worker(self, agent_id: int, target_cli: str, prompt: str,
@@ -943,6 +1151,13 @@ class Dispatcher:
             }
             if body.get("env") is not None:
                 worker_options["env"] = body["env"]
+            # 容器沙箱开关（实验性）：默认关闭；设置 AGENT_MCP_SANDBOX_IMAGE 后启用，
+            # AGENT_MCP_SANDBOX_NETWORK 非 "none"/"false"/"0"/"off" 时允许容器联网。
+            sandbox_image = os.environ.get("AGENT_MCP_SANDBOX_IMAGE")
+            if sandbox_image:
+                worker_options["sandbox_container"] = sandbox_image
+                worker_options["sandbox_network"] = os.environ.get(
+                    "AGENT_MCP_SANDBOX_NETWORK", "none")
             # 审计快照：记录启动前工作区状态
             initial_snapshot = snapshot_workspace(cwd)
             info = self._spawn_fn(target_cli, **worker_options)
@@ -957,6 +1172,15 @@ class Dispatcher:
             return self._agent_result(agent_id, status="error", error=str(exc))
         with self._lock:
             self._workers[agent_id] = info
+        # A5: worker 关键信息落库——daemon 重启后据此认领仍存活的 worker（收尸/续等）
+        try:
+            self.db.set_worker_info(agent_id, json.dumps(
+                {k: info.get(k) for k in ("worker_pid", "state_path", "out_path",
+                                          "err_path")},
+                ensure_ascii=False))
+        except Exception as exc:
+            print(f"[dispatcher] persist worker_info failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
         self._set_status(agent_id, "running", pid=info["worker_pid"])
         self._broadcast("agent.running", {"agent_id": agent_id,
                                           "pid": info["worker_pid"]}, agent_id)
@@ -1070,22 +1294,8 @@ class Dispatcher:
             return
         if not finished:
             return
-        # 审计 Diff 结算：生成工作区变更 Diff 并入库
-        try:
-            initial_snap = info.get("initial_snapshot") or {}
-            cwd = info.get("cwd") or (self.db.get_agent(agent_id) or {}).get("cwd")
-            if cwd and os.path.exists(cwd):
-                final_snap = snapshot_workspace(cwd)
-                diffs = compute_workspace_diff(initial_snap, final_snap)
-                for d in diffs:
-                    self.db.add_audit_diff(
-                        agent_id=agent_id,
-                        file_path=d["path"],
-                        change_type=d["change_type"],
-                        diff_text=d.get("diff_text", ""),
-                    )
-        except Exception as audit_exc:
-            print(f"[audit] diff capture failed for agent {agent_id}: {audit_exc}", file=sys.stderr)
+        # 审计 Diff 结算（best-effort，失败以 agent.audit_failed 事件留痕）
+        self._settle_workspace_audit(agent_id, info)
 
         agent = self.db.get_agent(agent_id)
         if agent is not None:
@@ -1165,8 +1375,15 @@ class Dispatcher:
 
     def _maybe_downgrade_on_budget(self, agent_id: int, agent: dict | None,
                                     body: dict) -> None:
-        """token_budget 超额 → 触发一次 followup 用低档 model 重跑（只降一档不连降）。
-        当前 run 不动，完成态后判，避免运行中换 model 不支持的 CLI。"""
+        """token_budget 超额后的降档决策（完成态判定，运行中不动）。
+
+        两种模式：
+        - 默认（未配置 downgrade_chain，v2 行为不变）：按 MODEL_DOWNGRADE
+          同 CLI 降一档，仅广播 agent.budget_downgrade 提示主 Agent 自行决定；
+        - B3 用户预声明链（body.downgrade_chain=[{"cli","model"},...]，opt-in）：
+          按链逐步广播明确的下一跳组合（含 to_cli），主 Agent 可据此直接
+          followup(target_cli=..., model=...) 跨底座重跑。
+          系统永不擅自更换用户未声明的组合；链走完即止。"""
         budget = float(body.get("token_budget") or 0)
         if budget <= 0 or agent is None:
             return
@@ -1177,9 +1394,39 @@ class Dispatcher:
         if agent.get("status") != "terminated":  # 只对成功态降档重跑
             return
         current_model = agent.get("model") or body.get("model")
+
+        # B3：用户预声明降档链（opt-in）
+        chain = body.get("downgrade_chain")
+        if isinstance(chain, list) and chain:
+            step = int(body.get("_downgrade_step") or 0)
+            if step >= len(chain):
+                return  # 链已走完，不连降
+            target = chain[step] if isinstance(chain[step], dict) else {}
+            target_cli = str(target.get("cli") or "").strip()
+            if not target_cli:
+                return
+            self._broadcast("agent.budget_downgrade",
+                            {"agent_id": agent_id,
+                             "from": current_model,
+                             "to": target.get("model"),
+                             "from_cli": agent.get("cli"),
+                             "to_cli": target_cli,
+                             "chain_step": step + 1,
+                             "chain_len": len(chain),
+                             "used_tokens": used,
+                             "budget": budget,
+                             "reason": "token_budget exceeded; user-declared "
+                                       "downgrade chain",
+                             "hint": f"followup(agent_id={agent_id}, "
+                                     f"target_cli='{target_cli}', "
+                                     f"prompt=original task) to continue on the "
+                                     f"user-declared cheaper harness"},
+                            agent_id)
+            return
+
         downgraded = MODEL_DOWNGRADE.get(current_model or "")
         if not downgraded:
-            return  # 已在最低档或无映射，不连降
+            return  # 已在最低档或无映射，不连降（v2 原行为）
         self._broadcast("agent.budget_downgrade",
                         {"agent_id": agent_id, "from": current_model,
                          "to": downgraded, "used_tokens": used,
@@ -1298,8 +1545,7 @@ class Dispatcher:
         if not has_pending:
             return
         if self._scheduler.acquire(str(agent_id)):
-            with self._lock:
-                params = self._pending.pop(agent_id, None)
+            params = self._take_pending(agent_id)
             if params is not None:
                 self._run_worker(agent_id, *params)
             else:
@@ -1311,8 +1557,7 @@ class Dispatcher:
             self._start_queued(promoted)
 
     def _start_queued(self, key: str) -> None:
-        with self._lock:
-            params = self._pending.pop(int(key), None)
+        params = self._take_pending(int(key))
         if params is None:
             self._release_and_promote(key)  # 被中断的排队任务：释放占位
             return
@@ -1342,8 +1587,13 @@ class Dispatcher:
                 0, session_id=agent["session_id"],
                 compress_consumed=True, keep_recent=5)
             events = [e for e in raw_events if e.get("agent_id") == agent["id"]]
+            # B4: 附带审计变更清单（编排层 diff-based 审查与监控展示的数据源）
+            file_diffs = [{"file_path": d.get("file_path"),
+                           "change_type": d.get("change_type")}
+                          for d in self.db.get_file_diffs(
+                              agent_id=agent["id"])[:20]]
             if return_ref:
-                return self._agent_result(
+                result = self._agent_result(
                     agent["id"], status="terminated",
                     stop_reason=agent["stop_reason"],
                     summary=final,
@@ -1353,11 +1603,14 @@ class Dispatcher:
                     ref={"agent_id": agent["id"],
                          "out_path": summary},
                     summary_preview=final[:200])
-            return self._agent_result(
-                agent["id"], status="terminated",
-                stop_reason=agent["stop_reason"], summary=final,
-                usage=usage_summary, events_compressed=True,
-                events=events)
+            else:
+                result = self._agent_result(
+                    agent["id"], status="terminated",
+                    stop_reason=agent["stop_reason"], summary=final,
+                    usage=usage_summary, events_compressed=True,
+                    events=events)
+            result["file_diffs"] = file_diffs
+            return result
         if agent["status"] == "error":
             msg = summary.strip() or agent.get("stop_reason", "")
             msg = _extract_final_answer(msg, summary_chars)
@@ -1449,17 +1702,27 @@ class Dispatcher:
             self.broadcaster.publish({"type": typ, "agent_id": agent_id,
                                       "payload": payload, "seq": seq}, seq=seq)
         if usage:
-            self.db.upsert_usage(agent_id=agent_id, model="aggregate",
-                                 input_tokens=usage.get("input_tokens", 0),
-                                 output_tokens=usage.get("output_tokens", 0),
-                                 cache_creation=usage.get("cache_creation", 0),
-                                 cache_read=usage.get("cache_read", 0),
-                                 cost_usd=usage.get("cost_usd", 0.0) or 0.0)
+            # B2 usage 结算统一口径：按适配器声明的 semantics 处理。
+            # authoritative 且总量全空 → 不覆盖既有累计（防尾随零清账）；
+            # cumulative → 最新累计值直接覆盖（禁止二次累加）。
+            semantics = getattr(adapter, "usage_semantics", "authoritative")
+            empty_totals = not any(
+                int(usage.get(k) or 0)
+                for k in ("input_tokens", "output_tokens", "cache_creation",
+                          "cache_read")) and not (usage.get("cost_usd") or 0.0)
+            skip_upsert = semantics == "authoritative" and empty_totals
+            if not skip_upsert:
+                self.db.upsert_usage(agent_id=agent_id, model="aggregate",
+                                     input_tokens=usage.get("input_tokens", 0),
+                                     output_tokens=usage.get("output_tokens", 0),
+                                     cache_creation=usage.get("cache_creation", 0),
+                                     cache_read=usage.get("cache_read", 0),
+                                     cost_usd=usage.get("cost_usd", 0.0) or 0.0)
             # v0.3 策略：真实成本增量回灌预算（H1：usage_delta 的唯一生产者）
             decision = self.policy_engine.evaluate(PolicyEvent(
                 "usage_delta", data={"cost": usage.get("cost_usd", 0.0) or 0.0,
                                      "agent_id": agent_id}))
-            self.policy_engine.save()
+            # A5：热路径不再同步写盘——策略状态由心跳线程周期 save_if_dirty 落盘
             if decision.result != PolicyResult.ALLOW.value:
                 self._broadcast("policy_decision", {
                     "name": decision.name, "result": decision.result,

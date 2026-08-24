@@ -44,8 +44,16 @@ class MailboxManager:
         self.db = db
 
     def send(self, team_id: str, from_agent_id: int, message: str, *,
-             to_agent_id: int | None = None, msg_type: str = MSG_TYPE_TEXT) -> int:
-        """发送点对点或广播消息，返回消息 ID。"""
+             to_agent_id: int | None = None, msg_type: str = MSG_TYPE_TEXT,
+             payload: Any = None) -> int:
+        """发送点对点或广播消息，返回消息 ID。
+
+        payload 非空时以 JSON 信封并入 message 字段（{"text": ..., "payload": ...}），
+        不改表结构；fetch_inbox 返回原始行，信封由消费方按需解包。
+        """
+        if payload is not None:
+            message = json.dumps({"text": message, "payload": payload},
+                                 ensure_ascii=False)
         return self.db.mailbox_send(
             team_id=team_id,
             from_agent_id=from_agent_id,

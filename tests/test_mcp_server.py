@@ -32,7 +32,8 @@ def test_initialize_returns_server_info():
                        "params": {"clientInfo": {"name": "codex"}}}, emit=out.append)
     msg = out[0]
     assert msg["id"] == 1
-    assert msg["result"]["serverInfo"] == {"name": "agent-mcp", "version": "2.2.0"}
+    assert msg["result"]["serverInfo"] == {"name": "agent-mcp",
+                                           "version": mcp_server.SERVER_VERSION}
     assert msg["result"]["protocolVersion"] == "2025-03-26"
     assert mcp_server._HOST == "codex"
 
@@ -65,18 +66,20 @@ def test_initialize_unsupported_top_level_version_falls_back_to_legacy():
 
 
 def test_tools_list_returns_full_set_without_declared_use():
-    """默认全量 16 工具：legacy 客户端与未声明 used 的客户端均完整可见。"""
+    """默认全量 19 工具（v0 mailbox/consensus 三工具并入）：legacy 客户端与
+    未声明 used 的客户端均完整可见。"""
     out = []
     mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                        "params": {"protocolVersion": "2025-11-25"}}, emit=out.append)
     out.clear()
     mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, emit=out.append)
     names = [t["name"] for t in out[0]["result"]["tools"]]
-    assert len(names) == 16
+    assert len(names) == 19
     for expect in ("spawn_agent", "wait_agent", "estimate_complexity", "send_message",
                    "steer_agent", "followup_task", "interrupt_agent", "list_agents",
                    "get_agent_activity", "get_token_usage", "memory_store", "memory_recall",
-                   "orchestrate_task", "policy_list", "policy_add", "policy_state"):
+                   "orchestrate_task", "policy_list", "policy_add", "policy_state",
+                   "mailbox_send", "mailbox_fetch", "consensus_vote"):
         assert expect in names
 
 
@@ -94,13 +97,14 @@ def test_tools_list_2026_stateless_declared_use_prunes():
                           "estimate_complexity", "send_message"}
 
 
-def test_tools_list_has_sixteen_tools_in_order():
+def test_tools_list_has_nineteen_tools_in_order():
     names = [t["name"] for t in mcp_server.TOOLS]
     assert names == ["spawn_agent", "orchestrate_task", "policy_list", "policy_add",
                      "policy_state", "send_message", "steer_agent",
                      "followup_task", "wait_agent", "interrupt_agent", "list_agents",
                      "get_agent_activity", "get_token_usage", "estimate_complexity",
-                     "memory_store", "memory_recall"]
+                     "memory_store", "memory_recall",
+                     "mailbox_send", "mailbox_fetch", "consensus_vote"]
 
 
 def test_spawn_schema_requires_cwd():
@@ -431,19 +435,22 @@ def test_unknown_tool_rpc_error():
 
 # ---- ensure_daemon 原子拉起 ----
 
-class _ProbeResponse:
-    def __init__(self, body, status=200):
-        self.status = status
-        self._body = json.dumps(body).encode("utf-8")
+def _stub_request_daemon(monkeypatch, script):
+    """桩掉 mcp_server._request_daemon：script 为按调用顺序弹出的
+    (status, body_dict) 或 Exception 实例；返回 calls 记录 (method, path, token)。"""
+    calls = []
+    seq = list(script)
 
-    def __enter__(self):
-        return self
+    def fake(method, port, path, *, token=None, payload=None, timeout=None):
+        calls.append((method, path, token))
+        item = seq.pop(0) if seq else (200, {})
+        if isinstance(item, Exception):
+            raise item
+        status, body = item
+        return status, json.dumps(body).encode("utf-8")
 
-    def __exit__(self, *_args):
-        return False
-
-    def read(self):
-        return self._body
+    monkeypatch.setattr(mcp_server, "_request_daemon", fake)
+    return calls
 
 
 def _write_probe_token(monkeypatch, tmp_path, token="probe-token"):
@@ -456,110 +463,73 @@ def _write_probe_token(monkeypatch, tmp_path, token="probe-token"):
 def test_probe_accepts_current_daemon_identity(monkeypatch, tmp_path):
     token = _write_probe_token(monkeypatch, tmp_path)
     fingerprint = mcp_server.hashlib.sha256(token.encode("utf-8")).hexdigest()
-    monkeypatch.setattr(
-        mcp_server.urllib.request,
-        "urlopen",
-        lambda _request, timeout=1: _ProbeResponse(
-            {
-                "ok": True,
-                "service": "agent-mcp-daemon",
-                "token_sha256": fingerprint,
-            }
-        ),
-    )
+    calls = _stub_request_daemon(monkeypatch, [
+        (200, {"ok": True, "service": "agent-mcp-daemon",
+               "token_sha256": fingerprint}),
+    ])
 
-    assert mcp_server._probe("http://127.0.0.1:8765")
+    assert mcp_server._probe(8765)
+    assert calls == [("GET", "/health", None)]
 
 
 def test_probe_accepts_legacy_daemon_only_after_authenticated_read(monkeypatch, tmp_path):
     token = _write_probe_token(monkeypatch, tmp_path)
-    requests = []
+    calls = _stub_request_daemon(monkeypatch, [
+        (200, {"ok": True, "version": 1}),
+        (200, {"agents": []}),
+    ])
 
-    def fake_urlopen(request, timeout=1):
-        requests.append(request)
-        if isinstance(request, str):
-            return _ProbeResponse({"ok": True, "version": 1})
-        assert request.full_url.endswith("/api/agents/list")
-        assert request.get_header("X-auth-token") == token
-        assert json.loads(request.data) == {
-            "session_id": "agent-mcp-compatibility-probe"
-        }
-        return _ProbeResponse({"agents": []})
-
-    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
-
-    assert mcp_server._probe("http://127.0.0.1:8765")
-    assert len(requests) == 2
+    assert mcp_server._probe(8765)
+    assert calls[0] == ("GET", "/health", None)
+    method, path, used_token = calls[1]
+    assert (method, path) == ("POST", "/api/agents/list")
+    assert used_token == token
 
 
 def test_probe_rejects_legacy_health_when_authenticated_read_fails(monkeypatch, tmp_path):
     _write_probe_token(monkeypatch, tmp_path, token="wrong-token")
-    calls = 0
+    calls = _stub_request_daemon(monkeypatch, [
+        (200, {"ok": True, "version": 1}),
+        OSError("unauthorized"),
+    ])
 
-    def fake_urlopen(request, timeout=1):
-        nonlocal calls
-        calls += 1
-        if isinstance(request, str):
-            return _ProbeResponse({"ok": True, "version": 1})
-        raise OSError("unauthorized")
-
-    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
-
-    assert not mcp_server._probe("http://127.0.0.1:8765")
-    assert calls == 2
+    assert not mcp_server._probe(8765)
+    assert len(calls) == 2
 
 
 def test_probe_rejects_unrecognized_health_without_auth_fallback(monkeypatch, tmp_path):
     _write_probe_token(monkeypatch, tmp_path)
-    calls = 0
+    calls = _stub_request_daemon(monkeypatch, [
+        (200, {"ok": True, "version": 2, "service": "other"}),
+    ])
 
-    def fake_urlopen(_request, timeout=1):
-        nonlocal calls
-        calls += 1
-        return _ProbeResponse({"ok": True, "version": 2, "service": "other"})
-
-    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
-
-    assert not mcp_server._probe("http://127.0.0.1:8765")
-    assert calls == 1
+    assert not mcp_server._probe(8765)
+    assert len(calls) == 1
 
 
 def test_probe_rejects_new_health_with_wrong_fingerprint(monkeypatch, tmp_path):
     """新契约下 token 无效：service 正确但 token_sha256 与本地 token 不符
     （另一 token 的 daemon）→ 立即拒绝，不回退认证探测。"""
     _write_probe_token(monkeypatch, tmp_path, token="real-token")
-    calls = 0
+    calls = _stub_request_daemon(monkeypatch, [
+        (200, {"ok": True, "service": "agent-mcp-daemon",
+               "token_sha256": mcp_server.hashlib.sha256(b"other-token").hexdigest()}),
+    ])
 
-    def fake_urlopen(_request, timeout=1):
-        nonlocal calls
-        calls += 1
-        return _ProbeResponse({
-            "ok": True,
-            "service": "agent-mcp-daemon",
-            "token_sha256": mcp_server.hashlib.sha256(b"other-token").hexdigest(),
-        })
-
-    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
-
-    assert not mcp_server._probe("http://127.0.0.1:8765")
-    assert calls == 1  # 指纹不匹配即拒绝，不做多余请求
+    assert not mcp_server._probe(8765)
+    assert len(calls) == 1  # 指纹不匹配即拒绝，不做多余请求
 
 
 def test_probe_rejects_wrong_service_with_matching_fingerprint(monkeypatch, tmp_path):
     """service 声明为其它服务（即使带匹配指纹）→ 拒绝。"""
     token = _write_probe_token(monkeypatch, tmp_path)
     fingerprint = mcp_server.hashlib.sha256(token.encode("utf-8")).hexdigest()
+    _stub_request_daemon(monkeypatch, [
+        (200, {"ok": True, "service": "some-other-service",
+               "token_sha256": fingerprint}),
+    ])
 
-    def fake_urlopen(_request, timeout=1):
-        return _ProbeResponse({
-            "ok": True,
-            "service": "some-other-service",
-            "token_sha256": fingerprint,
-        })
-
-    monkeypatch.setattr(mcp_server.urllib.request, "urlopen", fake_urlopen)
-
-    assert not mcp_server._probe("http://127.0.0.1:8765")
+    assert not mcp_server._probe(8765)
 
 
 def test_ensure_daemon_probe_alive(monkeypatch, tmp_path):
@@ -573,8 +543,8 @@ def test_ensure_daemon_probe_alive(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mcp_server, "_probe", lambda base: True)
     monkeypatch.setattr(mcp_server, "_spawn_detached", fake_spawn)
-    base, token = mcp_server.ensure_daemon()
-    assert base == "http://127.0.0.1:8765"
+    port, token = mcp_server.ensure_daemon()
+    assert port == 8765
     assert spawned == []  # 已存活，不拉起
 
 
@@ -633,8 +603,8 @@ def test_ensure_daemon_spawns_when_down_and_writes_token(monkeypatch, tmp_path):
         spawned.append(cmd)
 
     monkeypatch.setattr(mcp_server, "_spawn_detached", fake_spawn)
-    base, token = mcp_server.ensure_daemon()
-    assert base == "http://127.0.0.1:8765"
+    port, token = mcp_server.ensure_daemon()
+    assert port == 8765
     assert len(spawned) == 1
     cmd = spawned[0]
     assert any("daemon_main.py" in c for c in cmd)

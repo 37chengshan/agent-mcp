@@ -65,31 +65,46 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_health(base: str, timeout: float = 10.0) -> None:
+# 受控请求（SSRF 约束）：host/port 走独立参数、path 为以 / 开头的字面量，
+# 不构造任何 URL 字符串。base 参数语义为 daemon 端口号。
+def _wait_health(port: int, timeout: float = 10.0) -> None:
+    import http.client
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(base + "/health", timeout=1) as resp:
-                if resp.status == 200:
-                    return
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+            conn.request("GET", "/health")
+            ok = conn.getresponse().status == 200
+            conn.close()
+            if ok:
+                return
         except Exception:
             pass
         time.sleep(0.2)
-    raise RuntimeError(f"daemon not healthy at {base} within {timeout:.0f}s")
+    raise RuntimeError(f"daemon not healthy at 127.0.0.1:{port} within {timeout:.0f}s")
 
 
-def _post(base: str, token: str, path: str, payload: dict) -> dict:
-    req = urllib.request.Request(
-        base + path, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        method="POST", headers={"X-Auth-Token": token,
-                                "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read())
+def _post(port: int, token: str, path: str, payload: dict) -> dict:
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    conn.request("POST", path,
+                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                 headers={"X-Auth-Token": token,
+                          "Content-Type": "application/json"})
+    resp = conn.getresponse()
+    body = json.loads(resp.read())
+    conn.close()
+    return body
 
 
-def _get_json(base: str, path: str) -> dict:
-    with urllib.request.urlopen(base + path, timeout=10) as resp:
-        return json.loads(resp.read())
+def _get_json(port: int, path: str) -> dict:
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = json.loads(resp.read())
+    conn.close()
+    return body
 
 
 def _start_daemon(state_dir: Path, port: int) -> subprocess.Popen:
@@ -109,7 +124,7 @@ def daemon(tmp_path):
     port = _free_port()
     state_dir = tmp_path / "state"
     proc = _start_daemon(state_dir, port)
-    base = f"http://127.0.0.1:{port}"
+    base = port  # 受控目标：仅回环端口号，URL 由 helper 按字面量路径构造
     try:
         _wait_health(base)
     except Exception:
@@ -123,17 +138,28 @@ def daemon(tmp_path):
     proc.wait(timeout=5)
 
 
-def _sse_reader(base: str, q: queue.Queue, ready: threading.Event | None = None) -> None:
+def _sse_reader(port: int, q: queue.Queue, ready: threading.Event | None = None) -> None:
     """后台线程读 SSE 行到队列；EOF/异常投递 None 哨兵。
     ready（可选）：HTTP 响应头返回（服务器已注册 SSE client）后 set。"""
+    import http.client
     try:
-        with urllib.request.urlopen(base + "/events", timeout=60) as resp:
-            if ready is not None:
-                ready.set()
-            for line in resp:
-                q.put(line.decode("utf-8", "replace").rstrip("\n"))
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        conn.request("GET", "/events")
+        resp = conn.getresponse()
+        if ready is not None:
+            ready.set()
+        while True:
+            line = resp.fp.readline()
+            if not line:
+                break
+            q.put(line.decode("utf-8", "replace").rstrip("\n"))
     except Exception:
         q.put(None)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _collect_sse(q: queue.Queue, needed: list[str], timeout: float = 60.0) -> list[dict]:
@@ -213,10 +239,14 @@ def test_daemon_health_and_snapshot_structure(daemon):
 
 @pytest.mark.integration
 def test_daemon_serves_web_index(daemon):
-    with urllib.request.urlopen(daemon["base"] + "/", timeout=10) as resp:
-        assert resp.status == 200
-        assert "text/html" in resp.headers["Content-Type"]
-        body = resp.read().decode("utf-8")
+    import http.client as _hc
+    _conn = _hc.HTTPConnection("127.0.0.1", daemon["base"], timeout=10)
+    _conn.request("GET", "/")
+    resp = _conn.getresponse()
+    assert resp.status == 200
+    assert "text/html" in resp.headers["Content-Type"]
+    body = resp.read().decode("utf-8")
+    _conn.close()
     assert "Agent MCP" in body and 'id="map-pane"' in body
 
 
@@ -274,7 +304,7 @@ def test_daemon_claude_spawn_wait_end_to_end(daemon):
     assert done["status"] == "terminated"
     assert done["stop_reason"] == "end_turn"
 
-    snap = _get_json(daemon["base"], f"/api/snapshot?session_id=e2e-test")
+    snap = _get_json(daemon["base"], "/api/snapshot?session_id=e2e-test")
     agents = [a for a in snap["agents"] if a["id"] == aid]
     assert agents and agents[0]["status"] == "terminated"
     types = [e["type"] for e in snap["events"] if e["agent_id"] == aid]
@@ -321,10 +351,9 @@ def test_daemon_restart_preserves_history(daemon):
     daemon["proc"].wait(timeout=5)
     port2 = _free_port()
     proc2 = _start_daemon(daemon["state_dir"], port2)
-    base2 = f"http://127.0.0.1:{port2}"
     try:
-        _wait_health(base2)
-        snap = _get_json(base2, "/api/snapshot?session_id=restart-test")
+        _wait_health(port2)
+        snap = _get_json(port2, "/api/snapshot?session_id=restart-test")
         agents = [a for a in snap["agents"] if a["id"] == aid]
         assert agents and agents[0]["status"] == "terminated"
         assert snap["usage"]["totals"]["input_tokens"] > 0

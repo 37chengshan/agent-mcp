@@ -3,3 +3,11 @@ __pycache__/
 design-preview-top.png
 .DS_Store
 .atomcode/
+# v3.0：本地工具状态与构建产物不入库
+.mimosa/
+.zcode/
+agent_mcp.egg-info/
+build/
+dist/
+.smoke-venv/
+.pytest_cache/

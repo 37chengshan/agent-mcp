@@ -4,6 +4,11 @@
 > 2026-08-13 复核（v0.3 Phase 0）：新增适配器 codex/kimi/copilot/pi/zcode/cline 事件归一化
 > 已由 `tests/test_event_normalization.py` fixture 校准 ✅（zcode/cline 为降级文本捕获模式）；
 > 表中能力项 ⏳ 表示真实 CLI 环境待实测（fixture 不替代真实环境），不影响适配器归一化可信度。
+> **2026-08-24 实测状态声明（B2 诚实化）**：以下 ⏳ 项仍未清偿，引用本矩阵时请连同本声明——
+> zcode/cline 降级文本捕获的真实环境验证、omp/opencode 的 resume 续接实测、grok 首启
+> >120s 的超时预算标定。usage 结算语义已显式化：omp/opencode=`cumulative`，
+> 其余内置适配器=`authoritative`（见 `BaseAdapter.usage_semantics` 与
+> tests/test_b2_usage_contract.py）。
 
 | 能力 | claude (2.1.220) | grok (0.2.118) | opencode (1.14.51) | omp(pi) |
 |---|---|---|---|---|

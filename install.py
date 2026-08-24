@@ -36,6 +36,19 @@ from typing import Any
 
 SERVER_NAME = "agent-mcp"
 LEGACY_NAME = "grok-cli"
+
+
+def read_version() -> str:
+    """读 agent_mcp/__init__.py 的 __version__（版本单一来源；纯 stdlib regex，
+    本脚本刻意不 import agent_mcp 包）。"""
+    init_path = Path(__file__).resolve().parent / "agent_mcp" / "__init__.py"
+    try:
+        match = re.search(r'^__version__\s*=\s*"([^"]+)"',
+                          init_path.read_text(encoding="utf-8"), re.M)
+        return match.group(1) if match else "unknown"
+    except OSError:
+        return "unknown"
+
 BACKUP_SUFFIX = ".bak-agentmcp-"
 HOSTS = ("codex", "claude", "omp", "opencode", "kimi", "zcode",
          "grok", "cursor", "gemini", "pi", "copilot", "cline", "qwen",
@@ -950,6 +963,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(errors), file=sys.stderr)
         return 1
 
+    print(f"agent-mcp v{read_version()} → {len(hosts)} host(s)")
     for host in hosts:
         logs = install_host(host, str(script), str(starter), skill_source, paths,
                             dry_run=args.dry_run, remove_legacy=args.remove_legacy)

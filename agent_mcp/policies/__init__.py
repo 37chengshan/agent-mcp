@@ -58,6 +58,7 @@ class PolicyEngine:
         self._lock = threading.Lock()
         self.max_log = max_log
         self.state_path = Path(state_path) if state_path else None
+        self._dirty = False  # A5：状态有变未落盘标记（热路径去同步写盘）
         self.state: dict[str, Any] = {
             "budget_usd": 0.0, "spawns": 0, "tool_calls": 0, "log": [],
         }
@@ -95,6 +96,17 @@ class PolicyEngine:
         tmp.write_text(json.dumps(self.state, ensure_ascii=False,
                                   separators=(",", ":")), encoding="utf-8")
         os.replace(tmp, self.state_path)
+        with self._lock:
+            self._dirty = False
+
+    def save_if_dirty(self) -> bool:
+        """A5: 仅当 evaluate/_log 产生过状态变更时才写盘；返回是否实际写入。
+        供后台周期调用（心跳），把策略状态持久化从事件热路径移出。"""
+        with self._lock:
+            dirty = self._dirty
+        if dirty:
+            self.save()
+        return dirty
 
     # -- 策略注册 -------------------------------------------------------
 
@@ -146,6 +158,7 @@ class PolicyEngine:
         log.append(entry)
         if len(log) > self.max_log:
             del log[: len(log) - self.max_log]
+        self._dirty = True  # A5：标记待落盘，由 save_if_dirty 周期刷写
 
     # -- 状态查询 -------------------------------------------------------
 

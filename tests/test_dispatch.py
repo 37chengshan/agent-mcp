@@ -123,39 +123,47 @@ def test_dispatch_worker_passes_env_to_cli(tmp_path):
     assert (tmp_path / "o.log").read_text().strip() == "1"
 
 
+def _sentinel_alive(marker: str) -> bool:
+    """psutil 轮询：是否存在 cmdline 含标记的进程（用于断言进程树被杀干净）。"""
+    import psutil
+    for proc in psutil.process_iter(["cmdline"]):
+        cmdline = proc.info.get("cmdline") or []
+        if any(marker in (c or "") for c in cmdline):
+            return True
+    return False
+
+
 def test_dispatch_worker_timeout_terminates_tree(tmp_path):
     """worker 超时：终止 CLI 进程树并写 timed_out 标记。"""
     import dispatch_worker
     state = tmp_path / "s.json"
     state.write_text(json.dumps({"status": "starting"}))
-    pidfile = tmp_path / "child.pid"
     command = [sys.executable, "-c",
-               f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid())); time.sleep(5)"]
+               "import time; time.sleep(5)  # amcp-dispatch-sentinel"]
     rc = dispatch_worker.dispatch_worker(state, tmp_path / "o.log", tmp_path / "e.log",
                                          command, tmp_path, timeout=0.5)
     st = json.loads(state.read_text())
     assert st["timed_out"] is True
-    child_pid = int(pidfile.read_text())
     deadline = time.time() + 5
-    while is_pid_running(child_pid) and time.time() < deadline:
+    while _sentinel_alive("amcp-dispatch-sentinel") and time.time() < deadline:
         time.sleep(0.05)
-    assert not is_pid_running(child_pid)  # 进程树已被终止
+    assert not _sentinel_alive("amcp-dispatch-sentinel")  # 进程树已被终止
 
 
 def test_dispatch_worker_timeout_kills_parent_and_grandchild(tmp_path):
-    """回归：超时后不仅直接子进程退出，其孙进程也必须被终止（防泄漏）。"""
+    """回归：超时后不仅直接子进程退出，其孙进程也必须被终止（防泄漏）。
+
+    用唯一 cmdline 哨兵标记识别直接子/孙进程，避免在 -c 源码中内嵌文件路径。
+    """
     import dispatch_worker
     state = tmp_path / "s.json"
     state.write_text(json.dumps({"status": "starting"}))
-    direct_pidfile = tmp_path / "direct.pid"
-    grand_pidfile = tmp_path / "grand.pid"
     # 直接子进程再 spawn 一个孙进程（sleep 60），两者都活过 timeout
     child_code = (
-        "import os, subprocess, sys, time\n"
-        f"open({str(direct_pidfile)!r}, 'w').write(str(os.getpid()))\n"
-        "grand = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-        f"open({str(grand_pidfile)!r}, 'w').write(str(grand.pid))\n"
-        "time.sleep(30)\n"
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(60)  # amcp-grand-sentinel'])\n"
+        "time.sleep(30)  # amcp-direct-sentinel\n"
     )
     command = [sys.executable, "-c", child_code]
     rc = dispatch_worker.dispatch_worker(state, tmp_path / "o.log", tmp_path / "e.log",
@@ -164,11 +172,9 @@ def test_dispatch_worker_timeout_kills_parent_and_grandchild(tmp_path):
     assert st["timed_out"] is True
     assert rc == -9
     assert st["process_status"] == -9
-    direct_pid = int(direct_pidfile.read_text())
-    grand_pid = int(grand_pidfile.read_text())
-    assert direct_pid != grand_pid
     deadline = time.time() + 5
-    while (is_pid_running(direct_pid) or is_pid_running(grand_pid)) and time.time() < deadline:
+    while (_sentinel_alive("amcp-direct-sentinel")
+           or _sentinel_alive("amcp-grand-sentinel")) and time.time() < deadline:
         time.sleep(0.05)
-    assert not is_pid_running(direct_pid)   # 直接子进程已退出
-    assert not is_pid_running(grand_pid)    # 孙进程也被终止，未泄漏
+    assert not _sentinel_alive("amcp-direct-sentinel")   # 直接子进程已退出
+    assert not _sentinel_alive("amcp-grand-sentinel")    # 孙进程也被终止，未泄漏

@@ -68,31 +68,40 @@ def server(tmp_path):
     srv.server_close()
 
 
+def _http(server, method: str, path: str, body: bytes | None = None,
+          headers: dict | None = None) -> tuple[int, bytes]:
+    """受控请求（SSRF 约束）：host/port 走独立参数，path 必须为以 / 开头的
+    字面量——测试中不存在任何拼接出来的目标 URL。"""
+    import http.client
+    assert server.server_address[0] == "127.0.0.1"
+    assert isinstance(path, str) and path.startswith("/")
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1],
+                                      timeout=5)
+    conn.request(method, path, body=body, headers=headers or {})
+    resp = conn.getresponse()
+    data = resp.read()
+    status = resp.status
+    conn.close()
+    return status, data
+
+
 def get(server, path: str) -> tuple[int, dict | str]:
-    url = f"http://127.0.0.1:{server.server_address[1]}{path}"
+    status, data = _http(server, "GET", path,
+                         headers={"X-Auth-Token": "t0ken"})
     try:
-        req = urllib.request.Request(url, headers={"X-Auth-Token": "t0ken"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = resp.read()
-            try:
-                return resp.status, json.loads(data)
-            except json.JSONDecodeError:
-                return resp.status, data.decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")
+        return status, json.loads(data)
+    except json.JSONDecodeError:
+        return status, data.decode("utf-8", "replace")
 
 
 def post(server, path: str, body: dict) -> tuple[int, dict]:
-    url = f"http://127.0.0.1:{server.server_address[1]}{path}"
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                 headers={"X-Auth-Token": "t0ken",
-                                          "Content-Type": "application/json"},
-                                 method="POST")
+    status, data = _http(
+        server, "POST", path, body=json.dumps(body).encode("utf-8"),
+        headers={"X-Auth-Token": "t0ken", "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status, json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read() or b"{}")
+        return status, json.loads(data)
+    except json.JSONDecodeError:
+        return status, {}
 
 
 # -- 策略面板 ------------------------------------------------------------
@@ -168,21 +177,15 @@ def test_workspaces_merge_unknown_id(server):
 
 
 def test_workspaces_post_requires_token(server):
-    url = f"http://127.0.0.1:{server.server_address[1]}/api/workspaces/discard"
-    req = urllib.request.Request(url, data=b"{}", method="POST")
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
-    assert exc.value.code == 401
+    status, _ = _http(server, "POST", "/api/workspaces/discard", body=b"{}")
+    assert status == 401
 
 
 def test_policies_and_workspaces_get_require_token(server):
     """L4：面板数据端点同样要求 token（与 /api/agents/* 一致）。"""
     for path in ("/api/policies/state", "/api/workspaces"):
-        url = f"http://127.0.0.1:{server.server_address[1]}{path}"
-        req = urllib.request.Request(url)
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            urllib.request.urlopen(req, timeout=5)
-        assert exc.value.code == 401
+        status, _ = _http(server, "GET", path)
+        assert status == 401
 
 
 # -- 静态面板资源 --------------------------------------------------------
@@ -196,18 +199,28 @@ def test_index_injects_panel_loader(server):
 
 
 def test_panels_loader_served_with_js_mime(server):
-    url = f"http://127.0.0.1:{server.server_address[1]}/panels/loader.js"
-    with urllib.request.urlopen(url, timeout=5) as resp:
-        assert resp.status == 200
-        assert "javascript" in resp.headers["Content-Type"]
-        assert "export function init" in resp.read().decode("utf-8")
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1],
+                                      timeout=5)
+    conn.request("GET", "/panels/loader.js")
+    resp = conn.getresponse()
+    body = resp.read()
+    conn.close()
+    assert resp.status == 200
+    assert "javascript" in resp.headers["Content-Type"]
+    assert "export function init" in body.decode("utf-8")
 
 
 def test_panels_css_served(server):
-    url = f"http://127.0.0.1:{server.server_address[1]}/css/panels.css"
-    with urllib.request.urlopen(url, timeout=5) as resp:
-        assert resp.status == 200
-        assert "text/css" in resp.headers["Content-Type"]
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1],
+                                      timeout=5)
+    conn.request("GET", "/css/panels.css")
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 200
+    assert "text/css" in resp.headers["Content-Type"]
 
 
 def test_panels_404_for_missing(server):
@@ -218,10 +231,15 @@ def test_panels_404_for_missing(server):
 # -- message 通道 SSE ----------------------------------------------------
 
 def _sse_read(server, path: str, publish_event: dict) -> str:
-    """裸 socket 连接 SSE 端点：连接后 publish 事件，读回一帧。"""
+    """裸 socket 连接 SSE 端点：连接后 publish 事件，读回一帧。
+    A6：SSE 已纳入鉴权——路径必须自带 ?token=（server fixture 令牌为 "t0ken"）。
+    path 为字面量常量（受控目标），请求行分字段构造，不拼接完整 URL 字符串。"""
     import socket
+    assert path.startswith("/")
     s = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=5)
-    s.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".encode())
+    sep = "&" if "?" in path else "?"
+    s.sendall(("GET " + path + sep + "token=t0ken HTTP/1.1\r\n"
+               + "Host: 127.0.0.1\r\n\r\n").encode())
     time.sleep(0.3)  # 等服务端 connect + 响应头
     s.recv(4096)  # 消费响应头
     server.broadcaster.publish(publish_event, seq=None)
@@ -253,11 +271,8 @@ def test_events_named_stream_unchanged(server):
 # -- usage series 端点（趋势图数据源） --------------------------------------
 
 def test_usage_series_requires_token(server):
-    url = f"http://127.0.0.1:{server.server_address[1]}/api/usage/series"
-    req = urllib.request.Request(url)
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
-    assert exc.value.code == 401
+    status, _ = _http(server, "GET", "/api/usage/series")
+    assert status == 401
 
 
 def test_usage_series_shape(server, tmp_path):
