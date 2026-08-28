@@ -1,4 +1,7 @@
 from __future__ import annotations
+import os
+
+from . import models as m
 import re
 import json
 import shutil
@@ -825,9 +828,108 @@ _CODEX = CodexAdapter()
 _KIMI = KimiAdapter()
 _COPILOT = CopilotAdapter()
 _PI = PiAdapter()
+class PrimeAgentRPCAdapter(BaseAdapter):
+    """prime-agent RPC 模式后端（roadmap §9.2）：LF-JSONL RPC 协议。
+
+    能力契约来自真实协议协商（P8 诚实原则）：本类默认只声明 spawn/resume/
+    steer/follow_up/observe 为 SUPPORTED，其余（schedule/heartbeat/goal/
+    autonomous/agent_message）默认 UNSUPPORTED 或 DEGRADED——未协商即调用 =
+    Invariant 6 违规。真实环境冒烟后按 negotiation 结果修正 capability-matrix。
+    """
+
+    cli_name = "prime-agent-rpc"
+    usage_semantics = "authoritative"
+    _BIN = ["prime-agent"]
+    # 版本差异兜底：可用 AGENT_MCP_PRIME_RPC_ARGS 覆盖启动参数（如 ["--rpc"]）
+    _RPC_ARGS_DEFAULT = ["--rpc"]
+
+    def __init__(self, capability_states: dict[str, str] | None = None):
+        states = dict(capability_states or {
+            "spawn": m.CAP_SUPPORTED,
+            "resume": m.CAP_SUPPORTED,
+            "steer": m.CAP_SUPPORTED,
+            "follow_up": m.CAP_SUPPORTED,
+            "observe": m.CAP_SUPPORTED,
+            "schedule": m.CAP_UNSUPPORTED,
+            "heartbeat": m.CAP_UNSUPPORTED,
+            "goal": m.CAP_UNSUPPORTED,
+            "autonomous": m.CAP_DEGRADED,
+            "agent_message": m.CAP_DEGRADED,
+        })
+        self.capabilities = m.AdapterCapability(states)
+
+    def binary(self) -> str | None:
+        for cand in self._BIN:
+            found = shutil.which(cand)
+            if found:
+                return found
+        return None
+
+    def build_command(self, *, prompt: str, cwd: str, model: str | None,
+                      permission_mode: str, max_turns: int,
+                      resume: str | None) -> list[str]:
+        raw_args = os.environ.get("AGENT_MCP_PRIME_RPC_ARGS", "").strip()
+        rpc_args = raw_args.split() if raw_args else list(self._RPC_ARGS_DEFAULT)
+        cmd = [self.binary() or "prime-agent"] + rpc_args
+        if resume:
+            cmd += ["--resume", resume]
+        cmd.append(prompt)
+        return cmd
+
+    def parse_stream(self, lines: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """把 prime-agent RPC 的 JSONL 帧归一化为 agent-mcp 事件。
+
+        映射保守：未知帧类型 → agent.log 事件（DEGRADED 语义，不丢数据）；
+        usage 帧按 authoritative 语义累计为最终总量。
+        """
+        events: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            frame_type = str(raw.get("type") or raw.get("event") or "")
+            usage_blob = raw.get("usage") or {}
+            if isinstance(usage_blob, dict):
+                for key, map_key in (("input_tokens", "input_tokens"),
+                                     ("output_tokens", "output_tokens"),
+                                     ("cache_creation", "cache_creation"),
+                                     ("cache_read", "cache_read"),
+                                     ("cost_usd", "cost_usd")):
+                    if key in usage_blob:
+                        usage[map_key] = usage_blob[key]
+            text = raw.get("text") or raw.get("content") or raw.get("message")
+            if text is not None and frame_type in ("message", "assistant", "text"):
+                events.append({"type": "agent.message", "payload": {"text": str(text)[:4000]}})
+            elif frame_type in ("tool_use", "tool_call"):
+                events.append({"type": "agent.tool_use", "payload": raw})
+            elif frame_type in ("tool_result",):
+                events.append({"type": "agent.tool_result", "payload": raw})
+            elif frame_type in ("error",):
+                events.append({"type": "agent.error", "payload": {"error": str(raw)[:2000]}})
+            else:
+                events.append({"type": "agent.log", "payload": {"frame": str(raw)[:2000]}})
+        return events, usage
+
+    def extract_session_id(self, raw: dict) -> str | None:
+        for key in ("sessionId", "session_id", "session", "id"):
+            value = raw.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+
 _ZCODE = ZcodeAdapter()
 _CLINE = ClineAdapter()
 _ADAPTERS: dict[str, BaseAdapter] = {
+    "prime-agent-rpc": PrimeAgentRPCAdapter(),
+    "prime-agent": PrimeAgentRPCAdapter(),
     "claude": _CLAUDE,
     "grok": _GROK,
     "opencode": _OPENCODE,

@@ -43,3 +43,5 @@
 | pi | `pi --mode json <prompt>` | JSONL：首行 `session{id}` + `message_end`（权威 message）/`agent_end` | `pi -c` / `--session <id>` | ⏳ | **Pi 与 omp 是两个项目**；npm `@earendil-works/pi-coding-agent`；归一化 ✅（fixture） |
 | zcode | `zcode --prompt <prompt>` | 文本捕获（headless 路径未实证；GUI 走 app-server 协议） | `--session <id>`（⏳） | ⏳ | CLI 直连有 401 认证障碍；**降级模式**：文本捕获（fixture ✅） |
 | cline | `cline --prompt <prompt>` | 文本捕获 | `--resume <id>`（⏳） | ⏳ | 主要 VS Code 扩展；独立 CLI headless 不明确；**降级模式**：文本捕获（fixture ✅） |
+
+| prime-agent-rpc | spawn/resume/steer/follow_up/observe=SUPPORTED（RPC 协商）；schedule/heartbeat/goal=UNSUPPORTED（默认）；autonomous/agent_message=DEGRADED ⏳ 真实环境冒烟后修正 |
