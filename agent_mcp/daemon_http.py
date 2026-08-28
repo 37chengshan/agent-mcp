@@ -40,6 +40,14 @@ _API_METHODS = {
     "/api/policies/list": "policy_list",
     "/api/policies/add": "policy_add",
     "/api/policies/state": "policy_state",
+    "/api/harness/list": "harness_list",
+    "/api/harness/add": "harness_add",
+    "/api/harness/update": "harness_update",
+    "/api/harness/delete": "harness_delete",
+    "/api/harness/rollback": "harness_rollback",
+    "/api/refine/preview": "refine_preview",
+    "/api/refine/commit": "refine_commit",
+    "/api/refine/rollback": "refine_rollback",
 }
 # 需要 token 的 workspace 写操作（merge/discard 会执行 git 命令）
 _WORKSPACE_POST = {"/api/workspaces/merge": "merged",

@@ -122,6 +122,14 @@ _DAEMON_PATHS = {
     "policy_list": "/api/policies/list",
     "policy_add": "/api/policies/add",
     "policy_state": "/api/policies/state",
+    "harness_list": "/api/harness/list",
+    "harness_add": "/api/harness/add",
+    "harness_update": "/api/harness/update",
+    "harness_delete": "/api/harness/delete",
+    "harness_rollback": "/api/harness/rollback",
+    "refine_preview": "/api/refine/preview",
+    "refine_commit": "/api/refine/commit",
+    "refine_rollback": "/api/refine/rollback",
 }
 
 TOOLS = [
@@ -435,6 +443,127 @@ TOOLS = [
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "harness_list",
+        "description": "列出 harness（prompt/memory/skill/subagent_spec）条目；可按 kind/scope 过滤。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["prompt", "memory", "skill", "subagent_spec"],
+                         "description": "过滤条目类型。"},
+                "scope": {"type": "string", "enum": ["local", "global"], "description": "过滤作用域。"},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "harness_add",
+        "description": "新增 harness 条目（revision v1 自动记录）。global 作用域需显式 authorized_global=true。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string", "description": "条目 id。"},
+                "kind": {"type": "string", "enum": ["prompt", "memory", "skill", "subagent_spec"]},
+                "title": {"type": "string"},
+                "content": {"type": "string"},
+                "path": {"type": "string", "default": "general"},
+                "scope": {"type": "string", "enum": ["local", "global"], "default": "local"},
+                "authorized_global": {"type": "boolean", "default": False},
+            },
+            "required": ["item_id", "kind"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "harness_update",
+        "description": "乐观并发更新（expected_version 必填；冲突抛错）。每次修改产生 revision。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string"},
+                "expected_version": {"type": "integer"},
+                "content": {"type": "string"},
+                "title": {"type": "string"},
+                "path": {"type": "string"},
+            },
+            "required": ["item_id", "expected_version"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "harness_delete",
+        "description": "删除 harness 条目（写 delete revision；历史保留可回滚）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string"},
+                "expected_version": {"type": "integer"},
+            },
+            "required": ["item_id", "expected_version"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "harness_rollback",
+        "description": "回滚条目到指定 revision；历史 revision 永不删除（Invariant 8）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string"},
+                "to_revision": {"type": "integer"},
+            },
+            "required": ["item_id", "to_revision"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "refine_preview",
+        "description": "Refine 预览：reviewer（或显式 reviewer_ops）产出结构化 proposal，绝不直写 harness。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "轨迹来源会话。"},
+                "reviewer_ops": {"type": "array", "description": "显式 proposal：[{op,item}]。"},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "refine_commit",
+        "description": "Refine 提交：校验→授权→OCC→diff→revision→event；同指纹 cooldown 生效时拒绝。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "ops": {"type": "array", "description": "[{op,item}]。"},
+                "fingerprint": {"type": "string", "description": "失败指纹（same-failure suppression）。"},
+                "evidence": {"type": "string"},
+            },
+            "required": ["ops"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "refine_rollback",
+        "description": "撤销一次 refine 提交（经 harness_revisions 回滚）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_id": {"type": "string"},
+                "to_revision": {"type": "integer"},
+            },
+            "required": ["item_id", "to_revision"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
     },
     {
         "name": "memory_store",

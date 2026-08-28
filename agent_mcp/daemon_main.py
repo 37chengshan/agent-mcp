@@ -1090,6 +1090,129 @@ class Dispatcher:
         self.policy_engine.save()
         return {"status": "ok", "policy": name, "params": params}
 
+    # ---- v4 Harness（roadmap §8；revision-based 可审计知识层） ----
+    def _require_store_v4(self):
+        if self.store_v4 is None:
+            raise ValueError("control plane store not ready")
+        return self.store_v4
+
+    @staticmethod
+    def _provenance(body: dict) -> str:
+        return str(body.get("session_id") or body.get("provenance") or "default")
+
+    def harness_list(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        return {"items": store.harness_list(kind=body.get("kind"), scope=body.get("scope"))}
+
+    def harness_add(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        item_id = body.get("item_id") or body.get("id")
+        if not item_id:
+            raise ValueError("item_id is required")
+        scope = body.get("scope", "local")
+        if scope == "global" and not body.get("authorized_global"):
+            raise ValueError("global harness modification requires explicit authorization")
+        item = store.harness_create(
+            item_id=str(item_id),
+            kind=str(body.get("kind") or "memory"),
+            title=str(body.get("title") or item_id),
+            content=body.get("content"),
+            content_ref=body.get("content_ref"),
+            path=str(body.get("path") or "general"),
+            scope=scope,
+            provenance=self._provenance(body),
+        )
+        return {"item": item, "version": item["version"]}
+
+    def harness_update(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        item_id = body.get("item_id") or body.get("id")
+        expected_version = body.get("expected_version")
+        if not item_id or expected_version is None:
+            raise ValueError("item_id and expected_version are required")
+        item = store.harness_update(
+            item_id=str(item_id),
+            expected_version=int(expected_version),
+            content=body.get("content"),
+            title=body.get("title"),
+            path=body.get("path"),
+            content_ref=body.get("content_ref"),
+            author=self._provenance(body),
+        )
+        return {"item": item, "version": item["version"]}
+
+    def harness_delete(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        item_id = body.get("item_id") or body.get("id")
+        expected_version = body.get("expected_version")
+        if not item_id or expected_version is None:
+            raise ValueError("item_id and expected_version are required")
+        store.harness_delete(item_id=str(item_id), expected_version=int(expected_version),
+                             author=self._provenance(body))
+        return {"deleted": True, "item_id": str(item_id)}
+
+    def harness_rollback(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        item_id = body.get("item_id") or body.get("id")
+        to_revision = body.get("to_revision")
+        if not item_id or to_revision is None:
+            raise ValueError("item_id and to_revision are required")
+        item = store.harness_rollback(str(item_id), int(to_revision),
+                                      author=self._provenance(body))
+        return {"item": item, "version": item["version"] if item else None}
+
+    # ---- v4 Refine（三段式；reviewer 只产 proposal，绝不直写） ----
+    def refine_preview(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        session_id = str(body.get("session_id") or "default")
+        explicit = body.get("reviewer_ops")
+        reviewer = getattr(self, "_refine_reviewer", None)
+        if explicit is not None:
+            from agent_mcp.refine import validate_proposal
+            return {"session_id": session_id, "proposal": validate_proposal(explicit),
+                    "proposal_count": len(explicit), "reviewer": "explicit"}
+        if reviewer is None:
+            raise ValueError(
+                "refine reviewer backend not configured; use reviewer_ops (explicit proposal) "
+                "or wire ExecutionManager reviewer (v4.1+)"
+            )
+        try:
+            events = self.db.events_since(0, session_id=session_id, limit=1000)
+        except Exception:
+            events = []
+        from agent_mcp.refine import run_preview
+        return run_preview(
+            trajectory=events,
+            harness_items=store.harness_list(),
+            reviewer=reviewer,
+            session_id=session_id,
+        )
+
+    def refine_commit(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        session_id = str(body.get("session_id") or "default")
+        from agent_mcp.refine import commit_proposal
+        return commit_proposal(
+            store,
+            body.get("ops"),
+            session_id=session_id,
+            fingerprint=body.get("fingerprint"),
+            evidence=body.get("evidence"),
+            author=self._provenance(body),
+        )
+
+    def refine_rollback(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        item_id = body.get("item_id") or body.get("id")
+        to_revision = body.get("to_revision")
+        if not item_id or to_revision is None:
+            raise ValueError("item_id and to_revision are required")
+        item = store.harness_rollback(str(item_id), int(to_revision))
+        store.refinement_record(trigger="refine_rollback", session_id="default",
+                                changes=[{"op": "rollback", "target": str(item_id),
+                                          "item": {"to_revision": int(to_revision)}}])
+        return {"item": item}
+
     def _sink_final_answer(self, agent_id: int, summary: str, session_id: str) -> None:
         """自动沉淀：完成态 summary 含 FINAL_ANSWER: 时写入 kind=final_answer 记忆
         （source=agent:<id>，去首尾空白，空则不写）。best-effort，失败只记日志。"""

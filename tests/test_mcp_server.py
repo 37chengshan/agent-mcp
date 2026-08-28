@@ -74,7 +74,7 @@ def test_tools_list_returns_full_set_without_declared_use():
     out.clear()
     mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, emit=out.append)
     names = [t["name"] for t in out[0]["result"]["tools"]]
-    assert len(names) == 19
+    assert len(names) == 27
     for expect in ("spawn_agent", "wait_agent", "estimate_complexity", "send_message",
                    "steer_agent", "followup_task", "interrupt_agent", "list_agents",
                    "get_agent_activity", "get_token_usage", "memory_store", "memory_recall",
@@ -103,6 +103,8 @@ def test_tools_list_has_nineteen_tools_in_order():
                      "policy_state", "send_message", "steer_agent",
                      "followup_task", "wait_agent", "interrupt_agent", "list_agents",
                      "get_agent_activity", "get_token_usage", "estimate_complexity",
+                     "harness_list", "harness_add", "harness_update", "harness_delete",
+                     "harness_rollback", "refine_preview", "refine_commit", "refine_rollback",
                      "memory_store", "memory_recall",
                      "mailbox_send", "mailbox_fetch", "consensus_vote"]
 
