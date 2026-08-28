@@ -828,6 +828,70 @@ _CODEX = CodexAdapter()
 _KIMI = KimiAdapter()
 _COPILOT = CopilotAdapter()
 _PI = PiAdapter()
+class PrimeAgentACPAdapter(BaseAdapter):
+    """prime-agent ACP 模式后端（roadmap §9.2，P5 gate）。
+
+    准入判据：以 prime-agent --acp 冒烟打通一条 ACP 路径后转 SUPPORTED 并合入
+    执行链；当前为能力契约桩（P8 诚实标注 ⏳），默认仅 spawn/observe 为
+    DEGRADED（协议未协商），其余 UNSUPPORTED——未协商即调用 = Invariant 6 违规。
+    """
+
+    cli_name = "prime-agent-acp"
+    usage_semantics = "authoritative"
+    _BIN = ["prime-agent"]
+    _RPC_ARGS_DEFAULT = ["--acp"]
+
+    def __init__(self, capability_states: dict[str, str] | None = None):
+        states = dict(capability_states or {
+            "spawn": m.CAP_DEGRADED,
+            "resume": m.CAP_DEGRADED,
+            "steer": m.CAP_DEGRADED,
+            "follow_up": m.CAP_DEGRADED,
+            "observe": m.CAP_DEGRADED,
+            "schedule": m.CAP_UNSUPPORTED,
+            "heartbeat": m.CAP_UNSUPPORTED,
+            "goal": m.CAP_UNSUPPORTED,
+            "autonomous": m.CAP_UNSUPPORTED,
+            "agent_message": m.CAP_UNSUPPORTED,
+        })
+        self.capabilities = m.AdapterCapability(states)
+
+    def binary(self) -> str | None:
+        for cand in self._BIN:
+            found = shutil.which(cand)
+            if found:
+                return found
+        return None
+
+    def build_command(self, *, prompt: str, cwd: str, model: str | None,
+                      permission_mode: str, max_turns: int,
+                      resume: str | None) -> list[str]:
+        raw_args = os.environ.get("AGENT_MCP_PRIME_ACP_ARGS", "").strip()
+        acp_args = raw_args.split() if raw_args else list(self._RPC_ARGS_DEFAULT)
+        cmd = [self.binary() or "prime-agent"] + acp_args
+        cmd.append(prompt)
+        return cmd
+
+    def parse_stream(self, lines: list[str]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("event:"):
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("type") == "message":
+                events.append({"type": "agent.message", "payload": {"text": str(raw.get("content", ""))[:4000]}})
+            else:
+                events.append({"type": "agent.log", "payload": {"frame": str(raw)[:2000]}})
+        return events, usage
+
+
 class PrimeAgentRPCAdapter(BaseAdapter):
     """prime-agent RPC 模式后端（roadmap §9.2）：LF-JSONL RPC 协议。
 
@@ -930,6 +994,7 @@ _CLINE = ClineAdapter()
 _ADAPTERS: dict[str, BaseAdapter] = {
     "prime-agent-rpc": PrimeAgentRPCAdapter(),
     "prime-agent": PrimeAgentRPCAdapter(),
+    "prime-agent-acp": PrimeAgentACPAdapter(),
     "claude": _CLAUDE,
     "grok": _GROK,
     "opencode": _OPENCODE,
