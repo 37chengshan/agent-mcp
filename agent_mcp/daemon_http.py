@@ -11,6 +11,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import models as m
+
+# SSE 帧分隔（chr(10) 避免转义歧义）
+NL = chr(10)
+
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
 MAX_SSE_CLIENTS = 128
 MAX_SSE_BUFFER = 1000  # 每客户端缓冲事件上限（L6：防慢消费者内存增长）
@@ -41,6 +46,148 @@ _WORKSPACE_POST = {"/api/workspaces/merge": "merged",
                    "/api/workspaces/discard": "discarded"}
 _WORKSPACES_FILE = "workspaces.json"
 _POLICIES_FILE = "policies.json"
+
+
+PROTOCOL_VERSION = 4
+SCHEMA_REVISION = 1
+CONTROL_CAPABILITIES = [
+    "command_journal",
+    "command_id_conflict",
+    "uncertain_command",
+    "ack_watermark_compaction",
+    "generation_event_cursor",
+    "snapshot_token",
+    "capability_discovery",
+]
+
+
+# v4 信封的 method 可以是 Dispatcher 方法名（spawn/steer/...）或既有 v1 路径
+# （/api/agents/spawn），统一解析为 Dispatcher 方法。
+def _resolve_v4_method(dispatcher: Any, method: str) -> str | None:
+    if method in _API_METHODS:
+        method = _API_METHODS[method]
+    if method in _WORKSPACE_POST:
+        method = _WORKSPACE_POST[method]
+    if method and hasattr(dispatcher, method):
+        return method
+    return None
+
+
+def protocol_payload(server: "DaemonHTTPServer") -> dict[str, Any]:
+    """能力协商：/api/protocol。新能力一律在此声明，capability-gated 消费。"""
+    adapters: dict[str, Any] = {}
+    store_v4 = getattr(server, "store_v4", None)
+    if store_v4 is not None:
+        adapters["control-plane"] = {
+            "journal": True,
+            "goals": True,
+            "schedules": True,
+            "harness": True,
+            "tasks": True,
+        }
+    return {
+        "protocol": "v4",
+        "version": PROTOCOL_VERSION,
+        "schema_revision": SCHEMA_REVISION,
+        "capabilities": CONTROL_CAPABILITIES,
+        "adapters": adapters,
+        "endpoints": {
+            "command": "/api/v4/command",
+            "ack": "/api/v4/ack",
+            "protocol": "/api/protocol",
+            "snapshot": "/api/snapshot",
+            "events": "/events",
+        },
+    }
+
+
+def handle_v4_ack(server: "DaemonHTTPServer", body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """ack 水位：确认 <= up_to_command_id 的已完成命令，推进 watermark/compaction。"""
+    store = getattr(server, "store_v4", None)
+    if store is None:
+        return 503, {"error": "control plane store not ready"}
+    client_id = body.get("client_id")
+    up_to = body.get("up_to_command_id")
+    if not client_id or not up_to:
+        return 400, {"error": "client_id and up_to_command_id are required"}
+    try:
+        acked = store.journal_ack(client_id, str(up_to))
+    except Exception as exc:  # noqa: BLE001
+        return 500, {"error": str(exc)}
+    return 200, {"acked": acked}
+
+
+def handle_v4_command(server: "DaemonHTTPServer", body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """/api/v4/command：版本化信封 + 命令日志幂等（new → 执行一次；
+    replay → 返回已记录结果；conflict → command_id_conflict；uncertain → 不盲目重放）。"""
+    if body.get("protocol") != "v4":
+        return 400, {"error": "protocol must be v4"}
+    client_id = body.get("client_id")
+    command_id = body.get("command_id")
+    request_hash = body.get("request_hash")
+    method = body.get("method")
+    params = body.get("params") or {}
+    if not client_id or not command_id or not request_hash or not method:
+        return 400, {"error": "client_id/command_id/request_hash/method are required"}
+    store = getattr(server, "store_v4", None)
+    dispatcher = getattr(server, "dispatcher", None)
+    if store is None or dispatcher is None:
+        return 503, {"error": "control plane not ready"}
+
+    existing = store.journal_get(client_id, command_id)
+    decision = m.journal_classify(existing, request_hash)
+    if decision == m.JOURNAL_CONFLICT:
+        return 409, {"error": "command_id_conflict",
+                     "detail": "same command_id with different request_hash is never executed"}
+    if decision == m.JOURNAL_REPLAY:
+        state = existing["state"]
+        if state == "completed":
+            import json as _json
+            result = _json.loads(existing["result_json"] or "{}") or {}
+            status = int(result.pop("_status", 200) or 200)
+            return status, dict(result, _idempotency="replay")
+        if state == "uncertain":
+            return 409, {"error": "command result uncertain", "state": "uncertain"}
+        return 202, {"state": "in_progress"}
+
+    entry = store.journal_record(
+        client_id=client_id, command_id=command_id, request_hash=request_hash,
+        method=method, params=params,
+    )
+    method_name = _resolve_v4_method(dispatcher, method)
+    if method_name is None:
+        store.journal_complete(client_id=client_id, command_id=command_id,
+                               result={"error": "unknown method: %s" % method, "_status": 400})
+        return 400, {"error": "unknown method: %s" % method}
+    try:
+        result = getattr(dispatcher, method_name)(params)
+    except ValueError as exc:
+        store.journal_complete(client_id=client_id, command_id=command_id,
+                               result={"error": str(exc), "_status": 400})
+        return 400, {"error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        # 结果不确定：标记 uncertain，绝不盲目重放
+        store.journal_mark_uncertain(client_id, command_id)
+        return 500, {"error": str(exc), "state": "uncertain"}
+    store.journal_complete(client_id=client_id, command_id=command_id, result=result)
+    if not isinstance(result, dict):
+        result = {"result": result}
+    return 200, dict(result, _idempotency="new")
+
+
+def parse_event_cursor(raw: str) -> tuple[int | None, int]:
+    """解析 SSE Last-Event-ID（支持 "<generation>:<seq>" 与纯 seq）。返回 (generation, seq)。"""
+    raw = (raw or "").strip()
+    if ":" in raw:
+        gen_s, _, seq_s = raw.partition(":")
+        try:
+            return int(gen_s), int(seq_s or 0)
+        except ValueError:
+            return None, 0
+    try:
+        return None, int(raw)
+    except ValueError:
+        return None, 0
 
 
 def _state_dir_of(server: "DaemonHTTPServer") -> Path | None:
@@ -158,8 +305,9 @@ def _workspace_apply(server: "DaemonHTTPServer", body: dict[str, Any],
 
 class EventBroadcaster:
     """SSE 统一广播：事件循环单写，非阻塞写，写失败断开，统一心跳。"""
-    def __init__(self, max_clients: int = MAX_SSE_CLIENTS):
+    def __init__(self, max_clients: int = MAX_SSE_CLIENTS, generation: int = 0):
         self.max = max_clients
+        self.generation: int = generation
         self._clients: dict[int, dict[str, Any]] = {}
         self._next = 0
         self._lock = threading.Lock()
@@ -182,7 +330,10 @@ class EventBroadcaster:
     def publish(self, event: dict[str, Any], *, seq: int | None) -> None:
         # seq=None 的事件（agent.message_delta）不落库，SSE 不带 id，
         # 断线回放只对齐落库 seq，不会与其冲突
-        id_line = f"id: {seq}\n" if seq is not None else ""
+        if seq is not None and self.generation:
+            id_line = f"id: {self.generation}:{seq}" + NL
+        else:
+            id_line = (f"id: {seq}" + NL) if seq is not None else ""
         payload = (f"{id_line}event: {event['type']}\n"
                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
         with self._lock:
@@ -215,12 +366,16 @@ class DaemonHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, addr, web_root: Path, *, token: str, db: Any,
-                 dispatcher: Any, broadcaster: EventBroadcaster | None = None):
+                 dispatcher: Any, broadcaster: EventBroadcaster | None = None,
+                 store_v4: Any = None):
         self.web_root = Path(web_root)
         self.token = token
         self.db = db
         self.dispatcher = dispatcher
         self.broadcaster = broadcaster or EventBroadcaster()
+        self.store_v4 = store_v4
+        self.generation: int = 0
+        self.generation_nonce: str = ""
         super().__init__(addr, Handler)
         self.server_name = "agent-mcp-daemon"
 
@@ -275,6 +430,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/config":
             self._send_json(200, {"max_message_chars": 20_000,
                                   "write_auth": "url-fragment"})
+        elif path == "/api/protocol":
+            if not self._check_token():
+                return
+            self._send_json(200, protocol_payload(self.server))
         elif path == "/api/snapshot":
             # A6：读端点纳入鉴权（header 或 ?token= 均可）
             if not self._check_token():
@@ -345,6 +504,25 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_token():
             return
         path = self.path.split("?")[0]
+        if path == "/api/v4/command":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._send_json(400, {"error": "invalid Content-Length"})
+                return
+            if length > MAX_JSON_BYTES:
+                self.rfile.read(min(length, MAX_JSON_BYTES * 2))
+                self._send_json(413, {"error": "request body too large"})
+                return
+            body = self._read_json()
+            status, payload = handle_v4_command(self.server, body)
+            self._send_json(status, payload)
+            return
+        if path == "/api/v4/ack":
+            body = self._read_json()
+            status, payload = handle_v4_ack(self.server, body)
+            self._send_json(status, payload)
+            return
         action = _WORKSPACE_POST.get(path)
         if action is not None:
             # workspace merge/discard：独立处理（不走 dispatcher 方法表）
@@ -422,11 +600,25 @@ class Handler(BaseHTTPRequestHandler):
             # D2 预计算异常 badge（免前端再扫全事件流）
             row["anomalies"] = db.agent_anomalies(a["id"])
             agent_out.append(row)
+        try:
+            limit = max(1, int((query.get("limit") or ["0"])[0]))
+        except ValueError:
+            limit = 0
+        if limit:
+            events = events[-limit:]
+        last_seq = events[-1]["seq"] if events else 0
+        generation = getattr(self.server, "generation", 0)
+        nonce = getattr(self.server, "generation_nonce", "")
+        token_raw = "%s:%s:%s" % (generation, nonce, last_seq)
         self._send_json(200, {
             "agents": agent_out,
             "events": events,
             "usage": {"totals": totals, "per_agent": per_agent},
-            "last_seq": events[-1]["seq"] if events else 0,
+            "last_seq": last_seq,
+            "generation": generation,
+            "snapshot_token": hashlib.sha256(token_raw.encode("utf-8")).hexdigest()[:16],
+            "begin": True,
+            "end": True,
         })
 
     def _stream_events(self, message_mode: bool = False):
@@ -446,10 +638,12 @@ class Handler(BaseHTTPRequestHandler):
             last_seq = int((query.get("last_seq") or ["0"])[0])
         except ValueError:
             last_seq = 0
-        try:
-            last_seq = max(last_seq, int(self.headers.get("Last-Event-ID") or "0"))
-        except ValueError:
-            pass
+        raw_cursor = self.headers.get("Last-Event-ID") or ""
+        gen_seen, seq_from_header = parse_event_cursor(raw_cursor)
+        if gen_seen is not None and gen_seen != self.server.generation:
+            # 代际不匹配：旧代事件不可续播，重置为全量回放（快照为恢复基线）
+            seq_from_header = 0
+        last_seq = max(last_seq, seq_from_header)
         client = self.server.broadcaster.connect()
         if client is None:
             self.send_error(503, "too many SSE clients")
@@ -481,7 +675,8 @@ class Handler(BaseHTTPRequestHandler):
                             "payload": ev["payload"],
                             "seq": seq,
                         }
-                        payload = self._frame(event_payload, seq, message_mode)
+                        payload = self._frame(event_payload, seq, message_mode,
+                                                generation=self.server.generation)
                         try:
                             self.wfile.write(payload.encode("utf-8"))
                             self.wfile.flush()
@@ -511,13 +706,15 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _frame(event_payload: dict[str, Any], seq: int,
-               message_mode: bool) -> str:
+               message_mode: bool, generation: int = 0) -> str:
         """组 SSE 帧。message_mode：id: + data 内嵌 type（无 event: 行，供
-        Last-Event-ID 重连续传）；否则命名事件帧（id: + event: + data:）。"""
+        Last-Event-ID 重连续传）；否则命名事件帧（id: + event: + data:）。
+        generation>0 时 id 为 "<generation>:<seq>"（代际游标）。"""
         data = json.dumps(event_payload, ensure_ascii=False)
+        id_line = (f"id: {generation}:{seq}" if generation else f"id: {seq}")
         if message_mode:
-            return f"id: {seq}\ndata: {data}\n\n"
-        return f"id: {seq}\nevent: {event_payload['type']}\ndata: {data}\n\n"
+            return NL.join([id_line, f"data: {data}", ""]) + NL
+        return NL.join([id_line, f"event: {event_payload['type']}", f"data: {data}", ""]) + NL
 
     @staticmethod
     def _to_message_chunk(chunk: str) -> str:
@@ -545,7 +742,10 @@ class Handler(BaseHTTPRequestHandler):
             first = part.split("\n", 1)[0]
             if first.startswith("id: "):
                 try:
-                    if int(first[4:]) in replayed:
+                    token = first[4:]
+                    if ":" in token:
+                        token = token.split(":", 1)[1]
+                    if int(token) in replayed:
                         continue
                 except ValueError:
                     pass

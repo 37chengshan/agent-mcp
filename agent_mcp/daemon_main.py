@@ -344,7 +344,7 @@ class Dispatcher:
     """
     def __init__(self, *, db: Any, broadcaster: EventBroadcaster, state_dir: Path | str,
                  max_concurrent: int = 4, spawn_fn: Any = None,
-                 monitor_interval: float = 1.0):
+                 monitor_interval: float = 1.0, store_v4: Any = None):
         self.db = db
         self.broadcaster = broadcaster
         self.state_dir = Path(state_dir)
@@ -366,6 +366,7 @@ class Dispatcher:
         self._hb_stop = threading.Event()
         self._hb_thread: threading.Thread | None = None
         # v0.3 策略引擎：daemon 级 enforcement（spawn/usage 数据源都在本进程）
+        self.store_v4 = store_v4
         self.policy_engine = PolicyEngine(state_path=self.state_dir / "policies.json")
         self.policy_engine.register("budget_policy", budget_policy_factory(
             limit_usd=float(os.environ.get("AGENT_MCP_BUDGET_USD", "10.0"))))
@@ -1830,11 +1831,18 @@ def main() -> int:
         threading.Timer(6 * 3600, _purge_cycle).start()
     threading.Timer(6 * 3600, _purge_cycle).start()
 
-    broadcaster = EventBroadcaster()
-    dispatcher = Dispatcher(db=db, broadcaster=broadcaster, state_dir=state_dir)
+    from agent_mcp.store_v4 import StoreV4
+    store_v4 = StoreV4(db)
+    gen_epoch, gen_nonce = store_v4.next_generation()
+    broadcaster = EventBroadcaster(generation=gen_epoch)
+    dispatcher = Dispatcher(db=db, broadcaster=broadcaster, state_dir=state_dir,
+                            store_v4=store_v4)
     try:
         srv = DaemonHTTPServer(("127.0.0.1", args.port), args.web_root, token=token,
-                           db=db, dispatcher=dispatcher, broadcaster=broadcaster)
+                           db=db, dispatcher=dispatcher, broadcaster=broadcaster,
+                           store_v4=store_v4)
+        srv.generation = gen_epoch
+        srv.generation_nonce = gen_nonce
     except OSError as exc:
         # D6: bind 失败明确报 port conflict 而非通用错误
         import errno
