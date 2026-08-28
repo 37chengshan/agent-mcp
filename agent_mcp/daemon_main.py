@@ -528,6 +528,15 @@ class Dispatcher:
                     self.db.touch_activity(agent_id)
                 except Exception:
                     pass  # 心跳失败不致命，下一轮重试
+            if tick % 10 == 0 and self.store_v4 is not None:
+                try:
+                    from agent_mcp.execution import ExecutionManager
+                    from agent_mcp.triggers import now_iso
+                    em = ExecutionManager(self, self.store_v4)
+                    em.schedule_pump(now_iso())
+                    em.goal_pump(now_iso())
+                except Exception as exc:
+                    print(f"[dispatcher] trigger pump failed: {exc}", file=sys.stderr)
             if tick % 30 == 0:
                 try:
                     self.policy_engine.save_if_dirty()
@@ -913,7 +922,11 @@ class Dispatcher:
             if agent is None:
                 raise ValueError(f"agent {body['agent_id']} not found")
             self._require_session(body, agent)
-            totals = self.db.usage_total(int(body["agent_id"]))
+            if body.get("include_children") and self.store_v4 is not None:
+                from agent_mcp.execution import usage_with_children
+                totals = usage_with_children(self.db, self.store_v4, int(body["agent_id"]))
+            else:
+                totals = self.db.usage_total(int(body["agent_id"]))
         else:
             totals: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0,
                                       "cache_creation": 0, "cache_read": 0,

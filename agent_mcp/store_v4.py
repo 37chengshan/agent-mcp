@@ -314,6 +314,11 @@ class StoreV4:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def runs_all(self) -> list[dict[str, Any]]:
+        conn = self.db._conn()
+        rows = conn.execute("SELECT * FROM runs ORDER BY created_at ASC").fetchall()
+        return [dict(r) for r in rows]
+
     def runs_in_status(self, *statuses: str) -> list[dict[str, Any]]:
         conn = self.db._conn()
         placeholders = ",".join("?" for _ in statuses)
@@ -400,6 +405,11 @@ class StoreV4:
         if active_only:
             sql += " AND status='active'"
         rows = conn.execute(sql + " ORDER BY id DESC", (session_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def goals_active(self) -> list[dict[str, Any]]:
+        conn = self.db._conn()
+        rows = conn.execute("SELECT * FROM goals WHERE status='active' ORDER BY id ASC").fetchall()
         return [dict(r) for r in rows]
 
     def goal_update_status(self, goal_id: int, status: str) -> dict[str, Any] | None:
