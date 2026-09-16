@@ -1,5 +1,17 @@
 # Agent MCP
 
+<p align="center">
+  <strong>Agent Control Plane</strong> — 把任意 Agent CLI 统一成可派发 / 可监控 / 可续接 / 可终止的工作池
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-4.0.0a1-C0503A" alt="version">
+  <img src="https://img.shields.io/badge/tools-34-3E7A56" alt="tools">
+  <img src="https://img.shields.io/badge/tests-589%20passed-3E7A56" alt="tests">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="license">
+  <img src="https://img.shields.io/badge/MCP-2026--07--28-5A54A3" alt="mcp">
+</p>
+
 > 当前版本 **v4.0.0a1**（单一来源：`agent_mcp/__init__.py`；变更记录见 [CHANGELOG.md](CHANGELOG.md)；v4 路线图见 [docs/plans/2026-08-28-v4-roadmap.md](docs/plans/2026-08-28-v4-roadmap.md)）。
 
 > **✅ v4：Agent Control Plane** —— Run 唯一执行单位、Goal/Schedule 触发、Harness/Refine 可审计知识层、控制台重做。Prime Agent 适配器已接入（能力契约；真实冒烟 ⏳）。
@@ -44,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.
 
 > ⚠️ 管道执行会以**当前用户权限**直接运行远程脚本——请先审阅 [install.sh](install.sh) 内容再执行；更稳妥的安装方式见下方 git clone。也可改用固定 commit 引用：`curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/<commit-sha>/install.sh | bash`。
 
-一键配置支持 **codex / claude / omp / opencode / kimi / zcode / grok / cursor / gemini / pi / copilot / cline / qwen / devin / windsurf / amazon-q / atomcode / kiro / goose / hermes / crush** 二十一种 Agent CLI（注册 MCP；前六种另装 skill）→ 安装完成后提示是否 star。**其它 CLI 同样可以接入**：用 `AGENT_MCP_HOST` 指定单个 host，或按下方方式三把提示词交给任意 AI 完成注册。`AGENT_MCP_DIR` 可自定义安装目录。host 覆盖依据见 [docs/research/installer-coverage-2026-08-13.md](docs/research/installer-coverage-2026-08-13.md)。
+一键配置支持 **codex / claude / omp / opencode / kimi / zcode / grok / cursor / gemini / pi / copilot / cline / qwen / devin / windsurf / amazon-q / atomcode / kiro / goose / hermes / crush** 二十一种 Agent CLI（注册 MCP；前六种另装 skill）。安装完成后会打印仓库首页链接（**不自动打开浏览器 / 不调用 gh star**）。**其它 CLI 同样可以接入**：用 `AGENT_MCP_HOST` 指定单个 host，或按下方方式三把提示词交给任意 AI 完成注册。`AGENT_MCP_DIR` 可自定义安装目录。host 覆盖依据见 [docs/research/installer-coverage-2026-08-13.md](docs/research/installer-coverage-2026-08-13.md)。
 
 **方式二 · git clone + 安装脚本**：
 
@@ -82,14 +94,14 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 | 🎯 **验证回投** | `verify_command` + `max_fix_attempts`：daemon 自跑验证，失败自动同 session 回投修复，只把最终结果交回主 Agent |
 | 💰 **成本控制** | `token_budget` 超额自动降档 model 重跑；`cache_ttl` 读密集结果秒级缓存（TTL 内 0 token）；`summary_chars` / `context_mode` 裁剪回传体积 |
 | 🔐 **会话隔离** | session_id 是所有权边界：宿主注入的稳定会话标识派生，同一对话重开 MCP 连接旧 agent 仍可用，跨会话不可互操作 |
-| 📊 **实时监控页** | 单文件、零外部依赖的只读 Web UI（SSE 直播事件流 + 对话图 + 明暗主题），异常状态（needs_advisor 需决策 / orphaned 失联 / verify 回投 / 降档 / ingest 失败）实时可见，daemon 随手起，`GET /` 实测 5ms |
-| 📈 **仪表盘三面板（v2）** | 底部 Dock 打开**全屏分页仪表盘**：协作泳道（agent 实时状态 + 跨厂商审查卡片）/ 策略可视化（预算进度环 + 审计日志）/ 工作区视图（worktree 合并/丢弃）。面板常驻不重建（切页零闪烁）、隐藏面板暂停渲染（性能）、进入/呼吸动画（prefers-reduced-motion 自动降级） |
+| 📊 **Web 控制台 v4** | 三栏：会话文件夹 / 自上而下对话树（流动边、节点可拖、画布缩放）/ Agent 详情；顶栏 Agent 切换；SSE 实时；明暗主题；`prefers-reduced-motion` 降级 |
+| 🧭 **仪表盘七面板** | 总览 · **编排控制（Run/Goal/Schedule）** · Token · 协作泳道 · 策略 · 工作区 · 信箱；ES modules 零构建链 |
 | 🧠 **记忆银行** | `memory_store` / `memory_recall` 跨会话项目记忆存取：FINAL_ANSWER 自动沉淀 + 关键词召回注入 |
-| 🧩 **多 Agent DAG 编排** | `orchestrate_task` 声明式任务图（依赖/cli/worktree/跨厂商审查）：无依赖任务并行、依赖任务按序推进、Polly 模式跨厂商审查（写者与审查者不同 CLI 厂商）、worktree 隔离执行 |
-| 🛡️ **策略治理引擎** | `PolicyEngine` 声明式策略链（预算/审批/工具限权 3 内置策略）：spawn/steer/orchestrate 入口前 enforcement，DENY 短路，状态落盘持久化，`policy_list/policy_add/policy_state` 会话内可配置 |
-| 📊 **监控页三面板** | 现有对话图之上新增协作泳道 / 策略可视化（预算进度环 + 审计日志）/ 工作区视图（worktree 合并/丢弃），原生 ES modules 零构建链，SSE 实时驱动 |
-| 🔒 **沙箱映射层** ⚠️🧪 | 统一策略意图 → 各 CLI 沙箱参数翻译（codex `--sandbox`、claude permission-mode、omp approval-mode…）。⚠️ 诚实标注：SANDBOX_MAP 映射表尚未接入执行链，当前实际生效的是各适配器 PERMISSION_FLAGS；进程级资源兜底未接线。🧪 容器沙箱为实验开关：设 `AGENT_MCP_SANDBOX_IMAGE` 启用（docker/podman 包装、默认禁网、CPU/内存硬配额） |
-| 🛠️ **一键安装全覆盖** | `install.py` 注册 21 个 host（6 主载体 + grok/cursor/gemini/pi/copilot/cline/qwen/devin/windsurf/amazon-q/atomcode/kiro/goose/hermes/crush），A/B/C 三模板复用 + YAML/rc 专属注册，备份回滚、`--rollback`、`--dry-run` 只预览 |
+| 🧩 **多 Agent DAG 编排** | `orchestrate_task` 声明式任务图（依赖/cli/worktree/跨厂商审查）：无依赖任务并行、依赖任务按序推进、Polly 模式跨厂商审查、worktree 隔离执行 |
+| 🛡️ **策略治理引擎** | `PolicyEngine` 声明式策略链（预算/审批/工具限权）：spawn/steer/orchestrate 入口前 enforcement，DENY 短路，状态落盘 |
+| 🎯 **v4 控制面** | Run 唯一执行单位；Goal 心泵续播；Schedule tick 防重放；`/api/v4/command` 幂等 journal；Harness revision + 三段式 refine |
+| 🔒 **沙箱映射层** ⚠️🧪 | 统一策略意图 → 各 CLI 沙箱参数翻译。⚠️ SANDBOX_MAP 尚未接入执行链，当前生效的是各适配器 PERMISSION_FLAGS。🧪 容器沙箱：设 `AGENT_MCP_SANDBOX_IMAGE` 启用 |
+| 🛠️ **一键安装** | `install.py` 注册 21 host；备份回滚；`--dry-run`；`start_agent_mcp.py --doctor` 健康体检；star 只打印仓库首页（不自动开浏览器） |
 
 > **统一入口，不锁死在单一 Agent CLI** —— 为每个任务选择更适合的执行组合：
 
@@ -106,41 +118,74 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 
 ## 🏗️ 架构
 
-```
-┌──────────────────────────────┐        ┌──────────────────────────────┐
-│  主 Agent (codex / claude /  │        │   监控页 (单文件只读 Web UI)  │
-│          omp ...)            │        │    http://127.0.0.1:8765/    │
-└──────────────┬───────────────┘        └──────────────▲───────────────┘
-               │ MCP stdio (零依赖薄层)                  │ SSE 事件流
-               ▼                                        │
-┌──────────────────────────────┐        ┌──────────────────────────────┐
-│   mcp_server.py (无状态)      │        │   daemon_main.py (常驻 daemon) │
-│   · 34 个 MCP 工具             │  HTTP  │   · 槽位 / 排队 / 心跳 / 看护   │
-│   · host 识别 + 会话隔离      │ ─────► │   · 验证回投 / 降档 / 缓存      │
-│   · 无 daemon 时原子拉起      │  X-Auth │   · SQLite 状态机持久化         │
-└──────────────────────────────┘   Token └──────────────┬───────────────┘
-                                                        │ subprocess
-                    ┌───────────────┬────────┬──────────┼──────────┐
-                    ▼               ▼        ▼          ▼          ▼
-              ┌──────────┐  ┌──────────┐ ┌────────┐ ┌────────┐ ┌──────────┐
-              │  claude  │  │   grok   │ │opencode│ │  omp   │ │ atomcode │
-              │  worker  │  │  worker  │ │ worker │ │ worker │ │  worker  │
-              └──────────┘  └──────────┘ └────────┘ └────────┘ └──────────┘
-                 统一事件流归一化（agent.spawned → running → message/usage → terminated）
-                 （另有 codex / kimi / copilot / pi / zcode / cline 适配器 + 自定义 CLI 配置）
-```
+```mermaid
+flowchart TB
+  Host["主 Agent Host<br/>claude · codex · omp · DSH …"]
+  Web["Web 控制台<br/>127.0.0.1:8765 · SSE"]
+  CLI["start · install · doctor"]
 
-完整架构图见 [docs/architecture.svg](docs/architecture.svg)，编排流程见 [docs/workflow.svg](docs/workflow.svg)。
+  MCP["mcp_server.py<br/>34 工具 · 无状态 · 会话隔离"]
+  CP["Control Plane daemon<br/>/api/v4 · journal · 槽位 · 策略"]
+  Store["store_v4 + db<br/>runs · goals · harness · journal"]
+  EM["Execution Manager<br/>Run 唯一执行单位"]
+  Ad["Backend Adapters<br/>claude · grok · omp · prime …"]
+  HR["Harness / Refine<br/>revision · proposal"]
+  RT["Native Agent Runtime<br/>claude / omp / codex / prime / custom"]
 
-> **编排、监控、续接与容错** —— 运行起来之后怎么把多 Agent 真正管起来：
-
-```text
-复杂度分级门 → 派发 → 监控（wait 不轮询）→ 验证回投 → 容错（超时 / resume / 降档）
+  Host -->|MCP stdio| MCP
+  Web -->|SSE / HTTP| CP
+  CLI --> CP
+  MCP -->|X-Auth HTTP| CP
+  CP --> Store
+  CP --> EM
+  EM --> Ad
+  CP --> HR
+  Ad --> RT
 ```
 
 <p align="center">
-  <img src="docs/images/agent-mcp-orchestration.png" width="100%" alt="Agent MCP — 编排、监控、续接与容错">
+  <img src="docs/architecture-v4.svg" width="100%" alt="Agent MCP v4 Control Plane 架构">
 </p>
+
+| 层 | 职责 | 关键模块 |
+|---|---|---|
+| **MCP Protocol** | 34 工具、host 识别、会话隔离、daemon 原子拉起 | `mcp_server.py` |
+| **Control Plane** | 幂等命令 journal、槽位/排队、策略、SSE | `daemon_http.py` · `daemon_main.py` |
+| **Execution** | Run 状态机、Goal/Schedule 泵、预算 | `execution.py` · `triggers.py` · `store_v4.py` |
+| **Backend Adapter** | 各 CLI 命令构造 + 事件/usage/session 归一化 | `cli_adapters.py` |
+| **Native Runtime** | 真正执行（agent-mcp 不实现 agent loop） | claude / omp / codex / prime / custom |
+
+> **边界**：思考 / 工具调用 / 模型推理 → Native Runtime；编排、调度、托管、观测、治理 → agent-mcp。
+
+编排闭环：
+
+```text
+复杂度分级门 → 派发(Run) → 监控(wait) → 验证回投 → 容错(超时/resume/降档)
+```
+
+---
+
+## 🖥️ 控制台（v4 实拍）
+
+三栏布局：**左**会话文件夹分类 · **中**自上而下对话树（流动边 / 节点可拖 / 画布缩放）· **右**Agent 详情与操作。顶栏一键切换 Agent。
+
+| 会话总览 | 单会话对话树 | 仪表盘 |
+|:---:|:---:|:---:|
+| ![总览](docs/images/console-overview.jpg) | ![对话树](docs/images/console-session-tree.jpg) | ![仪表盘](docs/images/console-dashboard.jpg) |
+
+打开方式：
+
+```bash
+python3 start_agent_mcp.py --open
+# 或 http://127.0.0.1:8765/#token=<daemon.json 中的 token>
+```
+
+- 画布：空白处拖拽 · 滚轮缩放 · 节点单独拖动
+- 会话：文件夹可折叠（Default / OMP / Release / …），状态写 localStorage
+- 运行中链路有流动动画；`prefers-reduced-motion` 自动降级
+- 仪表盘：总览 / **编排控制(Run·Goal·Schedule)** / Token / 协作 / 策略 / 工作区 / 信箱
+
+> 旧编排示意图（仍有效）：[routing](docs/images/agent-mcp-routing.png) · [orchestration](docs/images/agent-mcp-orchestration.png)
 
 ---
 
@@ -187,26 +232,32 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 ## 📦 项目结构
 
 ```
-mcp_server.py            # MCP 薄层：工具定义、host 识别、会话隔离、daemon 原子拉起、策略 enforcement
-agent_mcp/
-  daemon_main.py         # 常驻 daemon：Dispatcher、槽位/排队/心跳/看护、验证回投、SSE
-  cli_adapters.py        # 多 CLI 适配器（命令构造 + 事件流归一化）
-  orchestrator.py        # 多 Agent DAG 编排（依赖图 + Polly 跨厂商审查 + worktree）
-  policies/              # 策略治理引擎（PolicyEngine + budget/approval/tool_limit 内置策略）
-  sandbox/               # 统一沙箱意图 → CLI 参数映射 + 进程级资源兜底
-  state_machine.py       # agent 状态机（starting/running/terminated/error/…）
-  db.py                  # SQLite 持久化（agent/事件/usage）
-  daemon_http.py         # HTTP 路由 + X-Auth-Token 认证 + SSE（命名/消息双通道）+ 策略/工作区端点
+mcp_server.py            # MCP 薄层：34 工具 · host 识别 · 会话隔离 · daemon 拉起
+start_agent_mcp.py       # 幂等启动 daemon · --open 控制台 · --doctor 体检
+install.py / install.sh  # 21 host 注册 · 备份回滚 · tarball 可选 SHA-256
 dispatch_worker.py       # 子进程 worker（超时终止进程树）
-install.py               # 21 host 注册（A/B/C 模板 + YAML/rc）+ skill + 备份回滚
-install.sh               # curl 一键安装（21 host 选择）
-start_agent_mcp.py       # 幂等启动 daemon（可选打开监控页）
-web/index.html           # 单文件零依赖只读监控页（SSE + 对话图 + 明暗主题）
-web/panels/              # 协作泳道 / 策略可视化 / 工作区视图 三面板（ES modules）
-web/css/panels.css       # 面板样式（复用 index.html 视觉语言）
-skill/                   # 编排 skill + 10 内置 Agent + 任务简报模板
-docs/                    # 验收清单 / 能力矩阵 / 安装器覆盖调研 / 设计文档
-tests/                   # 20+ 测试文件（含真实 stdio 与 CLI 集成冒烟）
+
+agent_mcp/
+  daemon_main.py         # Dispatcher · 槽位/排队/心跳 · Run 落库/结算 · Goal/Schedule 工具
+  daemon_http.py         # HTTP/SSE · /api/v4/command journal · /api/protocol
+  execution.py           # Execution Manager（Run 唯一执行单位）
+  triggers.py            # Goal/Schedule Intent
+  store_v4.py            # runs/journal/goals/schedules/harness/tasks
+  models.py              # Run 状态机 · 预算 · IntervalSpec · Invariants
+  refine.py              # 三段式 refine（preview/commit/rollback）
+  cli_adapters.py        # 11+ 适配器 · prime-agent-rpc/acp · Generic
+  orchestrator.py        # DAG 编排 + 跨厂商审查 + worktree
+  policies/ · sandbox/   # 策略引擎 · 沙箱映射
+  db.py · events.py · state_machine.py
+
+web/
+  index.html             # v4 控制台（文件夹会话 · 对话树 · 详情）
+  panels/                # loader + dashboard/control/tokens/collaboration/…
+  css/panels.css
+
+skill/                   # 编排 skill + 10 内置 Agent
+docs/                    # 架构图 · 能力矩阵 · 路线图 · DSH/安装指南
+tests/                   # 589 单测（registry/invariants/v4/web/security…）
 ```
 
 ---

@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" font-family="-apple-system,BlinkMacSystemFont,'PingFang SC','Segoe UI',sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8B867A"/>
+    </marker>
+    <style>
+      .box{fill:#fff;stroke:#E7E2D8;stroke-width:1.2}
+      .box-ink{fill:#2E2A22;stroke:#2E2A22}
+      .box-acc{fill:#F6E3DB;stroke:#C0503A;stroke-width:1.4}
+      .box-ok{fill:#E4F0E8;stroke:#3E7A56;stroke-width:1.2}
+      .t{fill:#2E2A22;font-size:13px;font-weight:600}
+      .ts{fill:#6E675A;font-size:11px}
+      .tw{fill:#F7F5F0;font-size:13px;font-weight:600}
+      .lab{fill:#6E675A;font-size:10px;font-family:ui-monospace,Menlo,monospace}
+      .edge{stroke:#8B867A;stroke-width:1.2;fill:none;marker-end:url(#arr)}
+    </style>
+  </defs>
+  <rect width="960" height="520" fill="#F7F5F0"/>
+
+  <!-- Hosts -->
+  <rect class="box" x="40" y="28" width="200" height="52" rx="8"/>
+  <text class="t" x="140" y="50" text-anchor="middle">主 Agent Host</text>
+  <text class="ts" x="140" y="68" text-anchor="middle">claude / codex / omp / DSH …</text>
+
+  <rect class="box" x="380" y="28" width="200" height="52" rx="8"/>
+  <text class="t" x="480" y="50" text-anchor="middle">Web 控制台</text>
+  <text class="ts" x="480" y="68" text-anchor="middle">127.0.0.1:8765 · SSE</text>
+
+  <rect class="box" x="720" y="28" width="200" height="52" rx="8"/>
+  <text class="t" x="820" y="50" text-anchor="middle">CLI / Doctor</text>
+  <text class="ts" x="820" y="68" text-anchor="middle">start · install · doctor</text>
+
+  <!-- MCP thin layer -->
+  <rect class="box-acc" x="40" y="120" width="280" height="70" rx="10"/>
+  <text class="t" x="180" y="148" text-anchor="middle">mcp_server.py</text>
+  <text class="ts" x="180" y="168" text-anchor="middle">34 工具 · 无状态 · 会话隔离</text>
+
+  <!-- Control plane -->
+  <rect class="box-ink" x="360" y="110" width="280" height="90" rx="10"/>
+  <text class="tw" x="500" y="140" text-anchor="middle">Control Plane (daemon)</text>
+  <text class="ts" x="500" y="160" text-anchor="middle" fill="#B5B0A4">HTTP /api/v4 · journal · SSE</text>
+  <text class="ts" x="500" y="178" text-anchor="middle" fill="#B5B0A4">槽位 / 排队 / 心跳 / 策略</text>
+
+  <!-- Store -->
+  <rect class="box-ok" x="680" y="120" width="240" height="70" rx="10"/>
+  <text class="t" x="800" y="148" text-anchor="middle">store_v4 + db</text>
+  <text class="ts" x="800" y="168" text-anchor="middle">runs · goals · harness · journal</text>
+
+  <!-- Execution -->
+  <rect class="box-acc" x="360" y="240" width="280" height="64" rx="10"/>
+  <text class="t" x="500" y="266" text-anchor="middle">Execution Manager</text>
+  <text class="ts" x="500" y="286" text-anchor="middle">Run 唯一执行单位 · Goal/Schedule 泵</text>
+
+  <!-- Adapters -->
+  <rect class="box" x="40" y="240" width="280" height="64" rx="10"/>
+  <text class="t" x="180" y="266" text-anchor="middle">Backend Adapters</text>
+  <text class="ts" x="180" y="286" text-anchor="middle">claude·grok·omp·codex·prime…</text>
+
+  <rect class="box" x="680" y="240" width="240" height="64" rx="10"/>
+  <text class="t" x="800" y="266" text-anchor="middle">Harness / Refine</text>
+  <text class="ts" x="800" y="286" text-anchor="middle">revision · rollback · proposal</text>
+
+  <!-- Workers -->
+  <g>
+    <rect class="box" x="60" y="360" width="150" height="48" rx="8"/>
+    <text class="ts" x="135" y="388" text-anchor="middle">claude worker</text>
+    <rect class="box" x="230" y="360" width="150" height="48" rx="8"/>
+    <text class="ts" x="305" y="388" text-anchor="middle">omp worker</text>
+    <rect class="box" x="400" y="360" width="150" height="48" rx="8"/>
+    <text class="ts" x="475" y="388" text-anchor="middle">codex worker</text>
+    <rect class="box" x="570" y="360" width="150" height="48" rx="8"/>
+    <text class="ts" x="645" y="388" text-anchor="middle">prime-agent</text>
+    <rect class="box" x="740" y="360" width="150" height="48" rx="8"/>
+    <text class="ts" x="815" y="388" text-anchor="middle">custom CLI</text>
+  </g>
+  <text class="lab" x="480" y="440" text-anchor="middle">Native Agent Runtime — 执行 100% 留在原生 CLI</text>
+
+  <!-- edges -->
+  <path class="edge" d="M140 80 V120"/>
+  <path class="edge" d="M480 80 V110"/>
+  <path class="edge" d="M820 80 V120"/>
+  <path class="edge" d="M320 155 H360"/>
+  <path class="edge" d="M640 155 H680"/>
+  <path class="edge" d="M500 200 V240"/>
+  <path class="edge" d="M360 272 H320"/>
+  <path class="edge" d="M640 272 H680"/>
+  <path class="edge" d="M180 304 V360"/>
+  <path class="edge" d="M500 304 V360"/>
+  <path class="edge" d="M800 304 V360"/>
+
+  <text class="lab" x="250" y="112">MCP stdio</text>
+  <text class="lab" x="560" y="100">SSE</text>
+  <text class="lab" x="700" y="230">X-Auth</text>
+</svg>
