@@ -450,9 +450,10 @@ def test_mcp_tools_full_for_undeclared_client(mcp_proc):
 
     tools = _rpc(proc, q, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = [t["name"] for t in tools["result"]["tools"]]
-    assert len(names) == 16
+    assert len(names) == 34
     for expect in MCP_TOOL_NAMES + ["orchestrate_task", "policy_list",
-                                    "policy_add", "policy_state"]:
+                                    "policy_add", "policy_state",
+                                    "list_runs", "goal_create", "schedule_create"]:
         assert expect in names
 
 

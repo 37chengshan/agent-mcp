@@ -48,6 +48,13 @@ _API_METHODS = {
     "/api/refine/preview": "refine_preview",
     "/api/refine/commit": "refine_commit",
     "/api/refine/rollback": "refine_rollback",
+    "/api/v4/runs": "list_runs",
+    "/api/v4/goals": "goal_list",
+    "/api/v4/goals/create": "goal_create",
+    "/api/v4/goals/update": "goal_update",
+    "/api/v4/schedules": "schedule_list",
+    "/api/v4/schedules/create": "schedule_create",
+    "/api/v4/schedules/cancel": "schedule_cancel",
 }
 # 需要 token 的 workspace 写操作（merge/discard 会执行 git 命令）
 _WORKSPACE_POST = {"/api/workspaces/merge": "merged",
@@ -485,6 +492,18 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 hours = 24
             self._send_json(200, {"series": db.usage_series(hours)})
+        elif path == "/api/v4/runs":
+            if not self._check_token():
+                return
+            self._dispatch_get("list_runs")
+        elif path == "/api/v4/goals":
+            if not self._check_token():
+                return
+            self._dispatch_get("goal_list")
+        elif path == "/api/v4/schedules":
+            if not self._check_token():
+                return
+            self._dispatch_get("schedule_list")
         elif path == "/events":
             # A6：SSE 纳入鉴权（EventSource 走 ?token= 查询通道）
             if not self._check_token():
@@ -775,6 +794,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _dispatch_get(self, method_name: str) -> None:
+        """GET 侧只读 Dispatcher 方法（query string 作为 body 参数）。"""
+        if self.server.dispatcher is None:
+            self._send_json(503, {"error": "dispatcher not ready"})
+            return
+        query = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+        body = {k: (v[0] if len(v) == 1 else v) for k, v in query.items()}
+        method = getattr(self.server.dispatcher, method_name, None)
+        if method is None:
+            self._send_json(404, {"error": "unknown method"})
+            return
+        try:
+            self._send_json(200, method(body))
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"error": str(exc)})
+
     def _send_index(self):
         """发送 index.html 并注入面板 loader（幂等：已有注入标记则跳过）。
 
@@ -793,8 +830,9 @@ class Handler(BaseHTTPRequestHandler):
                         .encode("utf-8"))
         if b"window.__amToken=" not in data:
             data = data.replace(b"</head>", token_script + b"</head>", 1)
-        marker = b'<script type="module" src="/panels/loader.js?v=v4"></script>'
-        if marker not in data:
+        # 幂等注入面板 loader（兼容带/不带 ?v= 版本号）
+        if b"/panels/loader.js" not in data:
+            marker = b'<script type="module" src="/panels/loader.js?v=v6"></script>'
             if b"</body>" in data:
                 data = data.replace(b"</body>", marker + b"</body>", 1)
             else:

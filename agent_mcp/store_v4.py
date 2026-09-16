@@ -319,6 +319,13 @@ class StoreV4:
         rows = conn.execute("SELECT * FROM runs ORDER BY created_at ASC").fetchall()
         return [dict(r) for r in rows]
 
+    def runs_list(self, limit: int = 100) -> list[dict[str, Any]]:
+        conn = self.db._conn()
+        rows = conn.execute(
+            "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def runs_in_status(self, *statuses: str) -> list[dict[str, Any]]:
         conn = self.db._conn()
         placeholders = ",".join("?" for _ in statuses)
@@ -412,6 +419,19 @@ class StoreV4:
         rows = conn.execute("SELECT * FROM goals WHERE status='active' ORDER BY id ASC").fetchall()
         return [dict(r) for r in rows]
 
+    def goals_list(self, session_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        conn = self.db._conn()
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM goals WHERE session_id=? ORDER BY id DESC LIMIT ?",
+                (session_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM goals ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def goal_update_status(self, goal_id: int, status: str) -> dict[str, Any] | None:
         if status not in m.GOAL_STATUSES:
             raise ValueError("invalid goal status: %s" % status)
@@ -470,6 +490,24 @@ class StoreV4:
             (now_iso,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def schedules_list(self, session_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        conn = self.db._conn()
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM schedules WHERE session_id=? ORDER BY id DESC LIMIT ?",
+                (session_id, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM schedules ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def schedule_get(self, schedule_id: int) -> dict[str, Any] | None:
+        conn = self.db._conn()
+        row = conn.execute("SELECT * FROM schedules WHERE id=?", (int(schedule_id),)).fetchone()
+        return dict(row) if row else None
 
     def schedule_claim(self, schedule_id: int, claim_id: str) -> bool:
         """原子 claim：未 claim 且非 paused 才成功（Invariant 3：同一 tick 至多一个 Run）。"""

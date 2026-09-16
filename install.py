@@ -57,7 +57,8 @@ HOSTS = ("codex", "claude", "omp", "opencode", "kimi", "zcode",
 STARTER_NAME = "start_agent_mcp.py"
 HOOK_MARKER = "# agent-mcp-session-start"
 GITHUB_REPO = "37chengshan/agent-mcp"
-GITHUB_STAR_URL = f"https://github.com/{GITHUB_REPO}/stargazers"
+# 点星/收藏入口用仓库首页（用户心智是「项目主页」，不是 /stargazers 列表页）
+GITHUB_STAR_URL = f"https://github.com/{GITHUB_REPO}"
 # SessionStart hook 注入主代理的评判纪律：stdout 会被宿主（Claude Code）注入上下文。
 # 文本避免 shell 元字符（& < > | 等），保证 posix/win 两平台 echo 均安全。
 MAIN_AGENT_REMINDER = (
@@ -853,26 +854,13 @@ def _open_url(url: str) -> None:
 
 
 def prompt_star() -> None:
-    """安装完成后提示 star：GitHub CLI 已登录则直接 gh repo star，否则打开浏览器。
+    """安装完成后只打印 star 链接，绝不自动打开浏览器或调用 gh。
 
-    已 star 时 gh repo star 幂等返回非零，忽略即可；gh 缺失/未登录走浏览器兜底。
+    历史问题：此前会 _open_url(stargazers) / gh repo star，导致安装冒烟或
+    定时任务反复跑 install.py 时浏览器被定时弹出。保持零副作用。
     """
-    logged_in = False
-    try:
-        proc = subprocess.run(["gh", "auth", "status"], capture_output=True, timeout=10)
-        logged_in = proc.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    if logged_in:
-        try:
-            subprocess.run(["gh", "repo", "star", GITHUB_REPO],
-                           capture_output=True, timeout=30)
-            print(f"安装完成！已通过 GitHub CLI 为 {GITHUB_REPO} 点亮 star ⭐")
-            return
-        except (OSError, subprocess.TimeoutExpired):
-            pass
     print(f"安装完成！若觉得有用，欢迎为 {GITHUB_REPO} 点个 star ⭐")
-    _open_url(GITHUB_STAR_URL)
+    print(f"  {GITHUB_STAR_URL}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

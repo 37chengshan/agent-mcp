@@ -111,10 +111,14 @@ def test_start_daemon_returns_false_after_health_attempts(monkeypatch, tmp_path)
 def test_main_prints_structured_status(monkeypatch, tmp_path, capsys, started, status):
     monkeypatch.setattr(start_agent_mcp, "start_daemon", lambda *_a: started)
     monkeypatch.setattr(start_agent_mcp, "is_healthy", lambda _url, _token="": True)
+    monkeypatch.setattr(start_agent_mcp, "read_token", lambda _sd: "tok-secret")
     assert main(["--state-dir", str(tmp_path), "--port", "9876"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == status
-    assert result["url"].startswith("http://127.0.0.1:9876/#token=")
+    # stdout 永不含 token（防终端/CI 日志落盘）
+    assert result["url"] == "http://127.0.0.1:9876/"
+    assert "token" not in result["url"]
+    assert "tok-secret" not in json.dumps(result)
 
 
 def test_main_opens_browser_only_after_health(monkeypatch, tmp_path, capsys):
@@ -128,9 +132,12 @@ def test_main_opens_browser_only_after_health(monkeypatch, tmp_path, capsys):
     )
     assert main(["--state-dir", str(tmp_path), "--port", "9876", "--open"]) == 0
     assert order[:2] == ["start", "health"]
+    # 浏览器仍拿带 token 的 fragment；stdout 不打印 token
     assert order[2][0] == start_agent_mcp.browser_command("unused")[0]
     assert order[2][1].startswith("http://127.0.0.1:9876/#token=")
-    assert json.loads(capsys.readouterr().out)["status"] == "started"
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "started"
+    assert out["url"] == "http://127.0.0.1:9876/"
 
 
 def test_main_error_never_opens_browser(monkeypatch, tmp_path, capsys):

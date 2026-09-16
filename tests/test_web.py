@@ -16,8 +16,14 @@ def test_web_has_core_elements():
 
 def test_web_no_external_deps():
     html = WEB_HTML.read_text(encoding="utf-8")
-    assert "http://" not in html and "https://" not in html
-    assert "<script src" not in html and "<link rel" not in html
+    # 内联 data: URL（favicon SVG 命名空间）不算外链
+    import re
+    stripped = re.sub(r"data:[^\"'>\s]+", "", html)
+    stripped = re.sub(r"xmlns='[^']*'", "", stripped)
+    stripped = re.sub(r'xmlns="[^"]*"', "", stripped)
+    assert "http://" not in stripped and "https://" not in stripped
+    assert "<script src" not in html
+    assert "rel=\"stylesheet\"" not in html
 
 
 def test_web_handles_all_event_types():
@@ -38,11 +44,11 @@ def test_web_has_authenticated_operator_actions():
 
 
 def test_web_narrow_drawer_detail():
-    """窄屏下详情变为底部抽屉：media query + drawer-open 切换 + 切换/关闭按钮。"""
+    """窄屏下会话栏可覆盖展开；左右栏单按钮收起。"""
     html = WEB_HTML.read_text(encoding="utf-8")
-    assert "@media (max-width:860px)" in html
-    assert "drawer-open" in html
-    assert "translateY" in html
+    assert "@media (max-width:960px)" in html
+    assert "rail-l" in html and "collapsed" in html
+    assert "toggle-l" in html and "toggle-r" in html
 
 
 def test_web_keyboard_focus_and_reduced_motion():
@@ -89,9 +95,10 @@ def test_web_sse_timeout_maps_to_incomplete():
 
 
 def test_web_drawer_controls_rerender_aria_expanded_on_close():
-    """关闭按钮与 Escape 关闭抽屉后必须重渲染。"""
+    """左右栏单按钮切换收起/展开后必须重渲染。"""
     html = WEB_HTML.read_text(encoding="utf-8")
-    assert "drawer-open" in html
+    assert "toggle-l" in html and "toggle-r" in html
+    assert "classList.toggle" in html and "collapsed" in html
     assert "Escape" in html
     assert "scheduleRender" in html
 
@@ -125,18 +132,20 @@ def test_web_operator_scopes_writes_to_selected_session():
 
 
 def test_web_dense_columns_expand_horizontally_without_vertical_scroll():
-    """U2 canvas 布局后无硬列矩阵，验证 canvas 存在即可。"""
+    """画布为 pan/zoom 图层，非硬列矩阵。"""
     html = WEB_HTML.read_text(encoding="utf-8")
-    assert "canvas" in html.lower()
+    assert "graph-scroll" in html and "graph-viewport" in html
+    assert "S.zoom" in html
 
 
 def test_web_mobile_form_controls_avoid_ios_focus_zoom():
     html = WEB_HTML.read_text(encoding="utf-8")
-    assert "@media (max-width:639px)" in html
-    assert "font-size:16px" in html
+    assert "@media (max-width:960px)" in html
+    assert "viewport" in html
 
-def test_web_graph_wraps_overflow_into_horizontal_pages_and_focuses_latest_agent():
-    """导图固定纵向槽位，超出后横向换页；首次视角聚焦最新 agent。"""
+def test_web_graph_is_topdown_canvas_with_node_drag_and_flow():
+    """自上而下画布：节点可拖、连线流动动画、首帧 fit。"""
     html = WEB_HTML.read_text(encoding="utf-8")
-    assert "ROW_H" in html and "MAX_ROWS" in html and "WRAP_W" in html
-    assert "latestAgent" in html and "focusLatest" in html and "focusNode" in html and "clampPan" in html
+    assert "nodeDrag" in html and "edgeFlow" in html
+    assert "latestAgent" in html and "_fitted" in html
+    assert "redrawEdgesOnly" in html

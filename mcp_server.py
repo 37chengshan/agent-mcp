@@ -130,6 +130,13 @@ _DAEMON_PATHS = {
     "refine_preview": "/api/refine/preview",
     "refine_commit": "/api/refine/commit",
     "refine_rollback": "/api/refine/rollback",
+    "list_runs": "/api/v4/runs",
+    "goal_create": "/api/v4/goals/create",
+    "goal_list": "/api/v4/goals",
+    "goal_update": "/api/v4/goals/update",
+    "schedule_create": "/api/v4/schedules/create",
+    "schedule_list": "/api/v4/schedules",
+    "schedule_cancel": "/api/v4/schedules/cancel",
 }
 
 TOOLS = [
@@ -561,6 +568,109 @@ TOOLS = [
                 "to_revision": {"type": "integer"},
             },
             "required": ["item_id", "to_revision"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "list_runs",
+        "description": "列出 v4 Run（唯一执行单位）最近记录：状态/触发类型/绑定 agent。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "goal_create",
+        "description": "创建持续目标 Goal（只产 Intent；由 daemon 心泵在 agent 空闲时续播）。"
+                       "预算耗尽或 completed 后不再自动续播。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "objective": {"type": "string", "description": "目标描述（续播 prompt）。"},
+                "agent_id": {"type": "integer", "description": "绑定的 agent（必填才能续播）。"},
+                "session_id": {"type": "string"},
+                "token_budget": {"type": "integer"},
+                "time_budget_seconds": {"type": "integer"},
+            },
+            "required": ["objective"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "goal_list",
+        "description": "列出 Goal（可按 session_id 过滤）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "goal_update",
+        "description": "更新 Goal 状态（active/paused/completed）。completed 后永不自动续播。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "goal_id": {"type": "integer"},
+                "status": {"type": "string", "enum": ["active", "paused", "completed"]},
+            },
+            "required": ["goal_id", "status"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "schedule_create",
+        "description": "创建定时触发 Schedule（kind=one_shot/cron/heartbeat）。"
+                       "interval_expr 支持 '30m'/'1h' 或 5 字段 cron。同一 tick 至多一个 Run。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "agent_id": {"type": "integer", "description": "到点 followup 的目标 agent。"},
+                "session_id": {"type": "string"},
+                "kind": {"type": "string", "enum": ["one_shot", "cron", "heartbeat"],
+                         "default": "one_shot"},
+                "interval_expr": {"type": "string", "description": "'30m' / '1h' / cron 五段"},
+                "next_tick": {"type": "string", "description": "ISO 时间；缺省按 interval 计算"},
+            },
+            "required": ["prompt"],
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": False},
+    },
+    {
+        "name": "schedule_list",
+        "description": "列出 Schedule（可按 session_id 过滤）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "schedule_cancel",
+        "description": "取消 Schedule（paused=1，不再触发）。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schedule_id": {"type": "integer"},
+            },
+            "required": ["schedule_id"],
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": False},

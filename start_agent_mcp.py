@@ -94,12 +94,67 @@ def start_daemon(state_dir: Path, port: int = DEFAULT_PORT) -> bool:
     return False
 
 
+def doctor_report(state_dir: Path, port: int) -> dict:
+    """本地健康体检：daemon / 依赖 / web / 版本 / 状态目录。只读，不改任何文件。"""
+    import importlib.util
+    base_url = f"http://127.0.0.1:{port}"
+    token = read_token(state_dir)
+    healthy = is_healthy(base_url, token)
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    add("python", sys.version_info >= (3, 9), f"{sys.version.split()[0]} (need >=3.9)")
+    add("psutil", importlib.util.find_spec("psutil") is not None, "daemon hard dependency")
+    add("mcp_server", (ROOT / "mcp_server.py").is_file(), str(ROOT / "mcp_server.py"))
+    add("daemon_main", DAEMON.is_file(), str(DAEMON))
+    add("web_index", (ROOT / "web" / "index.html").is_file(), str(ROOT / "web" / "index.html"))
+    add("web_loader", (ROOT / "web" / "panels" / "loader.js").is_file(),
+        str(ROOT / "web" / "panels" / "loader.js"))
+    add("state_dir", state_dir.is_dir(), str(state_dir))
+    add("daemon_json", (state_dir / "daemon.json").is_file(),
+        str(state_dir / "daemon.json"))
+    add("token", bool(token), "present" if token else "missing")
+    add("health", healthy, base_url if healthy else f"not healthy at {base_url}")
+
+    version = "unknown"
+    try:
+        text = (ROOT / "agent_mcp" / "__init__.py").read_text(encoding="utf-8")
+        import re as _re
+        m = _re.search(r'^__version__\s*=\s*"([^"]+)"', text, _re.M)
+        if m:
+            version = m.group(1)
+    except OSError:
+        pass
+    add("version", version != "unknown", version)
+
+    ok = all(c["ok"] for c in checks)
+    return {
+        "ok": ok,
+        "version": version,
+        "port": port,
+        "base_url": base_url,
+        "state_dir": str(state_dir),
+        "daemon_healthy": healthy,
+        "checks": checks,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=int(os.environ.get("AGENT_MCP_PORT", DEFAULT_PORT)))
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     parser.add_argument("--open", action="store_true", help="Open the local monitoring page after startup.")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Run local health checks and print JSON (does not start daemon).")
     args = parser.parse_args(argv)
+
+    if args.doctor:
+        report = doctor_report(args.state_dir, args.port)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report["ok"] else 1
+
     base_url = f"http://127.0.0.1:{args.port}"
     started = start_daemon(args.state_dir, args.port)
     token = read_token(args.state_dir)
@@ -114,14 +169,14 @@ def main(argv: list[str] | None = None) -> int:
     if open_browser:
         subprocess.Popen(browser_command(url), stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
-    # When the browser is opened for the user, the write token has already
-    # been delivered through the local URL fragment.  Do not duplicate it in
-    # stdout, where terminal capture or automation logs may persist it.
-    reported_url = f"{base_url}/" if open_browser else url
+    # 不把含 #token= 的完整 URL 打进 stdout（终端捕获/CI 日志会落盘明文）。
+    # 浏览器打开时 token 已走 URL fragment；already_running 只给无 token 的 base。
+    reported_url = f"{base_url}/"
     print(json.dumps({
         "status": "started" if started else "already_running",
         "url": reported_url,
         "write_auth": "opened_in_browser" if open_browser else "url_fragment",
+        "hint": "完整带 token 链接见 state-dir/daemon.json 或 start --open",
     }))
     return 0
 

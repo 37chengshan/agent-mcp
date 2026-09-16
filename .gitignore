@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 design-preview-top.png
+design-preview.html
+console-home.png
 .DS_Store
 .atomcode/
 # v3.0：本地工具状态与构建产物不入库
@@ -11,3 +13,11 @@ build/
 dist/
 .smoke-venv/
 .pytest_cache/
+.ruff_cache/
+# v4：本机会话/审查/浏览器产物
+.codebase-memory/
+.playwright-cli/
+.playwright-mcp/
+output/
+.claude/plans/
+

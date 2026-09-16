@@ -47,12 +47,10 @@ def test_launcher_open_skips_browser_when_already_running(monkeypatch, tmp_path,
     ]) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {
-        "status": "already_running",
-        "url": "http://127.0.0.1:9876/#token=sensitive-write-token",
-        "write_auth": "url_fragment",
-    }
-    assert token in json.dumps(payload)  # token in URL fragment, not in browser
+    assert payload["status"] == "already_running"
+    assert payload["url"] == "http://127.0.0.1:9876/"
+    assert payload["write_auth"] == "url_fragment"
+    assert token not in json.dumps(payload)  # stdout 永不含 token
     assert len(opened) == 0  # browser was NOT opened
 
 
@@ -78,11 +76,10 @@ def test_launcher_open_opens_browser_when_started(monkeypatch, tmp_path, capsys)
     ]) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {
-        "status": "started",
-        "url": "http://127.0.0.1:9876/",
-        "write_auth": "opened_in_browser",
-    }
+    assert payload["status"] == "started"
+    assert payload["url"] == "http://127.0.0.1:9876/"
+    assert payload["write_auth"] == "opened_in_browser"
+    assert "hint" in payload
     assert token not in json.dumps(payload)
     assert len(opened) == 1
     assert token in opened[0][-1]

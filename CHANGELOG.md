@@ -6,6 +6,26 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [4.0.0a1] - 2026-09-16
+
+v4.0 第一个里程碑（路线图见
+[docs/plans/2026-08-28-v4-roadmap.md](docs/plans/2026-08-28-v4-roadmap.md)）。
+主题：Agent Control Plane——Run 唯一执行单位 + 可信协议层 + 控制台重做。
+
+### Added
+- **P0 核心对象模型**：`store_v4`（runs/journal/goals/schedules/harness*/refinement/tasks/meta）+ `models.Run` 状态机 + Invariants 测试骨架。
+- **P1 Control Plane Reliability**：`/api/v4/command` 幂等 journal、`/api/v4/ack` 水位压缩、`{generation,seq}` 事件游标、`/api/protocol` 能力协商。
+- **P2 Execution Manager**：`execution.py` + `triggers.py`；Goal/Schedule 心泵（tick claim 防重放）；Autonomous 预算 min()；usage 子树归因。
+- **P3 Harness + Refine**：revision-based 知识层（rollback/OCC/base prompt 守卫）+ 三段式 refine 管道（preview/commit/rollback）。
+- **P4/P5 Prime Agent 适配器**：`prime-agent-rpc` / `prime-agent-acp`（能力三态诚实声明，真实冒烟 ⏳）。
+- **用户可见 Goal/Schedule/Run 工具**（本轮 +7）：`list_runs` / `goal_create|list|update` / `schedule_create|list|cancel`；spawn/followup 落 Run；agent 终态映射 Run 状态（含 WAITING 桥接）。工具总数 19→**34**（另含 harness×5 + refine×3）。
+- **控制台 v4**：左栏会话文件夹分类、顶栏 Agent 切换、自上而下节点图 + 流动边 + 节点/画布拖拽缩放、编排控制面板；删除回放。
+- **安装链**：`start_agent_mcp.py --doctor` JSON 健康体检；install.sh 可选 SHA-256；star 链接改为仓库首页且**不再自动打开浏览器**。
+
+### Changed
+- 版本单一来源升至 `4.0.0a1`；新增 `LICENSE`（MIT）。
+- 安装完成只打印 star 链接，禁止 `gh repo star` / `open` 副作用（防定时任务弹页）。
+
 ## [3.0.0a1] - 2026-08-24
 
 v3.0 第一个里程碑（路线图见

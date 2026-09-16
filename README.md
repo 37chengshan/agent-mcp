@@ -1,12 +1,12 @@
 # Agent MCP
 
-> 当前版本 **v3.0.0a1**（v3.0 里程碑 1；单一来源：`agent_mcp/__init__.py`，变更记录见 [CHANGELOG.md](CHANGELOG.md)，大版本路线图见 [docs/plans/2026-08-24-v3-roadmap.md](docs/plans/2026-08-24-v3-roadmap.md)）。
+> 当前版本 **v4.0.0a1**（单一来源：`agent_mcp/__init__.py`；变更记录见 [CHANGELOG.md](CHANGELOG.md)；v4 路线图见 [docs/plans/2026-08-28-v4-roadmap.md](docs/plans/2026-08-28-v4-roadmap.md)）。
 
-> **✅ 现已支持 DeepSeek Harness（DSH）与企业级多 Agent 协作** —— 动态编排、自动演进、P2P 协作信箱、隔离沙箱、混合召回记忆系统、MCP 资源与提示词全协议对齐。
+> **✅ v4：Agent Control Plane** —— Run 唯一执行单位、Goal/Schedule 触发、Harness/Refine 可审计知识层、控制台重做。Prime Agent 适配器已接入（能力契约；真实冒烟 ⏳）。
 
 ## 🟦 原生支持 DeepSeek Harness（DSH）
 
-**在 DeepSeek Harness 的 AI 会话中直接用上 agent-mcp 的全部 19 个 MCP 工具**（`mcp__agentmcp__spawn_agent` / `wait_agent` / `estimate_complexity` / `steer_agent` / `followup_task` / `memory_store` / `memory_recall` …）：DSH 以 stdio transport 直连 `mcp_server.py`，**一行 `insert` patch 即接入**——零插件开发、零代码改造；daemon 未起时自动原子拉起，子进程崩溃自动指数退避重连，重启后会话可续接。协议层对齐 **MCP 2026-07-28 最新规范**（无状态核心、`server/discover`、tasks 扩展、structuredContent），同时兼容 2025-11-25（DSH SDK 1.29.0 实际协商版本）与 2025-03-26 legacy 客户端。
+**在 DeepSeek Harness 的 AI 会话中直接用上 agent-mcp 的全部 34 个 MCP 工具**（`mcp__agentmcp__spawn_agent` / `wait_agent` / `estimate_complexity` / `steer_agent` / `followup_task` / `goal_create` / `schedule_create` / `harness_list` / `memory_store` …）：DSH 以 stdio transport 直连 `mcp_server.py`，**一行 `insert` patch 即接入**——零插件开发、零代码改造；daemon 未起时自动原子拉起，子进程崩溃自动指数退避重连，重启后会话可续接。协议层对齐 **MCP 2026-07-28 最新规范**（无状态核心、`server/discover`、tasks 扩展、structuredContent），同时兼容 2025-11-25（DSH SDK 1.29.0 实际协商版本）与 2025-03-26 legacy 客户端。
 
 ```yaml
 # ~/.dsh/profiles/<name>/cordis.patch.yml（或 $DSH_HOME/cordis.patch.yml）—— 加入即启用
@@ -73,7 +73,7 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 
 | 能力 | 说明 |
 |---|---|
-| 🟦 **DeepSeek Harness 原生接入** | DSH stdio 直连 `mcp_server.py`：19 个工具以 `mcp__agentmcp__*` 全量注册（一行 `insert` patch）；协议层对齐 MCP 2026-07-28 最新规范并兼容 2025-11-25 / 2025-03-26，daemon 自动拉起 + 断线自动重连 + 会话可续接，详见 [docs/dsh-integration.md](docs/dsh-integration.md) |
+| 🟦 **DeepSeek Harness 原生接入** | DSH stdio 直连 `mcp_server.py`：34 个工具以 `mcp__agentmcp__*` 全量注册（一行 `insert` patch）；协议层对齐 MCP 2026-07-28 最新规范并兼容 2025-11-25 / 2025-03-26，daemon 自动拉起 + 断线自动重连 + 会话可续接，详见 [docs/dsh-integration.md](docs/dsh-integration.md) |
 | 🧩 **任意 Agent CLI 统一派发** | `spawn_agent` 一个入口派发任意 CLI 子 Agent（内置 claude / grok / opencode / omp / atomcode / codex / kimi / copilot / pi / zcode / cline 适配器；其余 CLI 通过 `custom-clis/*.json` 配置接入，零改码）；适配器层各自归一化事件流、usage 与 session，上层无感 |
 | 🚦 **复杂度分级门** | `estimate_complexity` 本地直算（零 token、不 spawn），按 S/M/L 判级决定是否进入编排——**默认直接做，按需才拆**，杜绝过拆 |
 | ⏱️ **任务级超时** | `timeout_seconds`（1–1800s）到时终止整个进程树并标记 `incomplete/timeout`，可 resume 续跑；不等死、不悬空 |
@@ -115,7 +115,7 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
                ▼                                        │
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
 │   mcp_server.py (无状态)      │        │   daemon_main.py (常驻 daemon) │
-│   · 12 个工具（编排+记忆）     │  HTTP  │   · 槽位 / 排队 / 心跳 / 看护   │
+│   · 34 个 MCP 工具             │  HTTP  │   · 槽位 / 排队 / 心跳 / 看护   │
 │   · host 识别 + 会话隔离      │ ─────► │   · 验证回投 / 降档 / 缓存      │
 │   · 无 daemon 时原子拉起      │  X-Auth │   · SQLite 状态机持久化         │
 └──────────────────────────────┘   Token └──────────────┬───────────────┘
@@ -160,6 +160,11 @@ python3 start_agent_mcp.py --open              # 幂等启动 daemon，--open �
 | `get_agent_activity` | 事件流水（spawned/running/message/usage/terminated…） |
 | `get_token_usage` | 累计 token / 成本对账 |
 | `policy_list` / `policy_add` / `policy_state` | 策略引擎管理（daemon 级）：查看 / 收紧配置（budget/approval/tool_limit）/ 快照审计 |
+| `list_runs` | 列出 v4 Run（唯一执行单位）最近记录 |
+| `goal_create` / `goal_list` / `goal_update` | 持续目标 Goal：创建 / 列表 / active·paused·completed |
+| `schedule_create` / `schedule_list` / `schedule_cancel` | 定时触发 Schedule（one_shot/cron/heartbeat；同 tick 至多一个 Run） |
+| `harness_list` / `harness_add` / `harness_update` / `harness_delete` / `harness_rollback` | Harness 可审计知识层（revision / OCC / base prompt 守卫） |
+| `refine_preview` / `refine_commit` / `refine_rollback` | 三段式 refine（reviewer 只产 proposal，不直写） |
 | `memory_store` | 跨会话项目记忆写入（content 必填 + kind/key/tags 可选） |
 | `memory_recall` | 跨会话项目记忆召回（query/kind/limit 默认 5，会话隔离） |
 | `mailbox_send` / `mailbox_fetch` | 团队（team）作用域 P2P 信箱：点对点私信与组内广播；payload 以 JSON 信封随消息携带 |

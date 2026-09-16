@@ -21,7 +21,8 @@ set -u
 
 GITHUB_REPO="37chengshan/agent-mcp"
 GITHUB_RAW="https://raw.githubusercontent.com/${GITHUB_REPO}/main"
-GITHUB_STAR_URL="https://github.com/${GITHUB_REPO}/stargazers"
+# 点星/收藏用仓库首页（不是 /stargazers）
+GITHUB_STAR_URL="https://github.com/${GITHUB_REPO}"
 INSTALL_DIR="${AGENT_MCP_DIR:-$HOME/.agent-mcp}"
 # 可写入的 host 全集（install.py 同口径）
 AVAILABLE_HOSTS="codex claude omp opencode kimi zcode grok cursor gemini pi copilot cline qwen devin windsurf amazon-q atomcode kiro goose hermes crush"
@@ -31,6 +32,39 @@ die() { say "错误: $*" >&2; exit 1; }
 
 command -v python3 >/dev/null 2>&1 || die "需要 python3（>=3.9），请先安装 Python。"
 
+# --- 校验：可选 SHA-256（上游有 checksum 文件则强制；缺失则警告不阻断） ---
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    printf ''
+  fi
+}
+
+verify_tarball_sha256() {
+  # $1=tarball  $2=optional checksum file path
+  local sum tool_sum
+  tool_sum="$(sha256_of "$1")"
+  [ -n "$tool_sum" ] || { say "警告: 本机无 sha256sum/shasum，跳过归档校验。"; return 0; }
+  if [ ! -f "$2" ]; then
+    say "警告: 未找到校验文件（$2），跳过 SHA-256 校验。"
+    say "  可手动核对: sha256sum $1"
+    return 0
+  fi
+  # checksum 文件格式：`<hex>  <filename>` 或纯 hex
+  sum="$(awk 'NF{print $1; exit}' "$2")"
+  if [ -z "$sum" ]; then
+    say "警告: 校验文件为空，跳过 SHA-256 校验。"
+    return 0
+  fi
+  if [ "$sum" != "$tool_sum" ]; then
+    die "SHA-256 校验失败: 期望 $sum，实际 $tool_sum"
+  fi
+  say "SHA-256 校验通过: $tool_sum"
+}
+
 # --- 1. 获取项目文件 ---
 # 下载函数：codeload tarball（git 不可用或 clone 失败时的回退通道）
 fetch_tarball() {
@@ -38,6 +72,15 @@ fetch_tarball() {
   tmp="$(mktemp -d)"
   curl -fsSL "https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/heads/main" \
     -o "$tmp/repo.tar.gz" || die "下载失败。"
+  # 可选校验：AGENT_MCP_CHECKSUM 提供本地文件路径，或尝试拉远端 .sha256
+  CHECKSUM_SRC="${AGENT_MCP_CHECKSUM:-}"
+  if [ -z "$CHECKSUM_SRC" ]; then
+    if curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/main/release/agent-mcp-main.tar.gz.sha256" \
+         -o "$tmp/repo.tar.gz.sha256" 2>/dev/null; then
+      CHECKSUM_SRC="$tmp/repo.tar.gz.sha256"
+    fi
+  fi
+  verify_tarball_sha256 "$tmp/repo.tar.gz" "$CHECKSUM_SRC"
   tar -xzf "$tmp/repo.tar.gz" -C "$tmp" || die "解压失败。"
   # POSIX sh：解压顶层应为唯一目录（<repo>-<ref>），取第一个
   found=""
@@ -59,6 +102,9 @@ if [ -f "$INSTALL_DIR/install.py" ]; then
   fi
 else
   say "下载 agent-mcp 到 ${INSTALL_DIR} …"
+  # 仅当目录原先不存在时才允许后续失败清理；已有目录绝不清空（防误删用户数据）
+  DIR_PREEXISTED=0
+  [ -e "$INSTALL_DIR" ] && DIR_PREEXISTED=1
   mkdir -p "$INSTALL_DIR"
   if command -v git >/dev/null 2>&1; then
     if git clone --depth 1 "https://github.com/${GITHUB_REPO}.git" "$INSTALL_DIR" >/dev/null 2>&1; then
@@ -66,12 +112,18 @@ else
     else
       # git clone 失败（网络/代理/证书常见）→ 自动回退归档下载，不中断安装
       say "git clone 失败，自动改用归档下载…"
-      # M9：只清理我们刚创建的安装目录（防止 AGENT_MCP_DIR 指向用户任意目录被误删）
-      case "$INSTALL_DIR" in
-        "$HOME"/*|/tmp/*|/var/tmp/*) rm -rf "$INSTALL_DIR" ;;
-        *) die "拒绝清理非预期安装目录: ${INSTALL_DIR}（请手动处理后重试）" ;;
-      esac
-      mkdir -p "$INSTALL_DIR"
+      if [ "$DIR_PREEXISTED" -eq 0 ]; then
+        # 只清理本脚本刚创建的空目录；已存在目录直接拒绝覆盖
+        case "$INSTALL_DIR" in
+          "$HOME"/*|/tmp/*|/var/tmp/*) rm -rf "$INSTALL_DIR" ;;
+          *) die "拒绝清理非预期安装目录: ${INSTALL_DIR}（请手动处理后重试）" ;;
+        esac
+        mkdir -p "$INSTALL_DIR"
+      else
+        if [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+          die "目标目录已存在且非空，拒绝覆盖: ${INSTALL_DIR}（请清空或换 AGENT_MCP_DIR）"
+        fi
+      fi
       fetch_tarball
     fi
   else
@@ -155,35 +207,12 @@ else
   say "之后可随时执行：cd $INSTALL_DIR && python3 install.py --install --host <host>"
 fi
 
-# --- 4. star 提示（需用户同意才执行；非交互管道默认跳过） ---
+# --- 4. star 提示（只打印链接；绝不自动 open/xdg-open/gh） ---
 if [ -z "${AGENT_MCP_NO_STAR:-}" ]; then
   say ""
-  say "安装完成！如果觉得有用，欢迎给 ${GITHUB_REPO} 点个 star ⭐（${GITHUB_STAR_URL}）"
-  do_star() {
-    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-      gh repo star "$GITHUB_REPO" >/dev/null 2>&1 \
-        && say "已通过 GitHub CLI 点亮 star ⭐" \
-        || say "GitHub CLI 已登录但 star 失败（可能已 star），可手动访问：${GITHUB_STAR_URL}"
-    else
-      case "$(uname -s)" in
-        Darwin) open "$GITHUB_STAR_URL" >/dev/null 2>&1 || true ;;
-        Linux)  xdg-open "$GITHUB_STAR_URL" >/dev/null 2>&1 || true ;;
-        *)      say "请手动打开：${GITHUB_STAR_URL}" ;;
-      esac
-    fi
-  }
-  if [ -t 0 ]; then
-    # 交互终端：明确询问，用户同意才执行
-    printf '是否现在给项目点 star？[y/N] '
-    read -r star_choice || star_choice="n"
-    case "$star_choice" in
-      y | Y | yes | YES ) do_star ;;
-      * ) say "已跳过 star（可随时手动访问：${GITHUB_STAR_URL}）" ;;
-    esac
-  else
-    # 非交互管道：不自动执行，仅提示
-    say "非交互安装，已跳过 star（如需点亮请手动访问：${GITHUB_STAR_URL}）"
-  fi
+  say "安装完成！如果觉得有用，欢迎给 ${GITHUB_REPO} 点个 star ⭐"
+  say "  ${GITHUB_STAR_URL}"
+  say "（已取消自动打开浏览器 / gh star，避免定时任务反复弹页）"
 fi
 
 say ""

@@ -9,7 +9,7 @@
 
 Agent MCP 是一个 **MCP 服务器 + 编排 Skill**：
 
-- `mcp_server.py`：MCP stdio 服务器，暴露 12 个工具——9 个编排工具（`spawn_agent` / `send_message` / `steer_agent` / `followup_task` / `wait_agent` / `interrupt_agent` / `list_agents` / `get_agent_activity` / `get_token_usage` + `estimate_complexity`）+ 记忆银行（`memory_store` / `memory_recall` 跨会话项目记忆）
+- `mcp_server.py`：MCP stdio 服务器，暴露 34 个工具——编排（`spawn_agent` / `send_message` / `steer_agent` / `followup_task` / `wait_agent` / `interrupt_agent` / `list_agents` / `get_agent_activity` / `get_token_usage` / `estimate_complexity` / `orchestrate_task`）、策略、Harness/Refine、Goal/Schedule/Run、记忆银行（`memory_store` / `memory_recall`）、信箱与共识投票
 - `skill/`：编排工作流 Skill（SKILL.md + 10 个内置 Agent 预设 + 任务简报模板）
 - 安装后，你的 agent 可以把任意 CLI（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展）当子 Agent 工作池派发任务
 
@@ -218,7 +218,7 @@ cp -R skill /绝对路径/你的-skill-目录/agent-mcp
 
 1. **验证**：重启 agent 会话，确认 `spawn_agent` 等工具已出现；跑一次 `estimate_complexity`（本地直算、零 token）确认 daemon 拉起正常。
 2. **点个 star**：如果觉得有用，欢迎为项目点 star ⭐
-   → https://github.com/37chengshan/agent-mcp/stargazers
+   → https://github.com/37chengshan/agent-mcp
 3. **查看状态**：`python3 start_agent_mcp.py --open` 打开本地监控页（http://127.0.0.1:8765/）。
 
 ---

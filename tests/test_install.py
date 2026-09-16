@@ -359,43 +359,24 @@ def test_json_host_installs_config_and_skill_without_hook(
     assert any("SessionStart" in line and "不支持" in line for line in logs)
 
 
-def test_prompt_star_stars_via_gh_when_logged_in(monkeypatch, capsys):
+def test_prompt_star_never_opens_browser_or_calls_gh(monkeypatch, capsys):
+    """回归：安装完成只打印链接，禁止 gh star / 浏览器弹页（曾被定时任务反复触发）。"""
     calls = []
+
     def fake_run(cmd, *args, **kwargs):
         calls.append(cmd)
-        class Proc:
-            returncode = 0
-        return Proc()
-    monkeypatch.setattr(install.subprocess, "run", fake_run)
-    prompt_star()
-    out = capsys.readouterr().out
-    assert calls[0] == ["gh", "auth", "status"]
-    assert calls[1] == ["gh", "repo", "star", GITHUB_REPO]
-    assert "点亮 star" in out
+        raise AssertionError("prompt_star 不应调用任何子进程")
 
-
-def test_prompt_star_falls_back_to_browser_when_no_gh(monkeypatch, capsys):
-    def fake_run(cmd, *args, **kwargs):
-        raise FileNotFoundError("gh not found")
     monkeypatch.setattr(install.subprocess, "run", fake_run)
+    monkeypatch.setattr(install.subprocess, "Popen", fake_run)
     opened = []
     monkeypatch.setattr(install, "_open_url", lambda url: opened.append(url))
     prompt_star()
     out = capsys.readouterr().out
-    assert opened == [install.GITHUB_STAR_URL]
+    assert calls == []
+    assert opened == []
     assert "点个 star" in out
-
-
-def test_prompt_star_falls_back_when_gh_not_logged_in(monkeypatch, capsys):
-    def fake_run(cmd, *args, **kwargs):
-        class Proc:
-            returncode = 1 if cmd == ["gh", "auth", "status"] else 0
-        return Proc()
-    monkeypatch.setattr(install.subprocess, "run", fake_run)
-    opened = []
-    monkeypatch.setattr(install, "_open_url", lambda url: opened.append(url))
-    prompt_star()
-    assert opened == [install.GITHUB_STAR_URL]
+    assert install.GITHUB_STAR_URL in out
 
 
 def test_install_unknown_host_raises(tmp_path):

@@ -193,8 +193,8 @@ def test_policies_and_workspaces_get_require_token(server):
 def test_index_injects_panel_loader(server):
     code, html = get(server, "/")
     assert code == 200
-    assert '<script type="module" src="/panels/loader.js?v=v4"></script>' in html
-    assert "Conversation graph" in html  # 原页面内容保留
+    assert "/panels/loader.js" in html
+    assert "Agent Control Plane" in html or "Agent MCP" in html
     assert "window.__amToken" in html  # token 注入（面板鉴权不再依赖 URL hash）
 
 

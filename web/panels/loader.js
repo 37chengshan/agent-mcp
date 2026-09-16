@@ -12,10 +12,11 @@
 const SSE_URL = "/api/events";
 const CSS_URL = "/css/panels.css";
 const CSS_ID = "am-panels-css";
-const PANEL_V = "v5";
+const PANEL_V = "v6";
 
 const NAV = [
   { key: "dashboard",     label: "总览",       icon: "◧", module: `./dashboard.js?v=${PANEL_V}` },
+  { key: "control",       label: "编排控制",   icon: "◎", module: `./control.js?v=${PANEL_V}` },
   { key: "tokens",        label: "Token 用量", icon: "∑", module: `./tokens.js?v=${PANEL_V}` },
   { key: "collaboration", label: "协作泳道",   icon: "≋", module: `./collaboration.js?v=${PANEL_V}` },
   { key: "policies",      label: "策略可视化", icon: "◈", module: `./policies.js?v=${PANEL_V}` },
@@ -173,7 +174,7 @@ function buildDom(){
     </div>
     <footer class="am-sb">
       <span class="am-sb-item"><span class="am-dot" title="SSE"></span><span class="am-sb-last">就绪</span></span>
-      <span class="am-sb-item am-sb-right mono">v0.3 · agent-mcp daemon</span>
+      <span class="am-sb-item am-sb-right mono" id="am-sb-ver">agent-mcp daemon</span>
     </footer>`;
   document.body.appendChild(stage);
   headerEl = stage.querySelector(".am-hdr");
@@ -271,8 +272,17 @@ export function init(){
   getSse();
   bindThemeToggle();
   window.__amOpenDashboard = (key) => { openPane(key || currentKey || NAV[0].key); };
-  const btn = document.getElementById("dashboard-btn");
-  if(btn) btn.addEventListener("click", () => { openPane(currentKey || NAV[0].key); });
+  // 版本：从 /api/protocol 拉取（页脚不再写死 v0.3）
+  try{
+    const t = amToken();
+    fetch("/api/protocol", { headers: t ? { "X-Auth-Token": t } : {} })
+      .then(r => r.json())
+      .then(d => {
+        const el = document.getElementById("am-sb-ver");
+        if(el && d && d.version) el.textContent = `protocol v${d.version} · agent-mcp daemon`;
+      })
+      .catch(() => {});
+  }catch(e){ /* ignore */ }
 }
 
 if(document.readyState === "loading"){

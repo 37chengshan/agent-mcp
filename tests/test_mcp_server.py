@@ -66,7 +66,7 @@ def test_initialize_unsupported_top_level_version_falls_back_to_legacy():
 
 
 def test_tools_list_returns_full_set_without_declared_use():
-    """默认全量 19 工具（v0 mailbox/consensus 三工具并入）：legacy 客户端与
+    """默认全量 34 工具（v4 Goal/Schedule/Run 七工具并入）：legacy 客户端与
     未声明 used 的客户端均完整可见。"""
     out = []
     mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -74,12 +74,14 @@ def test_tools_list_returns_full_set_without_declared_use():
     out.clear()
     mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, emit=out.append)
     names = [t["name"] for t in out[0]["result"]["tools"]]
-    assert len(names) == 27
+    assert len(names) == 34
     for expect in ("spawn_agent", "wait_agent", "estimate_complexity", "send_message",
                    "steer_agent", "followup_task", "interrupt_agent", "list_agents",
                    "get_agent_activity", "get_token_usage", "memory_store", "memory_recall",
                    "orchestrate_task", "policy_list", "policy_add", "policy_state",
-                   "mailbox_send", "mailbox_fetch", "consensus_vote"):
+                   "mailbox_send", "mailbox_fetch", "consensus_vote",
+                   "list_runs", "goal_create", "goal_list", "goal_update",
+                   "schedule_create", "schedule_list", "schedule_cancel"):
         assert expect in names
 
 
@@ -105,6 +107,8 @@ def test_tools_list_has_nineteen_tools_in_order():
                      "get_agent_activity", "get_token_usage", "estimate_complexity",
                      "harness_list", "harness_add", "harness_update", "harness_delete",
                      "harness_rollback", "refine_preview", "refine_commit", "refine_rollback",
+                     "list_runs", "goal_create", "goal_list", "goal_update",
+                     "schedule_create", "schedule_list", "schedule_cancel",
                      "memory_store", "memory_recall",
                      "mailbox_send", "mailbox_fetch", "consensus_vote"]
 

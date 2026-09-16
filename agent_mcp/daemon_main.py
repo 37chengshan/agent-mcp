@@ -622,6 +622,11 @@ class Dispatcher:
             cli=target_cli, model=body.get("model"), cwd=cwd,
             permission_mode=body.get("permission_mode") or "plan",
             command_summary=None)
+        # v4：先记 Run 为 ADMITTED；拿到槽位后再升 RUNNING（queued 停在 ADMITTED）
+        run_id = self._record_run_for_agent(
+            agent_id, run_kind="manual", trigger_type="manual",
+            origin_command_id=body.get("command_id"),
+            parent_run_id=body.get("parent_run_id"), queued=True)
         # F1: 给此 agent_id 建一个 threading.Event，终态时 set 唤醒 wait
         with self._lock:
             self._events[agent_id] = threading.Event()
@@ -640,6 +645,7 @@ class Dispatcher:
                   file=sys.stderr)
         is_write = (body.get("permission_mode") or "plan") in ("acceptEdits", "fullAccess")
         if self._scheduler.acquire(str(agent_id), is_write=is_write):
+            self._promote_run_running(run_id)
             self._take_pending(agent_id)
             res = self._run_worker(agent_id, *params)
         else:
@@ -647,6 +653,8 @@ class Dispatcher:
         res["prompt_chars"] = len(prompt)
         res["estimated_tokens"] = _estimate_tokens(prompt)
         res["min_expected_seconds"] = _CLI_FIRST_START_SECONDS.get(target_cli, 10)
+        if run_id:
+            res["run_id"] = run_id
         # 完成态结果存缓存（terminated 才存，error/incomplete 不存）
         if cache_ttl > 0 and res.get("status") == "terminated":
             try:
@@ -733,18 +741,27 @@ class Dispatcher:
                   file=sys.stderr)
         # 终态 agent 续跑：先释放旧槽位（watcher 退出时可能未清），否则 acquire 返 False 误 queued
         self._scheduler.remove(str(agent_id))
+        # v4：followup 每个新 turn 落一条 Run（先 ADMITTED，占槽后 RUNNING）
+        followup_run_id = self._record_run_for_agent(
+            agent_id, run_kind="followup", trigger_type="manual",
+            parent_run_id=body.get("parent_run_id"), queued=True)
         if self._scheduler.acquire(str(agent_id)):
+            self._promote_run_running(followup_run_id)
+            self._resume_waiting_runs(agent_id)
             self._take_pending(agent_id)
             res = self._run_worker(agent_id, *params)
             res["merged_messages"] = len(pending_msgs)
             res["resumed_session_id"] = resume
+            if followup_run_id:
+                res["run_id"] = followup_run_id
             if expected_end is not None:
                 res["expected_end_seconds"] = expected_end
             return res
         return self._agent_result(agent_id, status="queued", pid=None,
                                   merged_messages=len(pending_msgs),
                                   resumed_session_id=resume,
-                                  expected_end_seconds=expected_end)
+                                  expected_end_seconds=expected_end,
+                                  **({"run_id": followup_run_id} if followup_run_id else {}))
 
     def steer(self, body: dict) -> dict:
         """中断当前 run 并在同一节点立即开始下一 turn；支持的 CLI 自动 resume。"""
@@ -1213,6 +1230,192 @@ class Dispatcher:
                                           "item": {"to_revision": int(to_revision)}}])
         return {"item": item}
 
+    # ---- v4 Run / Goal / Schedule（控制面对象，用户可见） ----
+
+    _AGENT_TO_RUN_STATUS = {
+        "terminated": "COMPLETED",
+        "error": "FAILED",
+        "cancelled": "CANCELLED",
+        "interrupted": "CANCELLED",
+        "incomplete": "INCOMPLETE",
+        "needs_advisor": "WAITING",
+    }
+
+    def _record_run_for_agent(self, agent_id: int, *, run_kind: str = "manual",
+                              trigger_type: str = "manual",
+                              origin_command_id: str | None = None,
+                              parent_run_id: str | None = None,
+                              queued: bool = True) -> str | None:
+        """spawn/followup 落 Run（唯一执行单位）。默认停在 ADMITTED。
+
+        queued=True → PENDING→ADMITTED（排队/未占槽）；
+        queued=False → 再升 RUNNING（已占槽开跑）。
+        best-effort：失败记日志不阻断派发。
+        """
+        if self.store_v4 is None:
+            return None
+        try:
+            run = self.store_v4.run_create(
+                run_kind=run_kind, trigger_type=trigger_type,
+                origin_command_id=origin_command_id, parent_run_id=parent_run_id)
+            self.store_v4.run_bind_agent(run["id"], agent_id)
+            self.store_v4.run_transition(run["id"], "ADMITTED")
+            if not queued:
+                self.store_v4.run_transition(run["id"], "RUNNING")
+            return str(run["id"])
+        except Exception as exc:
+            print(f"[dispatcher] record run failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
+            return None
+
+    def _promote_run_running(self, run_id: str | None) -> None:
+        """占到槽位后：ADMITTED→RUNNING（幂等，非法转移忽略）。"""
+        if not run_id or self.store_v4 is None:
+            return
+        try:
+            run = self.store_v4.run_get(run_id)
+            if run and run.get("status") == "ADMITTED":
+                self.store_v4.run_transition(run_id, "RUNNING")
+        except Exception as exc:
+            print(f"[dispatcher] promote run failed {run_id}: {exc}", file=sys.stderr)
+
+    def _resume_waiting_runs(self, agent_id: int) -> None:
+        """needs_advisor 恢复执行：WAITING→RUNNING，避免后续 COMPLETED 被状态机拒绝。"""
+        if self.store_v4 is None:
+            return
+        try:
+            for run in self.store_v4.runs_for_agent(int(agent_id)):
+                if run.get("status") == "WAITING":
+                    try:
+                        self.store_v4.run_transition(run["id"], "RUNNING")
+                    except ValueError:
+                        continue
+        except Exception as exc:
+            print(f"[dispatcher] resume waiting runs failed for {agent_id}: {exc}",
+                  file=sys.stderr)
+
+    def _settle_run_for_agent(self, agent_id: int, agent_status: str,
+                              stop_reason: str | None = None) -> None:
+        """agent 终态/需决策 → 对应 open Run 推进到映射态（幂等：仅动非终态 Run）。
+
+        WAITING 不能直达 COMPLETED（状态机只允许 WAITING→RUNNING/CANCELLED/FAILED），
+        此处先桥接 WAITING→RUNNING 再进终态。
+        """
+        if self.store_v4 is None:
+            return
+        target = self._AGENT_TO_RUN_STATUS.get(agent_status)
+        if target is None:
+            return
+        terminal = {"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "INCOMPLETE"}
+        try:
+            for run in self.store_v4.runs_for_agent(int(agent_id)):
+                status = run.get("status")
+                if status in terminal or status == target:
+                    continue
+                try:
+                    if status == "WAITING" and target in terminal:
+                        self.store_v4.run_transition(run["id"], "RUNNING")
+                    self.store_v4.run_transition(run["id"], target,
+                                                 stop_reason=stop_reason)
+                except ValueError:
+                    continue  # 非法转移（并发/已终态）：跳过该 Run
+        except Exception as exc:
+            print(f"[dispatcher] settle run failed for agent {agent_id}: {exc}",
+                  file=sys.stderr)
+
+    def list_runs(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        try:
+            limit = int(body.get("limit") or 100)
+        except (TypeError, ValueError):
+            limit = 100
+        return {"runs": store.runs_list(limit=max(1, min(limit, 500)))}
+
+    def goal_create(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        objective = (body.get("objective") or "").strip()
+        if not objective:
+            raise ValueError("objective is required")
+        session_id = str(body.get("session_id") or "default")
+        agent_id = body.get("agent_id")
+        goal_id = store.goal_create(
+            session_id=session_id,
+            objective=objective,
+            agent_id=int(agent_id) if agent_id is not None else None,
+            token_budget=int(body["token_budget"]) if body.get("token_budget") is not None else None,
+            time_budget_seconds=int(body["time_budget_seconds"])
+            if body.get("time_budget_seconds") is not None else None,
+        )
+        self._broadcast("goal.created", {"goal_id": goal_id, "session_id": session_id,
+                                         "objective": objective},
+                        int(agent_id) if agent_id is not None else None)
+        return {"goal": store.goal_get(goal_id)}
+
+    def goal_list(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        session_id = body.get("session_id")
+        return {"goals": store.goals_list(
+            session_id=str(session_id) if session_id else None,
+            limit=int(body.get("limit") or 100))}
+
+    def goal_update(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        goal_id = body.get("goal_id")
+        status = body.get("status")
+        if goal_id is None or not status:
+            raise ValueError("goal_id and status are required")
+        goal = store.goal_update_status(int(goal_id), str(status))
+        if goal is None:
+            raise ValueError("goal not found: %s" % goal_id)
+        self._broadcast("goal.updated", {"goal_id": int(goal_id), "status": status},
+                        goal.get("agent_id"))
+        return {"goal": goal}
+
+    def schedule_create(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        prompt = (body.get("prompt") or "").strip()
+        if not prompt:
+            raise ValueError("prompt is required")
+        session_id = str(body.get("session_id") or "default")
+        kind = str(body.get("kind") or "one_shot")
+        interval_expr = body.get("interval_expr")
+        agent_id = body.get("agent_id")
+        from agent_mcp.triggers import now_iso, next_tick_after
+        next_tick = body.get("next_tick")
+        if not next_tick and kind != "one_shot":
+            if not interval_expr:
+                raise ValueError("interval_expr is required for kind=%s" % kind)
+            next_tick = next_tick_after(store, {"interval_expr": interval_expr}, now_iso())
+            if not next_tick:
+                raise ValueError("cannot compute next_tick from interval_expr: %s"
+                                 % interval_expr)
+        if not next_tick and kind == "one_shot":
+            next_tick = now_iso()
+        schedule_id = store.schedule_create(
+            session_id=session_id, prompt=prompt, kind=kind,
+            interval_expr=interval_expr, next_tick=next_tick,
+            agent_id=int(agent_id) if agent_id is not None else None)
+        self._broadcast("schedule.created", {"schedule_id": schedule_id,
+                                             "session_id": session_id, "kind": kind},
+                        int(agent_id) if agent_id is not None else None)
+        return {"schedule": store.schedule_get(schedule_id)}
+
+    def schedule_list(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        session_id = body.get("session_id")
+        return {"schedules": store.schedules_list(
+            session_id=str(session_id) if session_id else None,
+            limit=int(body.get("limit") or 100))}
+
+    def schedule_cancel(self, body: dict) -> dict:
+        store = self._require_store_v4()
+        schedule_id = body.get("schedule_id")
+        if schedule_id is None:
+            raise ValueError("schedule_id is required")
+        store.schedule_cancel(int(schedule_id))
+        self._broadcast("schedule.cancelled", {"schedule_id": int(schedule_id)}, None)
+        return {"schedule": store.schedule_get(int(schedule_id))}
+
     def _sink_final_answer(self, agent_id: int, summary: str, session_id: str) -> None:
         """自动沉淀：完成态 summary 含 FINAL_ANSWER: 时写入 kind=final_answer 记忆
         （source=agent:<id>，去首尾空白，空则不写）。best-effort，失败只记日志。"""
@@ -1375,6 +1578,11 @@ class Dispatcher:
                 transition(current, status)
         self.db.set_status(agent_id, status, stop_reason=stop_reason, pid=pid,
                            cli_session_id=cli_session_id)
+        # v4：agent 状态 → open Run 推进（唯一执行单位的兼容投影）
+        if status == "running":
+            self._resume_waiting_runs(agent_id)
+        if status in _TERMINAL or status == "needs_advisor":
+            self._settle_run_for_agent(agent_id, status, stop_reason)
         # F1: 进入终态（或 needs_advisor）时 set 唤醒阻塞的 wait；followup 重启时重置 Event
         with self._lock:
             ev = self._events.get(agent_id)
