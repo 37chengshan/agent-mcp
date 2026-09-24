@@ -1,12 +1,12 @@
 # Agent MCP
 
 <p align="center">
-  <img src="docs/images/agentmcp-mark.gif" width="96" height="96" alt="agent-mcp mark">
+  <img src="docs/images/agentmcp-mark.png" width="88" alt="agent-mcp">
 </p>
 
 <p align="center">
-  <strong>Skill-first · MCP-backed Agent Control Plane</strong><br>
-  把任意 Agent CLI 统一成可派发 / 可监控 / 可续接 / 可终止的工作池
+  <strong>让 Agent 跑在最适配的底座上 · 打破 Agent 之间的隔离</strong><br>
+  任务特征 → 最适配 CLI × 模型 · 跨 Runtime 编排 / 消息互通 / 统一治理
 </p>
 
 <p align="center">
@@ -16,6 +16,10 @@
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="license">
   <img src="https://img.shields.io/badge/MCP-2026--07--28-5A54A3" alt="mcp">
   <img src="https://img.shields.io/badge/security-hardened-8B4513" alt="security">
+</p>
+
+<p align="center">
+  <img src="docs/images/architecture-match-bridge.gif" width="92%" alt="动态架构：匹配最适配底座并打破隔离">
 </p>
 
 <p align="center">
@@ -32,26 +36,32 @@
 
 ---
 
-## 这是什么
+## 核心思想
+
+```text
+不是：所有 Agent 挤在同一个 CLI 里
+而是：每个 Agent 跑在最适配它的底座上，彼此可通信、可协作、可统一治理
+```
+
+| 主张 | 含义 |
+|---|---|
+| **最适配底座** | 按任务特征选择 CLI × 模型（重构 → Claude Code，长上下文 → Codex，低延迟 → omp…），执行留在原生 Runtime |
+| **打破隔离** | 跨 Agent 消息（mailbox）、共识投票、子任务互派、跨会话续接，不再各干各的 |
+| **统一控制面** | 派发 / 监控 / 续接 / 终止 / 预算 / 审计在同一个 Control Plane，与底座无关 |
 
 三层架构（详见 [architecture.md](docs/architecture.md) · [ADR-0001](docs/decisions/0001-skill-first-mcp-runtime.md)）：
 
 ```text
-Skill   是否委派 · 怎么拆 · 选 CLI×模型 · 怎么验收     ← 编排控制面
+Skill   是否委派 · 怎么拆 · 选最适配 CLI×模型 · 怎么验收     ← 编排控制面
   ↓
-MCP     稳定工具面 · 会话隔离 · daemon 拉起            ← 能力面（薄、无状态）
+MCP     稳定工具面 · 会话隔离 · daemon 拉起                  ← 能力面（薄、无状态）
   ↓
-Daemon  队列 · 进程 · Run/Goal/Schedule · 策略 · SSE   ← 执行面
+Daemon  队列 · 进程 · Run/Goal/Schedule · 策略 · 协作         ← 执行面
   ↓
-Native Runtime   claude / codex / omp / prime / custom  ← 真正执行
+Native Runtime   claude / codex / omp / prime / custom        ← 真正执行（最适配底座）
 ```
 
-**边界**：模型推理与工具执行留在原生 CLI；agent-mcp 只做编排、调度、托管、观测与治理。
-
-```text
-不是：Agent MCP → 同一个 CLI
-而是：任务特征 → Agent MCP → 最合适 CLI × 最合适模型
-```
+**边界**：模型推理与工具执行留在原生 CLI；agent-mcp 只做编排、调度、托管、协作、观测与治理。
 
 ```mermaid
 flowchart LR

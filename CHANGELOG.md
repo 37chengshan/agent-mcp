@@ -37,8 +37,10 @@
 - Web：usage 趋势字段映射、预算环真实值、mailbox 路由、沙箱卡诚实「未接线」、`PANEL_V` 统一。
 
 ### Changed
+- **产品定位文案**：核心思想改为「让 Agent 跑在最适配的底座上 · 打破 Agent 之间的隔离」（不再用「工作池」表述）。
+- README 使用**静态透明 Logo**；动态可视化改为**架构匹配/协作演示图**（`architecture-match-bridge.gif`），非图标动效。
 - 控制台动效：面板/行/状态/图表/Toast，并尊重 `prefers-reduced-motion`。
-- README 重排 + 品牌动图；安全加固摘要；测试徽章 601。
+- README 重排 + 品牌资产 + 安全加固摘要；测试徽章 617。
 
 ## [4.0.0a1] - 2026-09-16
 

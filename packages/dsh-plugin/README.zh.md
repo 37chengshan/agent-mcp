@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>面向 <a href="https://github.com/37chengshan/agent-mcp">agent-mcp</a> 的 DeepSeek Harness（DSH）bundle 插件</strong><br>
-  一条 <code>dsh plugin add</code> → 工具目录出现 <code>mcp__agentmcp__*</code>
+  让 Agent 跑在最适配的底座上 · 打破隔离 · 一条 <code>dsh plugin add</code> 接入 <code>mcp__agentmcp__*</code>
 </p>
 
 [English](./README.md) · 中文

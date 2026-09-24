@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-mcp"
-description = "把任意 Agent CLI 统一为可派发/监控/续接/终止子工作池的 MCP 基础设施（模型×底座匹配的中性控制平面）"
+description = "让 Agent 跑在最适配的底座上、打破 Agent 之间的隔离：跨 Runtime 的编排 / 协作 / 治理控制面（MCP）"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
