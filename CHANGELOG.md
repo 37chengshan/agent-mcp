@@ -8,7 +8,10 @@
 
 ## [Unreleased]
 
-主题：深度缺陷清偿 + 控制台交互/动效 + 安全加固（多子代理并行修复）。
+主题：深度缺陷清偿 + 控制台交互/动效 + 安全加固 + DSH 插件市场上架包。
+
+### Added
+- **DSH bundle 插件** `packages/dsh-plugin`（`dsh-plugin-agentmcp`）：官方 `dsh.bundle.patch` 形态，`dsh plugin add` 一键装，`mcp__agentmcp__*` 工具面；跨平台 launcher（`scripts/launch-agentmcp.mjs`）；契约测试 `tests/test_dsh_bundle.py`；文档主路径改为 plugin add（手写 patch 为回退）。
 
 ### Security
 - 密钥文件 `O_CREAT|0600` 创建（消除 umask 0644 窗口）；`state_dir` 0700；日志/策略 0600。
@@ -19,6 +22,8 @@
 - custom-cli 拒绝世界可写目录 / 绝对路径 bins / 覆盖内置名（需显式 trust 标志）。
 - v4 `request_hash` 服务端重算；`_resolve_v4_method` 白名单；CSP `script-src 'self'`；`_read_json` 全路径限长。
 - Docker 挂载改 `--mount type=bind` 并拒绝路径含 `:`；network 谓词与文档对齐；git 参数补 `--`。
+- `sanitize_env` 改为白名单合并 + 扩展 denylist（`LD_*`/`PYTHON*`/`GIT_*`/`JAVA_TOOL_OPTIONS` 等）。
+- `verify` allowlist 路径边界匹配（`py` 不再匹配 `python3`）；worker `*.env.json` 用后即删；SSE 响应补 CSP。
 
 ### Fixed
 - journal：`created` 标志防并发双执行；孤儿 `recorded` → `uncertain` 可恢复（P7）。

@@ -14,15 +14,32 @@ import psutil
 from agent_mcp.cli_adapters import get_adapter
 from agent_mcp.sandbox import build_container_sandbox_command, requires_process_fallback
 
-# SEC-H5: 危险环境变量前缀/精确名——caller env 注入时一律剥离
+# SEC-H5: 危险环境变量精确名 + 前缀——caller env 注入时一律剥离。
+# allowlist-merge：只合并 caller 显式请求的键，且必须先通过本 denylist；
+# 绝不透传任意/未请求的环境变量。
 _DANGEROUS_ENV_EXACT = frozenset({
-    "LD_PRELOAD", "NODE_OPTIONS", "BASH_ENV", "ENV", "IFS",
+    # 动态链接器 / 语言运行时注入面
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG",
+    "NODE_OPTIONS", "NODE_PATH",
+    "BASH_ENV", "ENV", "IFS",
+    "PERL5OPT", "PERL5LIB",
+    "RUBYOPT", "RUBYLIB",
+    "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
+    # git 配置/传输劫持
+    "GIT_SSH_COMMAND", "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+    # PYTHON* 前缀已覆盖，精确名再锁一道（文档对齐）
+    "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
 })
-_DANGEROUS_ENV_PREFIXES = ("DYLD_", "PYTHON")
+_DANGEROUS_ENV_PREFIXES = (
+    "DYLD_",       # macOS 动态注入
+    "PYTHON",      # PYTHONPATH / PYTHONHOME / PYTHONSTARTUP / PYTHONUSERBASE ...
+    "BASH_FUNC_",  # bash 导出函数注入
+    "LD_",         # 其余 LD_* 注入/调试面
+)
 
 
 def sanitize_env(env: dict[str, str] | None) -> dict[str, str]:
-    """SEC-H5: 剥离危险键；仅返回安全的 caller 覆盖项。"""
+    """SEC-H5: allowlist-merge——只保留 caller 显式请求且通过 denylist 的键。"""
     if not env:
         return {}
     out: dict[str, str] = {}

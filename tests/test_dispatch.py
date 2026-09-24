@@ -6,7 +6,7 @@ import time
 import pytest
 import psutil
 from agent_mcp import cli_adapters
-from agent_mcp.dispatch import (SlotScheduler, build_worker_command,
+from agent_mcp.dispatch import (SlotScheduler, build_worker_command, sanitize_env,
                                 terminate_process_tree, is_pid_running,
                                 spawn_cli_worker, spawn_detached)
 
@@ -124,6 +124,93 @@ def test_build_worker_command_appends_env_without_changing_legacy_shape(tmp_path
                                           "DYLD_INSERT_LIBRARIES": "/evil.so"})
     env_path2 = Path(with_env2[-1][1:])
     assert json.loads(env_path2.read_text()) == {"A": "1"}
+
+
+def test_sanitize_env_allowlist_merge_strips_dangerous_keys():
+    """SEC-H5: 只透传显式请求键，且 denylist 全覆盖注入面。"""
+    env = {
+        "A": "1",
+        "LD_PRELOAD": "/evil.so",
+        "LD_LIBRARY_PATH": "/evil",
+        "LD_AUDIT": "x",
+        "LD_DEBUG": "all",
+        "LD_FOO": "x",
+        "DYLD_INSERT_LIBRARIES": "/evil.so",
+        "DYLD_LIBRARY_PATH": "/evil",
+        "PYTHONPATH": "/evil",
+        "PYTHONHOME": "/evil",
+        "PYTHONSTARTUP": "/evil",
+        "PYTHONUSERBASE": "/evil",
+        "NODE_OPTIONS": "--require /evil",
+        "NODE_PATH": "/evil",
+        "BASH_ENV": "/evil",
+        "BASH_FUNC_foo%%": "() { :; }",
+        "ENV": "/evil",
+        "IFS": " ",
+        "PERL5OPT": "-Mevil",
+        "PERL5LIB": "/evil",
+        "RUBYOPT": "-revil",
+        "RUBYLIB": "/evil",
+        "JAVA_TOOL_OPTIONS": "-javaagent:/evil",
+        "_JAVA_OPTIONS": "-javaagent:/evil",
+        "GIT_SSH_COMMAND": "evil",
+        "GIT_CONFIG": "evil",
+        "GIT_CONFIG_GLOBAL": "evil",
+        "GIT_CONFIG_SYSTEM": "evil",
+    }
+    assert sanitize_env(env) == {"A": "1"}
+    assert sanitize_env(None) == {}
+    assert sanitize_env({}) == {}
+
+
+def test_load_env_arg_unlinks_file_after_read(tmp_path):
+    import dispatch_worker
+    env_path = tmp_path / "s.env.json"
+    env_path.write_text(json.dumps({"A": "1"}))
+    env = dispatch_worker.load_env_arg(f"@{env_path}")
+    assert env == {"A": "1"}
+    assert not env_path.exists()  # 内容已消费，立即删除
+
+
+def test_dispatcher_cleanup_env_file_on_terminal(tmp_path):
+    """worker 终态后父侧兜底删除 *.env.json（worker 未读到也不残留）。"""
+    import time as _time
+    from agent_mcp.daemon_http import EventBroadcaster
+    from agent_mcp.daemon_main import Dispatcher
+    from agent_mcp.db import DB
+
+    def fake_spawn(target_cli, *, prompt, cwd, permission_mode="plan", model=None,
+                   max_turns=8, resume=None, state_dir, timeout_seconds=None):
+        state_path = tmp_path / "claude-0.json"
+        state_path.write_text(json.dumps({"status": "starting"}))
+        out_path = tmp_path / "claude-0.out.log"
+        out_path.write_text("done\n")
+        (tmp_path / "claude-0.err.log").write_text("")
+        env_path = tmp_path / "claude-0.env.json"
+        env_path.write_text(json.dumps({"SECRET": "x"}))
+        return {"worker_pid": 900001, "command_summary": "claude hi",
+                "state_path": str(state_path), "out_path": str(out_path),
+                "err_path": str(tmp_path / "claude-0.err.log")}
+
+    db = DB(tmp_path / "t.db")
+    d = Dispatcher(db=db, broadcaster=EventBroadcaster(), state_dir=tmp_path,
+                   spawn_fn=fake_spawn, monitor_interval=0.05)
+    d.start()
+    try:
+        res = d.spawn({"target_cli": "claude", "prompt": "X",
+                       "cwd": str(tmp_path), "session_id": "s1"})
+        env_path = tmp_path / "claude-0.env.json"
+        assert env_path.exists()
+        st = json.loads((tmp_path / "claude-0.json").read_text())
+        st.update({"status": "finished", "process_status": 0})
+        (tmp_path / "claude-0.json").write_text(json.dumps(st))
+        d.wait({"agent_id": res["agent_id"], "timeout": 10})
+        deadline = _time.time() + 5
+        while env_path.exists() and _time.time() < deadline:
+            _time.sleep(0.05)
+        assert not env_path.exists()
+    finally:
+        d.stop()
 
 
 def test_dispatch_worker_passes_env_to_cli(tmp_path):

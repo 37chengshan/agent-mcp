@@ -76,6 +76,20 @@ VERIFY_FIX_INSTRUCTION = (
 _MEMORY_KINDS = ("decision", "lesson", "convention", "final_answer")
 
 
+def _verify_cmd_allowed(cmd0: str, prefixes: list[str]) -> bool:
+    """SEC-H6 边界匹配：精确命中 / 路径前缀（后继必须是路径分隔符）/ 目录前缀。
+    禁止裸前缀误配——`py` 不得匹配 `python3`。"""
+    for p in prefixes:
+        if cmd0 == p:
+            return True
+        if (cmd0.startswith(p)
+                and (len(cmd0) == len(p) or cmd0[len(p)] in "/\\")):
+            return True
+        if p.endswith("/") and cmd0.startswith(p):
+            return True
+    return False
+
+
 def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[bool, str]:
     """daemon 自跑 verify_command，返回 (ok, output)。超时计失败。
 
@@ -83,7 +97,7 @@ def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[
     元字符（verify_command 来自 LLM/用户输入，此前等价于以 daemon 权限执行
     任意 shell）。无法安全切词时判失败并说明，不静默降级。
     SEC-H6 default-deny：AGENT_MCP_VERIFY_ALLOW_PREFIXES 为空时拒绝执行；
-    非空时首个 token 必须命中前缀之一。"""
+    非空时首个 token 必须命中前缀之一（边界匹配，禁止裸前缀误配）。"""
     try:
         cmd = shlex.split(verify_command)
     except ValueError as exc:
@@ -94,7 +108,7 @@ def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[
     if not allow:
         return False, ("[verify command rejected: AGENT_MCP_VERIFY_ALLOW_PREFIXES "
                        "is empty (default-deny)]")
-    if not any(cmd[0] == p or cmd[0].startswith(p) for p in allow):
+    if not _verify_cmd_allowed(cmd[0], allow):
         return False, (f"[verify command rejected: '{cmd[0]}' not in "
                        f"AGENT_MCP_VERIFY_ALLOW_PREFIXES allowlist]")
     try:
@@ -128,6 +142,25 @@ from agent_mcp.state_machine import TERMINAL as _TERMINAL, WAIT_WAKEUP  # noqa: 
 # 尚未落库时，wait 在 GRACE 窗口内轮询 DB 等终态，避免误报 running。
 _WAIT_GRACE_SECONDS = 5.0
 _WAIT_GRACE_POLL = 0.1
+
+
+def _env_file_for_state(state_path: Path | str | None) -> Path | None:
+    """state.json → state.env.json（与 dispatch.build_worker_command 同源约定）。"""
+    if not state_path:
+        return None
+    return Path(state_path).with_suffix(".env.json")
+
+
+def _unlink_env_file(state_path: Path | str | None) -> None:
+    """SEC-H5: worker 终态后删除 env 临时文件（内容可能含密钥）。best-effort。"""
+    env_path = _env_file_for_state(state_path)
+    if env_path is None:
+        return
+    try:
+        env_path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[dispatcher] env cleanup failed for {env_path}: {exc}",
+              file=sys.stderr)
 
 
 def _write_private(path: Path, data: dict) -> None:
@@ -919,6 +952,8 @@ class Dispatcher:
         with self._lock:
             info = self._workers.pop(agent_id, None)
             cancelled_pending = self._pending.pop(agent_id, None)
+        if info is not None:
+            _unlink_env_file(info.get("state_path"))
         if cancelled_pending is not None:
             # A5：取消排队任务时同步清掉落库副本
             try:
@@ -1665,6 +1700,7 @@ class Dispatcher:
         孤儿检测：state 已写 running 且 worker 进程已死 → _fail worker_died。"""
         orphan_info: dict | None = None
         finished = False
+        done_state_path: Path | str | None = None
         with self._lock:
             info = self._workers.get(agent_id)
             if info is None:
@@ -1677,6 +1713,7 @@ class Dispatcher:
                 timed_out = bool(state.get("timed_out"))
                 summary = _final_summary(info["out_path"])
                 finished = True
+                done_state_path = info.get("state_path")
             elif state.get("status") == "running" and not is_pid_running(info.get("worker_pid")):
                 # 孤儿检测：仅当 worker 已确认进入 running 态（state 写 running）
                 # 却进程已死（崩溃/被外部 kill）才判孤儿；starting/空 state 不判，
@@ -1684,6 +1721,9 @@ class Dispatcher:
                 self._workers.pop(agent_id, None)
                 self._offsets.pop(agent_id, None)
                 orphan_info = info
+                done_state_path = info.get("state_path")
+        if done_state_path is not None:
+            _unlink_env_file(done_state_path)
         if orphan_info is not None:
             self._fail(agent_id, stop_reason="worker_died",
                        message=f"worker pid {orphan_info.get('worker_pid')} "

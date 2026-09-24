@@ -1,9 +1,14 @@
 # DSH（DeepSeek Harness）接入 agent-mcp —— 临时试用 patch（默认关闭）
 #
+# 单一事实来源：packages/dsh-plugin/cordis.patch.yml（`dsh plugin add` 主路径的 bundle 载荷）。
+# 本文件仅作手工 fallback 摘录，字段以 packages 为准；勿在此单独演进。
+#
 # 用法：dsh web --patch /绝对路径/examples/dsh/agentmcp.cordis.yml
-# 持久启用：把下面的 insert 块合并进 $DSH_HOME/profiles/<name>/cordis.patch.yml
+# 持久启用（主路径）：dsh plugin --profile web add dsh-plugin-agentmcp
+#          或 github:37chengshan/agent-mcp/packages/dsh-plugin / 本地 ./packages/dsh-plugin
+# 持久启用（回退）：把下面的 insert 块合并进 $DSH_HOME/profiles/<name>/cordis.patch.yml
 #          或 $DSH_HOME/cordis.patch.yml（先读后追加，勿覆盖已有文件）。
-# 详见 docs/dsh-integration.md。
+# 详见 docs/dsh-integration.md 与 packages/dsh-plugin/README.zh.md。
 - insert:
     - id: mcp-agentmcp
       name: '@deepseek-ai/dsh-mcp-client'

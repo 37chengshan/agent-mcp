@@ -363,6 +363,35 @@ def test_events_replay_over_1000_with_live_publish_race_no_dup(tmp_path):
         srv.shutdown()
 
 
+def test_sse_responses_include_security_headers(tmp_path):
+    """SSE 流式响应同样必须带 CSP 等安全头（SEC-M9）。"""
+    import http.client
+    import threading
+    srv = _make_server(tmp_path)
+    try:
+        got: dict = {}
+
+        def read():
+            conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1],
+                                              timeout=5)
+            conn.request("GET", "/events?token=t")
+            resp = conn.getresponse()
+            got["headers"] = {k: v for k, v in resp.headers.items()}
+            conn.close()
+
+        t = threading.Thread(target=read)
+        t.start()
+        t.join(timeout=5)
+        assert not t.is_alive()
+        headers = got.get("headers") or {}
+        assert "frame-ancestors 'none'" in headers.get("Content-Security-Policy", "")
+        assert headers.get("X-Frame-Options") == "DENY"
+        assert headers.get("X-Content-Type-Options") == "nosniff"
+        assert headers.get("Referrer-Policy") == "no-referrer"
+    finally:
+        srv.shutdown()
+
+
 def test_oversized_json_body_rejected(tmp_path):
     import http.client
     srv = _make_server(tmp_path)

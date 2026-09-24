@@ -1,0 +1,37 @@
+{
+  "name": "dsh-plugin-agentmcp",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (DSH) bundle plugin: expose agent-mcp MCP tools as mcp__agentmcp__* via @deepseek-ai/dsh-mcp-client (stdio).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/37chengshan/agent-mcp"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-mcp-client": ">=0.1.0-rc.7"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "scripts",
+    "assets",
+    "package.json"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "mcp",
+    "agent",
+    "orchestration"
+  ]
+}

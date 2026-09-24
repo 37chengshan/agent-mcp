@@ -87,9 +87,17 @@ def terminate_tree(pid: int) -> None:
 
 
 def load_env_arg(arg: str) -> dict[str, str] | None:
-    """SEC-H5: env 从 @path 0600 文件读取（不再经 argv JSON）；兼容旧内联 JSON。"""
+    """SEC-H5: env 从 @path 0600 文件读取（不再经 argv JSON）；兼容旧内联 JSON。
+    读取后立即 unlink（内容已消费，不落盘残留）。"""
     if arg.startswith("@"):
-        raw = json.loads(Path(arg[1:]).read_text(encoding="utf-8"))
+        env_path = Path(arg[1:])
+        try:
+            raw = json.loads(env_path.read_text(encoding="utf-8"))
+        finally:
+            try:
+                env_path.unlink()
+            except OSError:
+                pass  # 已删/无权限：父侧 cleanup 兜底
     else:
         raw = json.loads(arg)
     if not isinstance(raw, dict) or not all(

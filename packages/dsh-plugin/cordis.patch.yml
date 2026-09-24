@@ -1,0 +1,33 @@
+# dsh-plugin-agentmcp — DeepSeek Harness bundle patch
+#
+# 单一事实来源：packages/dsh-plugin/（本文件）。
+# examples/dsh/agentmcp.cordis.yml 仅作手工 fallback 摘录，字段以本文件为准。
+# 接入指南：docs/dsh-integration.md §2（优先 `dsh plugin add`，本 patch 为 bundle 载荷）。
+#
+# 重启 / 刷新 DSH 后生效（HMR 可热替换）。
+- insert:
+    - id: mcp-agentmcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: agentmcp
+        transport: stdio
+        # 首选：node 启动器 —— 跨平台挑 python3/python/py，并按序定位 mcp_server.py
+        # （env AGENT_MCP_MCP_SERVER → 从包目录向上找（monorepo 根 / vendored 邻接）
+        #   → ~/.agent-mcp/mcp_server.py）。详见 scripts/launch-agentmcp.mjs。
+        # !!js/eval 在 DSH 加载本 patch 时按包目录解析，无写死的用户主路径。
+        command: node
+        args:
+          - !!js/eval "require('path').resolve(__dirname, 'scripts/launch-agentmcp.mjs')"
+        # ---- 备选：不经 node，直接 spawn python（二选一，注释掉上面 command/args 再启用）----
+        # command: !!js/eval "process.platform === 'win32' ? 'py' : 'python3'"
+        # args:
+        #   - !!js/eval "process.env.AGENT_MCP_MCP_SERVER || require('path').resolve(__dirname, '../../mcp_server.py') || require('path').join(require('os').homedir(), '.agent-mcp', 'mcp_server.py')"
+        # 可选：自定义状态目录 / 端口（缺省 ~/.codex/agent-mcp 与 8765）
+        # env:
+        #   AGENT_MCP_HOME: /绝对路径/状态目录
+        #   AGENT_MCP_PORT: '8765'
+        # 首连失败不阻塞插件激活，交由重连循环接管
+        failOnStartupError: false
+        # reconnect 走 dsh-mcp-client 默认（enabled: true、退避 500ms→30s、单次断线最多 10 次）
+        # DSH 单次工具调用超时：wait_agent 默认 25s 短阻塞循环，120s 留足余量
+        toolCallTimeoutMs: 120000

@@ -26,11 +26,35 @@ DSH 会话 ── spawn mcp_server.py（stdio JSON-RPC）──► agent-mcp dae
 
 ## 2. 配置（host 平面，推荐）
 
-DSH 的组合由 bundles + `cordis.patch.yml` 拼成，用户自定义层用 **patch 语法**。**推荐 host 平面**：一次连接、全会话共享同一组工具与同一 daemon。
+DSH 的组合由 bundles + `cordis.patch.yml` 拼成。**推荐 host 平面**：一次连接、全会话共享同一组工具与同一 daemon。
 
-### 2.1 单 profile 启用
+**主路径：`dsh plugin add` 安装官方 bundle 插件**（[packages/dsh-plugin/](../packages/dsh-plugin/)，
+单一事实来源；含跨平台启动器 `scripts/launch-agentmcp.mjs`，自动挑 python3/python/py 并按序定位
+`mcp_server.py`：`AGENT_MCP_MCP_SERVER` → 包目录向上（monorepo 根 / vendored 邻接）→ `~/.agent-mcp/`）。
 
-编辑 `$DSH_HOME/profiles/<name>/cordis.patch.yml`（本机为 `~/.dsh/profiles/web/cordis.patch.yml`），追加：
+### 2.1 用插件安装（主路径）
+
+```bash
+# npm registry（发布后）
+dsh plugin --profile web add dsh-plugin-agentmcp
+
+# GitHub 直装（子目录包，无需 npm publish）
+dsh plugin --profile web add github:37chengshan/agent-mcp/packages/dsh-plugin
+
+# 本地仓库路径
+dsh plugin --profile web add ./packages/dsh-plugin
+```
+
+刷新 / 重启 DSH 后，工具目录出现 `mcp__agentmcp__*`。插件说明与验证清单见
+[packages/dsh-plugin/README.zh.md](../packages/dsh-plugin/README.zh.md)。
+
+卸载：`dsh plugin --profile web remove dsh-plugin-agentmcp`。
+
+### 2.2 手工 patch（回退，不用插件系统）
+
+把 `packages/dsh-plugin/cordis.patch.yml` 中的 insert 块合并进
+`$DSH_HOME/profiles/<name>/cordis.patch.yml`（单 profile）或 `$DSH_HOME/cordis.patch.yml`
+（全机所有 profile；**勿覆盖已有文件——先读后追加**）。最小可用块：
 
 ```yaml
 # 加入即启用；重启/刷新 DSH 后生效（HMR 可热替换）
@@ -40,8 +64,12 @@ DSH 的组合由 bundles + `cordis.patch.yml` 拼成，用户自定义层用 **p
       config:
         serverName: agentmcp
         transport: stdio
-        command: python3
-        args: ['/绝对路径/agent-mcp/mcp_server.py']
+        # 推荐：node 启动器（跨平台找 python + mcp_server.py，勿写死 /Users/<name>/…）
+        command: node
+        args: ['/绝对路径/agent-mcp/packages/dsh-plugin/scripts/launch-agentmcp.mjs']
+        # 或直接 spawn python（自行解析绝对路径）：
+        # command: python3
+        # args: ['/绝对路径/agent-mcp/mcp_server.py']
         # 可选：自定义状态目录/端口（缺省 ~/.codex/agent-mcp 与 8765）
         # env:
         #   AGENT_MCP_HOME: /绝对路径/状态目录
@@ -51,11 +79,8 @@ DSH 的组合由 bundles + `cordis.patch.yml` 拼成，用户自定义层用 **p
         # toolCallTimeoutMs: 120000
 ```
 
-`command` 也可直接指向安装副本：`args: ['/Users/<you>/.agent-mcp/mcp_server.py']`。
-
-### 2.2 全机所有 profile 启用
-
-把同一个 `- insert:` 块合并进 `$DSH_HOME/cordis.patch.yml`（勿覆盖已有文件——先读后追加）。
+`args` 也可直接指向安装副本：`['/home/<you>/.agent-mcp/mcp_server.py']`（或本机对应的
+`~/.agent-mcp/mcp_server.py` 绝对路径——用 `echo ~/.agent-mcp/mcp_server.py` 展开，勿手写用户名）。
 
 ### 2.3 临时试用（不改持久配置）
 
@@ -63,7 +88,8 @@ DSH 的组合由 bundles + `cordis.patch.yml` 拼成，用户自定义层用 **p
 dsh web --patch /绝对路径/agent-mcp/examples/dsh/agentmcp.cordis.yml
 ```
 
-`examples/dsh/agentmcp.cordis.yml` 即 §2.1 的 insert 块原文，可复制到任意路径。
+`examples/dsh/agentmcp.cordis.yml` 是 §2.2 insert 块的手工 fallback 摘录（字段以
+`packages/dsh-plugin/cordis.patch.yml` 为准），可复制到任意路径。
 
 ## 3. 配置（agent preset 平面，备选）
 

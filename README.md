@@ -12,7 +12,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/version-4.0.0a1-C0503A" alt="version">
   <img src="https://img.shields.io/badge/tools-34%20%2F%20tools%2Flist-3E7A56" alt="tools">
-  <img src="https://img.shields.io/badge/tests-601%20passed-3E7A56" alt="tests">
+  <img src="https://img.shields.io/badge/tests-617%20passed-3E7A56" alt="tests">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="license">
   <img src="https://img.shields.io/badge/MCP-2026--07--28-5A54A3" alt="mcp">
   <img src="https://img.shields.io/badge/security-hardened-8B4513" alt="security">
@@ -95,7 +95,7 @@ AGENT_MCP_HOST=codex,claude \
 
 > 安装结束只打印仓库首页链接，**不自动开浏览器 / 不调用 gh star**。  
 > 诊断：`python3 start_agent_mcp.py --doctor`  
-> DeepSeek Harness：见 [dsh-integration.md](docs/dsh-integration.md)
+> DeepSeek Harness：`dsh plugin --profile web add dsh-plugin-agentmcp`（见 [packages/dsh-plugin](packages/dsh-plugin) · [dsh-integration.md](docs/dsh-integration.md)）
 
 ### 2. 打开控制台
 
@@ -153,10 +153,11 @@ mcp_server.py            # MCP 薄层（能力面）
 start_agent_mcp.py       # 启动 · --open · --doctor
 install.py / install.sh  # host 注册 · 备份回滚
 agent_mcp/               # daemon · execution · store_v4 · adapters · policies
+packages/dsh-plugin/     # DSH bundle 插件（dsh-plugin-agentmcp）
 web/                     # v4 控制台 + 仪表盘面板（含动效）
 skill/                   # 编排 Skill（控制面）+ 内置 Agent
 docs/                    # 架构 · ADR · 能力矩阵 · DSH/安装指南 · 品牌资产
-tests/                   # 601 单测
+tests/                   # 600+ 单测
 ```
 
 ---

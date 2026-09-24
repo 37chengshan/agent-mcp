@@ -241,6 +241,56 @@ def test_verify_allowlist_prefix_enforced(tmp_path, monkeypatch):
     assert "allowlist" not in out
 
 
+def test_verify_allowlist_prefix_boundary(tmp_path, monkeypatch):
+    """SEC-H6 边界匹配：裸前缀不得误配更长命令名。"""
+    monkeypatch.setenv("AGENT_MCP_VERIFY_ALLOW_PREFIXES", "py")
+    ok, out = _run_verify("python3 -c pass", cwd=str(tmp_path))
+    assert not ok and "allowlist" in out  # py 不得匹配 python3
+
+    monkeypatch.setenv("AGENT_MCP_VERIFY_ALLOW_PREFIXES", "pytest")
+    ok, out = _run_verify("pytest -q", cwd=str(tmp_path))
+    assert "allowlist" not in out  # exact basename 命中
+    ok, out = _run_verify("pytest-foo -q", cwd=str(tmp_path))
+    assert not ok and "allowlist" in out  # 后继非路径分隔符 → 拒绝
+
+    monkeypatch.setenv("AGENT_MCP_VERIFY_ALLOW_PREFIXES", "/usr/bin/python3")
+    ok, out = _run_verify("/usr/bin/python3 -c pass", cwd=str(tmp_path))
+    assert "allowlist" not in out  # 完整路径精确命中
+    ok, out = _run_verify("/usr/bin/python3evil -c pass", cwd=str(tmp_path))
+    assert not ok and "allowlist" in out
+
+
+def test_permission_mode_warning_not_silently_escalated():
+    """D9d: permission_mode 被丢弃时必须告警，绝不静默升权。"""
+    from agent_mcp.cli_adapters import BaseAdapter
+
+    class NoMap(BaseAdapter):
+        cli_name = "nomap"
+        PERMISSION_FLAGS = None
+
+    class PartialMap(BaseAdapter):
+        cli_name = "partial"
+        PERMISSION_FLAGS = {"plan": ["--plan"]}
+
+    class FullMap(BaseAdapter):
+        cli_name = "full"
+        PERMISSION_FLAGS = {
+            "plan": ["--plan"],
+            "acceptEdits": ["--accept"],
+            "fullAccess": ["--full"],
+        }
+
+    assert NoMap().permission_mode_warning("plan") is None
+    warn = NoMap().permission_mode_warning("fullAccess")
+    assert warn is not None and "dropped" in warn
+
+    assert PartialMap().permission_mode_warning("plan") is None
+    assert PartialMap().permission_mode_warning("fullAccess") is not None
+
+    assert FullMap().permission_mode_warning("fullAccess") is None
+    assert FullMap().permission_mode_warning("acceptEdits") is None
+
+
 # ---- SEC-H4/H8 空 session 拒绝 ----
 
 def test_empty_session_id_denies_mutating_ops(tmp_path, sec_srv):

@@ -1,0 +1,9 @@
+# files 白名单（package.json）才是真正的发布边界；此处再兜一层，
+# 防止本地开发时误把杂项带进 tarball。
+node_modules/
+*.log
+.DS_Store
+tests/
+test/
+*.tgz
+.npmignore
