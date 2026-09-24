@@ -7,25 +7,29 @@
 
 ## 0. 这是什么
 
-Agent MCP 是一个 **MCP 服务器 + 编排 Skill**：
+Agent MCP 是 **Skill-first 的跨 CLI Agent 运行时**（三层）：
 
-- `mcp_server.py`：MCP stdio 服务器，暴露 34 个工具——编排（`spawn_agent` / `send_message` / `steer_agent` / `followup_task` / `wait_agent` / `interrupt_agent` / `list_agents` / `get_agent_activity` / `get_token_usage` / `estimate_complexity` / `orchestrate_task`）、策略、Harness/Refine、Goal/Schedule/Run、记忆银行（`memory_store` / `memory_recall`）、信箱与共识投票
-- `skill/`：编排工作流 Skill（SKILL.md + 10 个内置 Agent 预设 + 任务简报模板）
-- 安装后，你的 agent 可以把任意 CLI（内置 claude / grok / opencode / omp / atomcode 适配器，可扩展）当子 Agent 工作池派发任务
+| 层 | 职责 |
+|---|---|
+| **Skill** | 是否委派、怎么拆、选哪个 CLI×模型、怎么验收 |
+| **MCP** | 稳定工具面（`mcp_server.py`，能力以 `tools/list` / `docs/capability-matrix.md` 为准） |
+| **Daemon** | 队列/进程/会话/超时/重试/持久化/SSE |
 
-**验证方式**：注册完成后，在你的 agent 会话里问"你能看到 spawn_agent 工具吗？"；能看到即安装成功。
+完整工具能力以 `mcp_server.py` 的 `TOOLS` 定义为准，本文档不单独维护固定数量。
+
+**验证方式**：注册完成后，在 agent 会话里确认 `spawn_agent`、`wait_agent`、`estimate_complexity` 均可见，并执行一次 `estimate_complexity` 验证 daemon 可正常拉起。
 
 ---
 
 ## 0.5 DeepSeek Harness（DSH）接入
 
-DSH 是通用 MCP 客户端，无需 install.py 注册：在其 profile 组合层加一行 `@deepseek-ai/dsh-mcp-client` 的 insert patch 即可，16 个工具以 `mcp__agentmcp__*` 出现在 DSH 工具目录。完整步骤、host/agent preset 双平面模板与验证清单见 **[DSH 接入指南](dsh-integration.md)**。
+DSH 是通用 MCP 客户端，无需 install.py 注册：在其 profile 组合层加一行 `@deepseek-ai/dsh-mcp-client` 的 insert patch 即可，工具以 `mcp__agentmcp__*` 出现在 DSH 工具目录（数量随 `tools/list`）。完整步骤见 **[DSH 接入指南](dsh-integration.md)**。
 
 ---
 
-## 1. 六种内置 host（有专用安装工具）
+## 1. 内置 host
 
-以下六个 agent 可用项目自带脚本一键安装（自动注册 MCP + 安装 skill，写配置前自动备份，`--rollback` 可恢复）：
+### 1a. 六个主载体（MCP + Skill 一并安装）
 
 | host | 说明 | 配置文件 |
 |---|---|---|
@@ -36,28 +40,40 @@ DSH 是通用 MCP 客户端，无需 install.py 注册：在其 profile 组合�
 | `kimi` | Kimi Code CLI | `~/.kimi-code/mcp.json`（或 `$KIMI_CODE_HOME`） |
 | `zcode` | ZCode | `~/.zcode/cli/config.json` |
 
+### 1b. 扩展 host（只注册 MCP，不一定装 Skill）
+
+`grok` / `cursor` / `gemini` / `pi` / `copilot` / `cline` / `qwen` / `devin` / `windsurf` / `amazon-q` / `atomcode` / `kiro` / `goose` / `hermes` / `crush`
+
+> **`--host all` = 上述全部 21 个 host**，会改写多套用户配置（六主载体 + 15 扩展）。
+> 只想装六个主载体时请显式列出，例如：
+> `python3 install.py --install --host codex,claude`（或逐个 `--host`）。
+> 当前 CLI 的 `--host` 接受单值；批量请多次执行或使用 `AGENT_MCP_HOST=a,b`（install.sh）。
+
 ### 安装命令
 
 ```bash
 # 先拿到项目文件（任意一种）：
 #   方式 A：git clone git@github.com:37chengshan/agent-mcp.git && cd agent-mcp
-#   方式 B：curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.sh | bash
-#           ⚠️ 管道执行以当前用户权限运行远程脚本，建议先审阅 install.sh；或用 git clone
+#   方式 B：AGENT_MCP_HOST=codex,claude \
+#           curl -fsSL https://raw.githubusercontent.com/37chengshan/agent-mcp/main/install.sh | bash
+#           ⚠️ 管道执行以当前用户权限运行远程脚本，建议先审阅 install.sh
+#           ⚠️ 非交互管道必须设置 AGENT_MCP_HOST，否则只下载、不写注册
 
-# 安装到指定 host（host 取上面表格的 name）：
+# 安装到指定 host（推荐显式，避免 all 改写 21 套配置）：
 python3 install.py --install --host claude
-# 或一次装全部六个：
+
+# 确实要全部 21 个 host 时：
 python3 install.py --install --host all
 
 # 只预览将做的变更，不写入：
-python3 install.py --install --host all --dry-run
+python3 install.py --install --host claude --dry-run
 
 # 误改配置后恢复：
 python3 install.py --rollback --host claude
 ```
 
-> 需要手动指定 `mcp_server.py` 路径时：`python3 install.py --install --host all /abs/path/to/mcp_server.py`
-> 安装完成后脚本会提示是否为项目点 star（GitHub CLI 已登录则直接 `gh repo star`，否则打开浏览器）。
+> 需要手动指定 `mcp_server.py` 路径时：`python3 install.py --install --host claude /abs/path/to/mcp_server.py`
+> 安装完成只打印仓库首页链接（不自动打开浏览器 / 不调用 gh star）。
 
 ---
 

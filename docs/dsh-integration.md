@@ -1,6 +1,6 @@
 # Agent MCP × DeepSeek Harness（DSH）接入指南
 
-把 agent-mcp 的 16 个 MCP 工具（12 核心编排工具 + `orchestrate_task` + `policy_list/policy_add/policy_state`）接入 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）AI 会话，让 DSH 模型直接在工具目录里看到并调用 `mcp__agentmcp__*`。
+把 agent-mcp 的 MCP 工具面接入 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）AI 会话，让 DSH 模型直接在工具目录里看到并调用 `mcp__agentmcp__*`。**工具数量以 `mcp_server.py` 的 `tools/list` 响应为准**（本文档不单独维护固定数字）。
 
 ## 0. 架构结论：零插件改造，stdio 直连
 
@@ -8,7 +8,7 @@ agent-mcp 不需要重写成 DSH 插件。DSH 原生自带 `@deepseek-ai/dsh-mcp
 
 ```
 DSH 会话 ── spawn mcp_server.py（stdio JSON-RPC）──► agent-mcp daemon（http://127.0.0.1:8765）
-              └── 16 个工具注册为 mcp__agentmcp__<rawName>
+              └── 工具注册为 mcp__agentmcp__<rawName>
 ```
 
 - `mcp_server.py` 是无状态 stdio 薄层：逐行读 stdin JSON-RPC，EOF 退出码 0，异常不崩溃——天然适配 DSH 的断线重连循环（崩溃后指数退避自动重启，默认 10 次）。
@@ -141,7 +141,7 @@ res = rpc([{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}])[0]["result"]
 print("tools:", len(res["tools"]), [t["name"] for t in res["tools"]][:4], "...")
 p.kill()
 EOF
-# 期望：initialize 回 2025-11-25；tools/list 返回 16 个工具
+# 期望：initialize 回 2025-11-25；tools/list 返回当前工具目录（见 mcp_server.TOOLS）
 ```
 
 3. 真实 DSH 会话：写入 §2 的 patch → 刷新/重启 → 工具目录出现 `mcp__agentmcp__*`（16 个）。
