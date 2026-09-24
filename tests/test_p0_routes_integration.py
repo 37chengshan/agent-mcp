@@ -102,7 +102,7 @@ def test_mailbox_send_fetch_roundtrip_over_route(env):
     assert status == 200 and sent["status"] == "sent"
 
     status, fetched = post(env, "/api/mailbox/fetch",
-                           {"team": "t1", "agent_id": receiver})
+                           {"team": "t1", "agent_id": receiver, "session_id": "s1"})
     assert status == 200
     msgs = fetched["messages"]
     assert len(msgs) == 1
@@ -112,7 +112,8 @@ def test_mailbox_send_fetch_roundtrip_over_route(env):
 
     # 未读过滤不影响 unread_only=False 的全量读取
     _, again = post(env, "/api/mailbox/fetch",
-                    {"team": "t1", "agent_id": receiver, "unread_only": False})
+                    {"team": "t1", "agent_id": receiver, "unread_only": False,
+                     "session_id": "s1"})
     assert len(again["messages"]) == 1
 
 
@@ -123,7 +124,8 @@ def test_mailbox_broadcast_and_inbox_delivery(env):
         "team": "t2", "from_agent_id": sender, "session_id": "s2",
         "message": "to all"})
     for aid in listeners:
-        _, got = post(env, "/api/mailbox/fetch", {"team": "t2", "agent_id": aid})
+        _, got = post(env, "/api/mailbox/fetch",
+                      {"team": "t2", "agent_id": aid, "session_id": "s2"})
         assert [m["message"] for m in got["messages"]] == ["to all"]
 
 
@@ -247,7 +249,7 @@ def test_container_sandbox_command_assembly(monkeypatch, tmp_path):
     cmd = result["command_summary"].split(" ")
     assert "docker" in cmd and "--network" in cmd and "none" in cmd
     # mount_cwd 修复：宿主工作区必须被挂载进容器（plan 只读 → ro）
-    assert f"-v {cwd.resolve()}:/workspace:ro" in result["command_summary"]
+    assert f"src={cwd.resolve()},dst=/workspace,readonly" in result["command_summary"]
     assert "--read-only" in cmd
     assert cmd[-3:] == ["python:3.12-slim", "/bin/echo", "hi"]
 
@@ -256,7 +258,8 @@ def test_container_sandbox_command_assembly(monkeypatch, tmp_path):
         target_cli="stub", prompt="yo", cwd=str(cwd), permission_mode="fullAccess",
         max_turns=8, resume=None, state_dir=tmp_path / "state", timeout_seconds=30,
         sandbox_container="python:3.12-slim")
-    assert f"{cwd.resolve()}:/workspace:rw" in result2["command_summary"]
+    assert f"src={cwd.resolve()},dst=/workspace" in result2["command_summary"]
+    assert "readonly" not in result2["command_summary"]
     assert "--read-only" not in result2["command_summary"].split(" ")
 
 

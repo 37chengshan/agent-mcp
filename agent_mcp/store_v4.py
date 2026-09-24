@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import models as m
@@ -159,24 +160,53 @@ class StoreV4:
         request_hash: str,
         method: str,
         params: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """记录命令（幂等锚点）。同 (client_id, command_id) 已存在时返回既有条目。"""
+    ) -> tuple[dict[str, Any], bool]:
+        """记录命令（幂等锚点）。返回 (entry, created)。
+
+        created=True 表示 THIS caller 插入了行（唯一执行权）；
+        created=False 表示并发/重试撞上既有行，调用方必须走 replay 路径（J2 TOCTOU）。
+        """
         params_json = _j(params or {})
         with self.db._lock:
             conn = self.db._conn()
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO command_journal"
                     " (client_id, command_id, request_hash, method, params_json, state, created_at)"
                     " VALUES (?,?,?,?,?,'recorded',?)",
                     (client_id, command_id, request_hash, method, params_json, self.db._utc()),
                 )
+                created = (cur.rowcount or 0) == 1
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
-        return self.journal_get(client_id, command_id)
+        entry = self.journal_get(client_id, command_id)
+        return entry, created
+
+    def journal_recover_orphans(self, *, max_age_seconds: float = 30.0,
+                                all_stale: bool = False) -> int:
+        """J1 崩溃恢复：stale recorded → uncertain，禁止盲目重放。
+
+        all_stale=True（daemon 启动）：任何 recorded 都是上一进程孤儿；
+        否则只回收超过 max_age_seconds 的 recorded（长卡死）。
+        """
+        with self.db._lock:
+            conn = self.db._conn()
+            if all_stale:
+                cur = conn.execute(
+                    "UPDATE command_journal SET state='uncertain' WHERE state='recorded'")
+            else:
+                cutoff = (datetime.now(timezone.utc)
+                          - timedelta(seconds=max_age_seconds)).isoformat()
+                cur = conn.execute(
+                    "UPDATE command_journal SET state='uncertain'"
+                    " WHERE state='recorded' AND created_at < ?",
+                    (cutoff,),
+                )
+            conn.commit()
+            return cur.rowcount or 0
 
     def journal_get(self, client_id: str, command_id: str) -> dict[str, Any] | None:
         conn = self.db._conn()
@@ -438,12 +468,22 @@ class StoreV4:
         now = self.db._utc()
         with self.db._lock:
             conn = self.db._conn()
-            conn.execute(
-                "UPDATE goals SET status=?, updated_at=?, completed_at=COALESCE(completed_at,"
-                " CASE WHEN ?='completed' THEN ? END) WHERE id=?",
-                (status, now, status, now, goal_id),
-            )
-            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute("SELECT status FROM goals WHERE id=?", (goal_id,)).fetchone()
+                if row is None:
+                    raise ValueError("goal not found: %s" % goal_id)
+                # 非法迁移（completed→active 等）拒绝
+                m.goal_transition(str(row["status"]), status)
+                conn.execute(
+                    "UPDATE goals SET status=?, updated_at=?, completed_at=COALESCE(completed_at,"
+                    " CASE WHEN ?='completed' THEN ? END) WHERE id=?",
+                    (status, now, status, now, goal_id),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return self.goal_get(goal_id)
 
     def goal_bump_round(self, goal_id: int) -> dict[str, Any] | None:

@@ -5,8 +5,8 @@
  * 写操作：POST /api/v4/goals/create|update · /api/v4/schedules/create|cancel
  * ============================================================ */
 
-import { esc, fmtInt, fmtTime, apiFetch, emptyState, loadingState, errorState,
-         ST_LABEL, ST_CLS } from "./components.js?v=v6";
+import { esc, fmtInt, fmtTime, apiFetch, apiPost, emptyState, toast,
+         setBtnBusy, authToken } from "./components.js?v=v7";
 
 const POLL_MS = 8000;
 
@@ -21,18 +21,7 @@ const RUN_ST = {
 };
 const GOAL_ST = { active: ["进行中", "run"], paused: ["已暂停", "soft"], completed: ["已完成", "ok"] };
 
-function apiPost(path, body){
-  const headers = { "Content-Type": "application/json" };
-  const t = (window.__amToken) || ((location.hash.match(/token=([^&]+)/) || [])[1]
-    ? decodeURIComponent((location.hash.match(/token=([^&]+)/) || [])[1]) : "");
-  if(t) headers["X-Auth-Token"] = t;
-  return fetch(path, { method: "POST", headers, body: JSON.stringify(body) })
-    .then(async r => {
-      const j = await r.json().catch(() => ({}));
-      if(!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      return j;
-    });
-}
+/* apiPost / authToken 来自 components.js（统一 X-Auth-Token） */
 
 function badge(label, cls){
   return `<span class="am-badge ${cls || "soft"}">${esc(label)}</span>`;
@@ -159,41 +148,45 @@ function bind(){
     if(!btn || busy) return;
     if(btn.classList.contains("am-btn-retry")){ flash = ""; await refresh(); return; }
     if(btn.dataset.goal){
-      busy = true; flash = "";
+      busy = true; flash = ""; setBtnBusy(btn, true);
       try{
         await apiPost("/api/v4/goals/update",
                       { goal_id: Number(btn.dataset.goal), status: btn.dataset.act });
         flash = "Goal 已更新";
-      }catch(err){ flash = "失败：" + err.message; }
-      busy = false; await refresh(); return;
+        toast("Goal 已更新");
+      }catch(err){ flash = "失败：" + err.message; toast(flash, "error"); }
+      busy = false; setBtnBusy(btn, false); await refresh(); return;
     }
     if(btn.dataset.sched){
-      busy = true; flash = "";
+      busy = true; flash = ""; setBtnBusy(btn, true);
       try{
         await apiPost("/api/v4/schedules/cancel", { schedule_id: Number(btn.dataset.sched) });
         flash = "Schedule 已取消";
-      }catch(err){ flash = "失败：" + err.message; }
-      busy = false; await refresh(); return;
+        toast("Schedule 已取消");
+      }catch(err){ flash = "失败：" + err.message; toast(flash, "error"); }
+      busy = false; setBtnBusy(btn, false); await refresh(); return;
     }
     if(btn.id === "am-ctl-create-goal"){
       const objective = (root.querySelector("#am-ctl-goal-obj")?.value || "").trim();
       const agentId = (root.querySelector("#am-ctl-goal-agent")?.value || "").trim();
-      if(!objective){ flash = "请填写目标描述"; render(); return; }
-      busy = true; flash = "";
+      if(!objective){ flash = "请填写目标描述"; toast(flash, "error"); render(); return; }
+      busy = true; flash = ""; setBtnBusy(btn, true, "创建中…");
       try{
         const body = { objective };
         if(agentId) body.agent_id = Number(agentId);
         await apiPost("/api/v4/goals/create", body);
         flash = "Goal 已创建";
+        toast("Goal 已创建");
         root.querySelector("#am-ctl-goal-obj").value = "";
-      }catch(err){ flash = "失败：" + err.message; }
-      busy = false; await refresh(); return;
+      }catch(err){ flash = "失败：" + err.message; toast(flash, "error"); }
+      busy = false; setBtnBusy(btn, false); await refresh(); return;
     }
   });
 }
 
 export function mount(container, sse, opts){
   disposed = false; visible = true;
+  if(!authToken()) toast("未检测到 X-Auth-Token，写操作可能被拒", "error");
   root = container;
   root.innerHTML = `
     <div class="am-panel">

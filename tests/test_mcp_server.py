@@ -408,7 +408,7 @@ def test_list_agents_include_other_sessions_passes_none(monkeypatch):
     monkeypatch.setattr(mcp_server, "_daemon_post", fake_post)
     mcp_server.call_tool("list_agents", {"include_other_sessions": True})
     assert captured[0]["session_id"] is None
-    assert "include_other_sessions" not in captured[0]
+    assert captured[0]["include_other_sessions"] is True
     mcp_server.call_tool("list_agents", {})
     assert captured[1]["session_id"] is not None
 

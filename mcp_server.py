@@ -169,14 +169,14 @@ TOOLS = [
                                                    "incomplete/timeout（可 resume）；不传则不设任务超时。"},
                 "parent_agent_id": {"type": "integer", "description": "父 agent（同会话）。"},
                 "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
-                "context_mode": {"type": "string", "enum": ["full", "compact", "none"],
+                "context_mode": {"type": "string", "enum": ["full", "compact", "tail", "none"],
                                  "default": "compact",
-                                 "description": "上下文注入模式（默认 compact：压缩父摘要）。"},
-                "summary_chars": {"type": "integer", "minimum": 100, "maximum": 8000,
-                                  "default": 600,
-                                  "description": "wait_agent terminated 摘要截断字符数（默认 600）。"},
-                "return_ref": {"type": "boolean", "default": False,
-                               "description": "terminated 时是否返回 ref 引用（含 out_path，默认 false）。"},
+                                 "description": "上下文注入模式（默认 compact：压缩父摘要；none=跳过注入）。"},
+                "parent_run_id": {"type": "string", "description": "父 Run id（v4 归因）。"},
+                "command_id": {"type": "string", "description": "幂等命令 id（journal）。"},
+                "role_path": {"type": "string", "description": "角色/系统提示路径（可选）。"},
+                "verify_timeout_sec": {"type": "number", "minimum": 1,
+                                       "description": "verify_command 超时秒数（默认 300）。"},
                 "cache_ttl": {"type": "integer", "minimum": 0, "maximum": 86400,
                               "default": 0,
                               "description": "spawn 缓存存活秒数（0=禁用缓存，默认 0）。"},
@@ -336,6 +336,11 @@ TOOLS = [
                           "description": "可选：本次 turn 覆盖模型（配合 target_cli 使用）。"},
                 "interrupt": {"type": "boolean", "default": False,
                               "description": "先终止运行中的 agent 再重派。"},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800,
+                                    "description": "任务级超时秒数。"},
+                "resume": {"type": "string", "description": "要恢复的 CLI session id。"},
+                "permission_mode": {"type": "string", "enum": ["plan", "acceptEdits", "fullAccess"],
+                                    "default": "plan", "description": "CLI 权限模式。"},
                 "env": {"type": "object", "additionalProperties": {"type": "string"},
                         "description": "注入 CLI 子进程的环境变量（merge 到现有环境，同名覆盖）。"},
             },
@@ -411,6 +416,7 @@ TOOLS = [
                               "description": "只返回 seq 更大的事件。"},
                 "include": {"type": "string", "enum": ["default", "verbose"], "default": "default",
                             "description": "default=压缩已消费 payload，verbose=返全量。"},
+                "session_id": {"type": "string", "description": "会话过滤；缺省当前会话。"},
             },
             "required": ["agent_id"],
             "additionalProperties": False,
@@ -426,6 +432,8 @@ TOOLS = [
             "properties": {
                 "agent_id": {"type": "integer", "description": "指定单 agent 的 usage。"},
                 "session_id": {"type": "string", "description": "缺省 agent_id 时按会话过滤。"},
+                "include_children": {"type": "boolean", "default": False,
+                                     "description": "是否聚合子孙 Run 的 usage。"},
             },
             "additionalProperties": False,
         },
@@ -691,6 +699,7 @@ TOOLS = [
                          "description": "记忆类型（默认 lesson）。"},
                 "key": {"type": "string", "description": "可选键名，便于精确召回。"},
                 "tags": {"type": "string", "description": "可选标签串（空格分隔），参与关键词检索。"},
+                "source": {"type": "string", "description": "来源标记（可选）。"},
                 "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
             },
             "required": ["content"],
@@ -731,8 +740,9 @@ TOOLS = [
                 "message": {"type": "string", "description": "消息正文。"},
                 "msg_type": {"type": "string", "description": "消息类型（message/proposal/artifact）。"},
                 "payload": {"type": "object", "description": "可选结构化载荷。"},
+                "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
             },
-            "required": ["message"],
+            "required": ["message", "from_agent_id"],
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": False},
@@ -744,10 +754,12 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "team": {"type": "string", "description": "团队隔离标识（默认 default）。"},
-                "agent_id": {"type": "integer", "description": "收取者 Agent ID（空则获取广播）。"},
+                "agent_id": {"type": "integer", "description": "收取者 Agent ID。"},
                 "unread_only": {"type": "boolean", "default": True, "description": "是否仅收取未读消息。"},
                 "limit": {"type": "integer", "default": 20, "description": "拉取条数上限。"},
+                "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
             },
+            "required": ["agent_id"],
             "additionalProperties": False,
         },
         "annotations": {"readOnlyHint": True},
@@ -764,6 +776,8 @@ TOOLS = [
                 "proposal": {"type": "string", "description": "提案内容（action=propose 时必填）。"},
                 "vote": {"type": "boolean", "description": "赞成(true)或反对(false)（action=vote 时填）。"},
                 "reason": {"type": "string", "description": "投票理由。"},
+                "topic": {"type": "string", "description": "投票主题（可选）。"},
+                "session_id": {"type": "string", "description": "会话隔离键；缺省用宿主会话。"},
             },
             "required": ["team", "action"],
             "additionalProperties": False,
@@ -944,6 +958,8 @@ def _persist_workspaces(tasks: list[dict[str, Any]], base_dir: str | None) -> No
         return
     state_dir = state_dir_from_env()
     state_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(state_dir, 0o700)
     ws_file = state_dir / "workspaces.json"
     existing: dict[str, Any] = {}
     if ws_file.is_file():
@@ -957,9 +973,19 @@ def _persist_workspaces(tasks: list[dict[str, Any]], base_dir: str | None) -> No
         by_id[w["id"]] = w
     merged = {"workspaces": list(by_id.values())}
     tmp = ws_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(merged, ensure_ascii=False,
-                              separators=(",", ":")), encoding="utf-8")
+    payload = json.dumps(merged, ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+    if os.name == "nt":
+        tmp.write_bytes(payload)
+    else:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
     os.replace(tmp, ws_file)
+    if os.name != "nt":
+        os.chmod(ws_file, 0o600)
 
 
 # 本地工具注册表：name → (实现, 是否常驻保留)
@@ -1231,8 +1257,17 @@ def _ensure_token_file() -> str:
     if not token:
         token = uuid.uuid4().hex
         DAEMON_JSON.parent.mkdir(parents=True, exist_ok=True)
-        DAEMON_JSON.write_text(json.dumps({"token": token}), encoding="utf-8")
         if os.name != "nt":
+            os.chmod(DAEMON_JSON.parent, 0o700)
+        payload = json.dumps({"token": token}).encode("utf-8")
+        if os.name == "nt":
+            DAEMON_JSON.write_bytes(payload)
+        else:
+            fd = os.open(str(DAEMON_JSON), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
             os.chmod(DAEMON_JSON, 0o600)
     return token
 
@@ -1246,7 +1281,15 @@ def _spawn_detached(command: list[str], *, env: dict[str, str] | None = None) ->
     err_log = STATE_DIR / "daemon.err.log"
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            os.chmod(STATE_DIR, 0o700)
+        # SEC-H1/H2: err 日志 0600（含诊断，不对外）
+        if os.name != "nt" and not err_log.exists():
+            fd = os.open(str(err_log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            os.close(fd)
         err_fh = err_log.open("a", encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(err_log, 0o600)
     except Exception:
         err_fh = subprocess.DEVNULL
     kwargs: dict[str, Any] = dict(env=env, stdin=subprocess.DEVNULL,
@@ -1406,22 +1449,77 @@ def _daemon_post(path: str, payload: dict[str, Any],
     return out
 
 
+def _schema_props(name: str) -> dict[str, Any]:
+    for tool in TOOLS:
+        if tool.get("name") == name:
+            schema = tool.get("inputSchema") or {}
+            return schema.get("properties") or {}
+    return {}
+
+
+def _strip_unknown_args(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """D9b: 按 inputSchema properties 裁掉未知键（防额外字段穿透 daemon）。"""
+    props = _schema_props(name)
+    if not props:
+        return dict(arguments)
+    return {k: v for k, v in arguments.items() if k in props}
+
+
+# J3: 变更类工具短 TTL 内容去重（防 MCP 重试双执行）；有 store 时优先 v4 信封
+_MUTATING_TOOLS = frozenset({
+    "spawn_agent", "followup_task", "steer_agent", "interrupt_agent",
+    "send_message", "orchestrate_task",
+})
+_DEDUP_TTL_SECONDS = 5.0
+_dedup_lock = threading.Lock()
+_dedup_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _dedup_check(key: str) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _dedup_lock:
+        for k in [k for k, (ts, _) in _dedup_cache.items() if now - ts > _DEDUP_TTL_SECONDS]:
+            del _dedup_cache[k]
+        hit = _dedup_cache.get(key)
+        return dict(hit[1]) if hit else None
+
+
+def _dedup_put(key: str, result: dict[str, Any]) -> None:
+    with _dedup_lock:
+        _dedup_cache[key] = (time.monotonic(), dict(result))
+
+
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     # 策略 enforcement 位于 daemon（spawn/usage 数据源同进程，H1/H2 修复）：
     # spawn/steer/orchestrate 由 daemon Dispatcher.spawn 拦截；这里不再本地评估。
     # 本地直算工具（零 token、不 spawn、不走 daemon）：estimate_complexity 等
     local = _LOCAL_TOOLS.get(name)
     if local is not None:
-        return local(arguments)
+        return local(_strip_unknown_args(name, arguments))
     path = _DAEMON_PATHS.get(name)
     if path is None:
         raise ValueError(f"unknown tool: {name}")
-    payload = dict(arguments)
+    payload = _strip_unknown_args(name, dict(arguments))
+    # SEC-H4: 客户端传空 session_id 不得绕过隔离——覆盖为真实会话
+    if "session_id" in payload and not payload.get("session_id"):
+        payload.pop("session_id", None)
     if name == "list_agents" and payload.pop("include_other_sessions", False):
-        # 跨会话找回：session_id 置 None → daemon 返回所有会话的 agent
+        # 跨会话找回：session_id 置 None + 显式开关 → daemon 返回所有会话的 agent
         payload["session_id"] = None
+        payload["include_other_sessions"] = True
     else:
         payload.setdefault("session_id", _session_id())
+    # J3: 变更类工具 5s 内容去重（tool+args+session 哈希）
+    dedup_key: str | None = None
+    if name in _MUTATING_TOOLS:
+        dedup_key = hashlib.sha256(
+            json.dumps({"t": name, "p": payload}, sort_keys=True,
+                       ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+        hit = _dedup_check(dedup_key)
+        if hit is not None:
+            out = dict(hit)
+            out["_idempotency"] = "dedup"
+            return out
     # wait_agent 阻塞时长可自定义（上限 MAX_WAIT_SECONDS）：HTTP 层超时同步叠加余量，
     # 避免 daemon 仍在等待时 MCP→daemon 请求先被 _HTTP_TIMEOUT 掐断。
     http_timeout: float | None = None
@@ -1429,7 +1527,11 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         # 默认 25s（≤ MCP 客户端 ~30s 截断上限），避免长轮询被宿主截断
         wait = min(max(float(payload.get("timeout") or 25), 1), MAX_WAIT_SECONDS)
         http_timeout = _HTTP_TIMEOUT + wait
-    return _daemon_post(path, payload, http_timeout=http_timeout)
+    result = _daemon_post(path, payload, http_timeout=http_timeout)
+    if (dedup_key is not None and isinstance(result, dict)
+            and result.get("status") != "error"):
+        _dedup_put(dedup_key, result)
+    return result
 
 
 def handle(request: dict[str, Any], *, emit=send) -> None:

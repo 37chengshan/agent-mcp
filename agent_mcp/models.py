@@ -193,6 +193,25 @@ GOAL_PAUSED = "paused"
 GOAL_COMPLETED = "completed"
 GOAL_STATUSES = frozenset({GOAL_ACTIVE, GOAL_PAUSED, GOAL_COMPLETED})
 
+# Goal 状态机：completed 为终态，拒绝 completed→active 等非法迁移
+GOAL_TRANSITIONS: dict[str, frozenset[str]] = {
+    GOAL_ACTIVE: frozenset({GOAL_PAUSED, GOAL_COMPLETED}),
+    GOAL_PAUSED: frozenset({GOAL_ACTIVE, GOAL_COMPLETED}),
+    GOAL_COMPLETED: frozenset(),
+}
+
+
+def goal_transition(current: str, target: str) -> str:
+    """Goal 状态机唯一合法转移；completed 终态不可再激活（Invariant 4）。"""
+    if current not in GOAL_STATUSES:
+        raise ValueError(f"invalid goal status: {current}")
+    if target not in GOAL_STATUSES:
+        raise ValueError(f"invalid goal status: {target}")
+    allowed = GOAL_TRANSITIONS.get(current, frozenset())
+    if target not in allowed:
+        raise ValueError(f"invalid goal transition: {current} -> {target}")
+    return target
+
 
 def goal_should_continue(
     goal: dict[str, Any],
@@ -259,15 +278,18 @@ class IntervalSpec:
             hours = IntervalSpec._expand(hour_f, 0, 23)
             doms = IntervalSpec._expand(dom_f, 1, 31)
             mons = IntervalSpec._expand(mon_f, 1, 12)
-            dows = IntervalSpec._expand(dow_f, 0, 6)
+            dows = IntervalSpec._expand(dow_f, 0, 7)  # 标准 cron 允许 0-7（0/7=Sunday）
+            dows = frozenset(0 if d == 7 else d for d in dows)
         except (ValueError, KeyError):
             return None
         cur = ref.replace(second=0, microsecond=0)
         for _ in range(366 * 24 * 60):  # 有界搜索（一年）
+            # 标准 cron DOW：Sunday=0 … Saturday=6；datetime.weekday() 是 Monday=0
+            cron_dow = (cur.weekday() + 1) % 7
             if (
                 cur.month in mons
                 and cur.day in doms
-                and cur.weekday() in dows
+                and cron_dow in dows
                 and cur.hour in hours
                 and cur.minute in minutes
             ):
@@ -338,11 +360,14 @@ def assert_harness_kind(kind: str) -> None:
         raise ValueError(f"invalid harness kind: {kind!r}; allowed={sorted(HARNESS_KINDS)}")
 
 
-def assert_refine_target_allowed(item: dict[str, Any] | None, *, op: str) -> None:
-    """Invariant 7：refine 只允许操作 harness 表内非 base 条目；op 白名单。"""
+def assert_refine_target_allowed(item: dict[str, Any] | None, *, op: str,
+                                 target_id: str | None = None) -> None:
+    """Invariant 7：refine 只允许操作 harness 表内非 base 条目；op 白名单。
+    target_id 显式传入时（create 无 item）同样拒绝 base-system-prompt。"""
     if op not in ("create", "update", "delete"):
         raise ValueError(f"invalid refine op: {op!r}")
-    if item is not None and item.get("id") == BASE_PROMPT_ID:
+    resolved = target_id or (item.get("id") if item is not None else None)
+    if resolved == BASE_PROMPT_ID:
         raise ValueError("base system prompt is immutable")
     if item is not None:
         assert_harness_kind(str(item.get("kind", "")))

@@ -32,7 +32,7 @@ def test_container_sandbox_builder():
     assert "--read-only" in wrapped
     assert "--network" in wrapped
     assert "none" in wrapped
-    assert "-v" in wrapped
+    assert "--mount" in wrapped
     assert "claude" in wrapped
 
 

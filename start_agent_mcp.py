@@ -37,6 +37,32 @@ def daemon_command(state_dir: Path, port: int = DEFAULT_PORT) -> list[str]:
             "--web-root", str(ROOT / "web")]
 
 
+def write_bootstrap_html(state_dir: Path, base_url: str, token: str) -> Path:
+    """SEC-H3: 0600 bootstrap 页，meta/script 跳到 /#token=...。
+    浏览器 argv 只含文件路径，绝不含 token。"""
+    target = f"{base_url}/#token={urllib.parse.quote(token, safe='')}"
+    # 目标 URL 里 token 仅出现在 fragment；html.escape 防属性注入
+    import html as _html
+    page = (
+        "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">"
+        f"<meta http-equiv=\"refresh\" content=\"0;url={_html.escape(target, quote=True)}\">"
+        f"<script>location.replace({json.dumps(target)});</script>"
+        "</head><body>Redirecting…</body></html>\n"
+    )
+    path = state_dir / "bootstrap.html"
+    payload = page.encode("utf-8")
+    if os.name == "nt":
+        path.write_bytes(payload)
+    else:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+    return path
+
+
 def browser_command(url: str) -> list[str]:
     if os.name == "nt":
         return ["cmd", "/c", "start", "", url]
@@ -73,6 +99,8 @@ def start_daemon(state_dir: Path, port: int = DEFAULT_PORT) -> bool:
     if is_healthy(base_url, read_token(state_dir)):
         return False
     state_dir.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(state_dir, 0o700)
     kwargs: dict[str, object] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
@@ -161,16 +189,16 @@ def main(argv: list[str] | None = None) -> int:
     if not is_healthy(base_url, token):
         print(json.dumps({"status": "error", "summary": "Agent MCP daemon did not become healthy."}))
         return 1
-    url = f"{base_url}/#token={urllib.parse.quote(token, safe='')}"
-    # Only open the browser when the daemon was actually started this call.
-    # If the daemon was already running, the monitoring page is already open
-    # (or was opened by the first start), so skip to avoid stacking tabs.
+    # SEC-H3: 打开 bootstrap.html（0600），argv 不携带 token；页面跳转到 /#token=
     open_browser = args.open and started
-    if open_browser:
-        subprocess.Popen(browser_command(url), stdout=subprocess.DEVNULL,
+    if open_browser and token:
+        boot = write_bootstrap_html(args.state_dir, base_url, token)
+        # file:// 路径不含密钥；token 只存在于 0600 文件内容与 URL fragment
+        subprocess.Popen(browser_command(boot.resolve().as_uri() if os.name == "nt"
+                                         else str(boot.resolve())),
+                         stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
     # 不把含 #token= 的完整 URL 打进 stdout（终端捕获/CI 日志会落盘明文）。
-    # 浏览器打开时 token 已走 URL fragment；already_running 只给无 token 的 base。
     reported_url = f"{base_url}/"
     print(json.dumps({
         "status": "started" if started else "already_running",

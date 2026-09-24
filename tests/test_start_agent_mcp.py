@@ -82,4 +82,11 @@ def test_launcher_open_opens_browser_when_started(monkeypatch, tmp_path, capsys)
     assert "hint" in payload
     assert token not in json.dumps(payload)
     assert len(opened) == 1
-    assert token in opened[0][-1]
+    # SEC-H3: argv 是 bootstrap.html 路径，不含 token；token 在 0600 文件内容里
+    boot_path = opened[0][-1]
+    assert "bootstrap.html" in boot_path
+    assert token not in boot_path
+    from pathlib import Path as _P
+    boot = _P(boot_path)
+    assert boot.is_file()
+    assert token in boot.read_text(encoding="utf-8")

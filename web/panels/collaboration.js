@@ -1,40 +1,31 @@
 /* ============================================================
  * Agent MCP · 协作泳道面板
  * 纵向泳道列表（每个 agent 一条：agent_id / cli / status / 活动摘要），
- * 数据源：GET /api/agents/list + GET /api/agents/activity；
- * SSE：agent.* 命名事件（现有格式 {seq,agent_id,payload}）实时更新状态，
- *      review_requested 事件（data 内嵌 type）高亮"审查请求"卡片。
- * 导出接口：{ mount(container, sse), unmount() }，由 loader.js 组装。
+ * 数据源：POST /api/agents/list {fields:"all"}（回退 GET ?fields=all / GET）
+ *        + GET /api/snapshot 元数据补全 + GET /api/agents/activity。
+ * SSE：agent.* 命名事件实时更新状态与 CLI（spawned/activity 合并）。
+ * review_requested 无生产者时不造假数据 —— 仅在有真实卡片时渲染，
+ * 否则显示「等待审查事件」。
+ * import 版本必须与 loader.js PANEL_V 一致。
  * ============================================================ */
+
+import { esc, fmtTime, apiFetch, apiPost, cliColor, emptyState, errorState,
+         isDeadEvent, toast } from "./components.js?v=v7";
 
 const AGENT_EVENTS = [
   "agent.spawned","agent.user_turn","agent.running","agent.message","agent.message_delta",
-  "agent.tool_use","agent.tool_result","agent.usage","agent.thread_message_sent",
-  "agent.thread_message_received","agent.idle","agent.terminated","agent.error",
+  "agent.tool_use","agent.tool_result","agent.usage",
+  "agent.terminated","agent.error",
   "agent.cancelled","agent.orphaned","agent.needs_advisor","agent.verify_failed",
   "agent.verify_passed","agent.budget_downgrade","agent.ingest_failed",
+  // 死事件（无生产者，UI 不等待）：agent.thread_message_sent / _received / agent.idle
+  // 见 components.js DEAD_EVENTS —— 订阅侧仍注册以便将来启用，入列前过滤。
 ];
-const MAX_ACTIVITY = 20;   // 每个泳道保留的活动条目上限
-const MAX_REVIEWS = 3;     // 每个泳道保留的审查卡片上限
-const DIFF_MAX = 140;      // diff 预览截断长度
+const MAX_ACTIVITY = 20;
+const MAX_REVIEWS = 3;
+const DIFF_MAX = 140;
 
-/* ---------- 小工具 ---------- */
-
-function esc(v){
-  return String(v ?? "").replace(/[&<>"']/g,
-    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-}
-
-function fmtTime(ts){
-  if(ts==null)return "";
-  const n = (typeof ts === "number" || /^\d+$/.test(String(ts))) ? Number(ts) : Date.parse(ts);
-  if(!Number.isFinite(n)) return String(ts);
-  const d = new Date(n);
-  const p = x => String(x).padStart(2,"0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
-
-/* 状态 → 中文标签 / 徽章类（与 index.html 的 statusLabel/statusColor 对齐） */
+/* 状态 → 中文标签 / 徽章类 */
 const STATUS_LABEL = {
   running:"运行中", terminated:"完成", queued:"排队", error:"失败", cancelled:"已取消",
   incomplete:"超时/失联", needs_advisor:"需决策", idle:"空闲", reviewing:"审查中",
@@ -45,13 +36,6 @@ function statusClass(s){
        : s==="needs_advisor" ? "warn" : s==="reviewing" ? "warn" : "soft";
 }
 
-/* CLI → 品牌色（与 index.html 的 cliColor 对齐） */
-const CLI_COLORS = {
-  grok:"var(--grok,#C9A34F)", opencode:"var(--opencode,#6FA587)",
-  omp:"var(--omp,#9A8EDA)", atomcode:"var(--atomcode,#5A9CD6)",
-};
-function cliColor(cli){ return CLI_COLORS[String(cli||"").toLowerCase()] || "var(--claude,#C87A5A)"; }
-
 /* agent.* 事件 → 活动摘要文本 */
 function eventText(type, payload){
   const p = payload || {};
@@ -60,13 +44,13 @@ function eventText(type, payload){
     case "agent.user_turn":          return "用户回合";
     case "agent.running":            return "开始运行";
     case "agent.message":            return p.text || p.message || "新消息";
-    case "agent.message_delta":      return null; // 增量流式文本，不逐条入泳道
+    case "agent.message_delta":      return null;
     case "agent.tool_use":           return "▸ 工具 " + (p.name || "tool");
     case "agent.tool_result":        return "工具结果" + (p.name ? " " + p.name : "") + (p.ok === false ? " 失败" : "");
     case "agent.usage":              return "用量 " + (p.tokens != null ? p.tokens + " tok" : "");
-    case "agent.thread_message_sent":return "线程消息已发送";
-    case "agent.thread_message_received": return "收到线程消息";
-    case "agent.idle":               return "空闲等待";
+    case "agent.thread_message_sent":return null; // 死事件
+    case "agent.thread_message_received": return null;
+    case "agent.idle":               return null;
     case "agent.terminated":         return "完成" + (p.stop_reason ? " · " + p.stop_reason : "");
     case "agent.error":              return "错误：" + (p.error || p.message || "未知");
     case "agent.cancelled":          return "已取消";
@@ -76,84 +60,104 @@ function eventText(type, payload){
     case "agent.verify_passed":      return "验证通过";
     case "agent.budget_downgrade":   return "预算降级";
     case "agent.ingest_failed":      return "上下文注入失败";
-    default:                         return type.replace(/^agent\./, "");
+    default:                         return String(type || "").replace(/^agent\./, "");
   }
 }
 
-/* ---------- 模块状态（loader 每次 mount 重新初始化） ---------- */
+/* ---------- 模块状态 ---------- */
 
-let root = null;        // 面板根元素
-let lanes = null;       // Map<agentId, lane 对象>
-let unsubs = null;      // Set<() => void> SSE 退订函数
+let root = null;
+let lanes = null;
+let unsubs = null;
 let disposed = true;
+let visible = true;
+let renderPending = false;
+let filter = "all";
+let hasAnyReview = false;
 
-/* ---------- 数据获取（对后端响应形状做防御性归一化） ---------- */
+/* ---------- 数据归一化 ---------- */
 
 function normalizeAgent(a){
+  if(!a || typeof a !== "object") return null;
   return {
-    id: String(a.id ?? a.agent_id ?? a.agentId ?? "?"),
-    cli: a.cli || "?",
+    id: String(a.id ?? a.agent_id ?? a.agentId ?? ""),
+    cli: a.cli || a.target_cli || "",
     status: a.status || "idle",
     task: a.task_name || a.task || a.name || "",
-    created_at: a.created_at || a.created || null,
+    created_at: a.created_at || a.created || a.started_at || null,
+    stop_reason: a.stop_reason || "",
   };
 }
 
 function normalizeActivity(x){
   const p = x.payload || {};
   return {
-    agent_id: String(x.agent_id ?? x.id ?? p.agent_id ?? "?"),
+    agent_id: String(x.agent_id ?? x.id ?? p.agent_id ?? ""),
     type: x.type || x.event || x.kind || "event",
     ts: x.ts ?? x.time ?? x.created_at ?? x.updated_at ?? Date.now(),
     text: x.text ?? x.message ?? x.summary ?? "",
     tool: x.tool ?? x.name ?? p.name ?? p.tool ?? "",
+    cli: x.cli || p.cli || p.target_cli || "",
+    seq: x.seq,
   };
 }
 
-/* ---------- 认证（与 index.html 同约定：URL hash #token=） ---------- */
-
-function authToken(){
-  // 优先 daemon 注入的全局 token（index 页注入 window.__amToken），回退 URL hash
-  if(window.__amToken) return window.__amToken;
-  const m = (location.hash || "").match(/token=([^&]+)/);
-  return m ? decodeURIComponent(m[1]) : "";
+function extractList(d){
+  if(Array.isArray(d)) return d;
+  return d.agents || d.list || d.data || [];
 }
 
-async function fetchAgents(){
-  const headers = {};
-  const t = authToken();
-  if(t) headers["X-Auth-Token"] = t;
-  const r = await fetch("/api/agents/list", {headers});
-  if(!r.ok) throw new Error("agents/list HTTP " + r.status);
-  const d = await r.json().catch(() => ({}));
-  const list = Array.isArray(d) ? d : (d.agents || []);
-  return (list || []).map(normalizeAgent);
+async function fetchAgentsFull(){
+  // 1) POST fields=all（P3 全量：含 cli / created_at）
+  try{
+    const d = await apiPost("/api/agents/list", { fields: "all" });
+    const list = extractList(d).map(normalizeAgent).filter(Boolean);
+    if(list.length) return list;
+  }catch{ /* fall through */ }
+  // 2) GET ?fields=all（后端若支持 query）
+  try{
+    const d = await apiFetch("/api/agents/list?fields=all");
+    const list = extractList(d).map(normalizeAgent).filter(Boolean);
+    if(list.length) return list;
+  }catch{ /* fall through */ }
+  // 3) GET 默认轻量字段
+  try{
+    const d = await apiFetch("/api/agents/list");
+    return extractList(d).map(normalizeAgent).filter(Boolean);
+  }catch(err){
+    throw err;
+  }
+}
+
+async function fetchSnapshotAgents(){
+  try{
+    const d = await apiFetch("/api/snapshot");
+    return extractList(d).map(normalizeAgent).filter(Boolean);
+  }catch{ return []; }
 }
 
 async function fetchActivity(){
-  const headers = {};
-  const t = authToken();
-  if(t) headers["X-Auth-Token"] = t;
-  const r = await fetch("/api/agents/activity", {headers});
-  if(!r.ok) throw new Error("agents/activity HTTP " + r.status);
-  const d = await r.json().catch(() => ({}));
-  const list = Array.isArray(d) ? d : (d.activity || d.events || []);
-  return (list || []).map(normalizeActivity);
+  try{
+    const d = await apiFetch("/api/agents/activity");
+    const list = Array.isArray(d) ? d : (d.activity || d.events || []);
+    return (list || []).map(normalizeActivity).filter(x => x.agent_id && !isDeadEvent(x.type));
+  }catch{ return []; }
 }
 
 /* ---------- 渲染 ---------- */
 
 function laneEl(id){
   const lane = lanes.get(id);
+  const cli = lane.cli || "—";
   const head = `<div class="am-swimlane-head">
       <span class="am-lane-id">#${esc(id)}</span>
-      <span class="am-cli" style="background:${cliColor(lane.cli)}">${esc(lane.cli)}</span>
+      <span class="am-cli" style="background:${cliColor(lane.cli)}" title="${esc(lane.cli || "CLI 未知")}">${esc(cli)}</span>
       <span class="am-badge ${statusClass(lane.status)}">${esc(statusLabel(lane.status))}</span>
     </div>
     <div class="am-lane-task" title="${esc(lane.task)}">${esc(lane.task) || '<span class="am-empty">（无任务描述）</span>'}</div>`;
 
-  // 审查请求卡片（最新在前）
-  const reviews = lane.reviews.map(rv => `
+  // 审查卡片：有真实事件才渲染（review_requested 当前无生产者，不造假）
+  const reviews = lane.reviews.length ? lane.reviews.map(rv => `
     <div class="am-review${rv.flash ? " flash" : ""}" title="diff 预览：${esc(rv.diff)}">
       <div class="am-rev-title">审查请求</div>
       <div class="am-rev-flow">
@@ -163,19 +167,15 @@ function laneEl(id){
         <span class="am-rev-agent">#${esc(id)}</span>
       </div>
       <div class="am-diff">${esc(rv.diff)}</div>
-    </div>`).join("");
+    </div>`).join("") : "";
 
-  // 活动摘要：最新一条
   const last = lane.activity[0];
   const act = last ? `<div class="am-lane-act">${
       last.type === "agent.running" ? '<span class="am-dot-live"></span>' : ""
     }${esc(fmtTime(last.ts))} · ${esc(last.text)}</div>` : "";
 
-  return `<div class="am-swimlane ${lane.status === "running" ? "run" : ""}" data-id="${esc(id)}">${head}${reviews}${act}</div>`;
+  return `<div class="am-swimlane ${lane.status === "running" ? "run" : ""} am-row-in" data-id="${esc(id)}">${head}${reviews}${act}</div>`;
 }
-
-/* 过滤器：all / running / done / bad */
-let filter = "all";
 
 function render(){
   if(disposed || !root) return;
@@ -190,15 +190,22 @@ function render(){
 
   const ids = [...lanes.values()]
     .filter(filterFn)
-    .sort((a,b) => (b.created_at || 0) < (a.created_at || 0) ? -1
-                  : (b.created_at || 0) > (a.created_at || 0) ? 1
-                  : String(a.id).localeCompare(String(b.id), "zh"))
+    .sort((a,b) => {
+      const ta = Date.parse(a.created_at || "") || 0;
+      const tb = Date.parse(b.created_at || "") || 0;
+      return tb - ta || String(a.id).localeCompare(String(b.id), "zh");
+    })
     .map(l => l.id);
+
+  const box = root.querySelector(".am-swimlanes");
   if(!ids.length){
-    root.querySelector(".am-swimlanes").innerHTML = '<div class="am-empty">暂无 agent 泳道，等待派发…</div>';
+    box.innerHTML = emptyState("暂无 agent 泳道，等待派发…");
     return;
   }
-  root.querySelector(".am-swimlanes").innerHTML = `<div class="am-swimlanes">${ids.map(laneEl).join("")}</div>`;
+  const reviewHint = hasAnyReview ? "" :
+    `<div class="am-review-pending" title="review_requested 事件当前无生产者">等待审查事件</div>`;
+  // 注意：不再嵌套 .am-swimlanes（此前会双重套壳）
+  box.innerHTML = reviewHint + ids.map(laneEl).join("");
 }
 
 function bindFilter(){
@@ -209,17 +216,13 @@ function bindFilter(){
     const btn = e.target.closest("button[data-f]");
     if(!btn) return;
     filter = btn.dataset.f;
-    box.querySelectorAll("button").forEach(b => b.classList.toggle("active", b === btn));
+    box.querySelectorAll("button").forEach(b => {
+      b.classList.toggle("active", b === btn);
+      b.setAttribute("aria-pressed", b === btn ? "true" : "false");
+    });
     render();
   });
 }
-
-/* 面板数据量小（泳道最多几十条），直接同步渲染；
- * 不使用 requestAnimationFrame 节流——后台 tab / 隐藏窗口会暂停
- * rAF，导致渲染永久冻结。隐藏面板（切到其他分页）时只标记 pending，
- * 切回时一次渲染（v2 loader 可见性通知）。 */
-let visible = true;
-let renderPending = false;
 
 function scheduleRender(){
   if(disposed) return;
@@ -229,20 +232,22 @@ function scheduleRender(){
 
 export function setVisible(v){
   visible = !!v;
-  if(visible && renderPending){ renderPending = false; render(); }
+  if(visible && renderPending){ renderPending = false; lastFpForce(); render(); }
 }
+function lastFpForce(){ /* 占位：泳道无指纹，切回直接渲染 */ }
 
 /* ---------- 状态更新 ---------- */
 
 function upsertLane(agent){
+  if(!agent || !agent.id) return null;
   let lane = lanes.get(agent.id);
   if(!lane){
-    lane = { id: agent.id, cli: agent.cli, status: agent.status, task: agent.task,
-             created_at: agent.created_at, activity: [], reviews: [] };
+    lane = { id: agent.id, cli: agent.cli || "", status: agent.status || "idle",
+             task: agent.task || "", created_at: agent.created_at || null,
+             activity: [], reviews: [] };
     lanes.set(agent.id, lane);
   }
-  // 已存在则合并可更新的字段（SSE 可能先于 list 返回）
-  if(agent.cli && agent.cli !== "?") lane.cli = agent.cli;
+  if(agent.cli) lane.cli = agent.cli;
   if(agent.task) lane.task = agent.task;
   if(agent.status) lane.status = agent.status;
   if(agent.created_at) lane.created_at = agent.created_at;
@@ -252,45 +257,49 @@ function upsertLane(agent){
 function pushActivity(agentId, entry){
   const lane = lanes.get(agentId);
   if(!lane) return;
-  // M3：按 seq 幂等去重（重连重放后同一事件只入列一次）
   if(entry.seq != null){
     const dup = lane.activity.some(a => a.seq === entry.seq);
     if(dup) return;
   }
+  if(isDeadEvent(entry.type)) return;
   lane.activity.unshift(entry);
   if(lane.activity.length > MAX_ACTIVITY) lane.activity.length = MAX_ACTIVITY;
 }
 
-/* SSE：agent.* 命名事件（data = {seq, agent_id, payload}，无内嵌 type） */
 function onAgentEvent(type, data){
+  if(isDeadEvent(type)) return;
   const payload = data.payload || {};
   const aid = String(data.agent_id ?? payload.agent_id ?? "");
-  if(!aid || !lanes.has(aid)) return;
+  if(!aid) return;
+  // SSE 可能先于 list 返回 → 建占位泳道，并尽量补 CLI
+  if(!lanes.has(aid)){
+    upsertLane({ id: aid, cli: payload.cli || payload.target_cli || "", status: "running", task: payload.task_name || "" });
+  }
   const lane = lanes.get(aid);
+  if(!lane) return;
+  if(payload.cli || payload.target_cli) lane.cli = payload.cli || payload.target_cli;
+  if(payload.task_name || payload.task) lane.task = payload.task_name || payload.task;
   if(type === "agent.running") lane.status = "running";
   else if(type === "agent.terminated") lane.status = payload.stop_reason === "timeout" ? "incomplete" : "terminated";
   else if(type === "agent.error") lane.status = "error";
   else if(type === "agent.cancelled") lane.status = "cancelled";
   else if(type === "agent.orphaned") lane.status = "incomplete";
   else if(type === "agent.needs_advisor") lane.status = "needs_advisor";
-  else if(type === "agent.idle") lane.status = "idle";
-  // agent.message_delta 为高频打字机增量（终态 message 已含全文），
-  // 入活动列表只会触发无意义的全量重绘 → 忽略（性能/防闪烁）
+  else if(type === "agent.spawned" && !lane.task && payload.task_name) lane.task = payload.task_name;
   if(type === "agent.message_delta") return;
   const text = eventText(type, payload);
-  if(text) pushActivity(aid, { type, ts: payload.ts ?? data.ts ?? Date.now(), text, seq: data.seq });
+  if(text) pushActivity(aid, { type, ts: payload.ts ?? data.ts ?? Date.now(), text, seq: data.seq, cli: lane.cli });
   scheduleRender();
 }
 
-/* SSE：review_requested（data 内嵌 type 字段的通用格式） */
 function onReviewRequested(data){
   const payload = data.payload || {};
   const aid = String(data.agent_id ?? payload.agent_id ?? payload.writer_agent_id ?? "");
   const diff = truncateDiff(payload.diff_preview || payload.diff || "");
-  // agent 未知时先建一条泳道（字段可能不全）
-  if(aid && !lanes.has(aid)) upsertLane({ id: aid, cli: payload.writer_cli || "?", status: "reviewing", task: payload.task || "" });
+  if(aid && !lanes.has(aid)) upsertLane({ id: aid, cli: payload.writer_cli || "", status: "reviewing", task: payload.task || "" });
   if(!aid) return;
   const lane = lanes.get(aid);
+  hasAnyReview = true;
   lane.reviews.unshift({
     writer_cli: payload.writer_cli || "writer",
     reviewer_cli: payload.reviewer_cli || "reviewer",
@@ -302,23 +311,22 @@ function onReviewRequested(data){
 
 function truncateDiff(text){
   const s = String(text || "");
-  const lines = s.split("\n").slice(0, 3);          // 最多保留 3 行
+  const lines = s.split("\n").slice(0, 3);
   let out = lines.join("\n");
   if(out.length > DIFF_MAX) out = out.slice(0, DIFF_MAX);
   if(out.length < s.length) out += "\n…";
   return out;
 }
 
-/* ---------- SSE 订阅：命名事件 + message 内嵌 type 双通道去重 ---------- */
+/* ---------- SSE 订阅 ---------- */
 
 function subscribe(sse, type, fn){
-  // 命名事件通道：data 不含 type 字段时处理（兼容现有 agent.* 格式）
+  if(!sse) return;
   const named = ev => {
     let d; try { d = JSON.parse(ev.data); } catch { return; }
     if(!d || d.type) return;
     fn(d, ev);
   };
-  // message 通道：data.type 匹配时处理（新事件契约格式）
   const msg = ev => {
     let d; try { d = JSON.parse(ev.data); } catch { return; }
     if(!d || d.type !== type) return;
@@ -332,10 +340,11 @@ function subscribe(sse, type, fn){
 /* ---------- 面板接口 ---------- */
 
 export function mount(container, sse, opts){
-  unmount(); // 防御：重复 mount 前先清理旧状态
+  unmount();
   disposed = false;
   visible = true;
   renderPending = false;
+  hasAnyReview = false;
   lanes = new Map();
   unsubs = new Set();
   root = document.createElement("div");
@@ -343,33 +352,54 @@ export function mount(container, sse, opts){
   root.innerHTML = `
     <div class="am-panel-hd"><span class="am-ph-title">协作泳道</span><span class="am-ph-sub">Collaboration</span>
       <span class="am-ph-ops am-collab-filters">
-        <button class="am-chip active" data-f="all">全部</button>
-        <button class="am-chip" data-f="running">运行中</button>
-        <button class="am-chip" data-f="done">完成</button>
-        <button class="am-chip" data-f="bad">异常</button>
+        <button class="am-chip active" data-f="all" aria-pressed="true">全部</button>
+        <button class="am-chip" data-f="running" aria-pressed="false">运行中</button>
+        <button class="am-chip" data-f="done" aria-pressed="false">完成</button>
+        <button class="am-chip" data-f="bad" aria-pressed="false">异常</button>
       </span>
     </div>
-    <div class="am-swimlanes"><div class="am-empty">加载泳道数据…</div></div>`;
+    <div class="am-swimlanes">${emptyState("加载泳道数据…")}</div>`;
   container.appendChild(root);
   bindFilter();
 
-  // 初始数据：list + activity 并行拉取
-  Promise.all([fetchAgents(), fetchActivity()])
-    .then(([agents, acts]) => {
+  Promise.all([fetchAgentsFull(), fetchSnapshotAgents(), fetchActivity()])
+    .then(([agents, snapAgents, acts]) => {
       if(disposed) return;
-      agents.forEach(a => { upsertLane(a); });
+      // snapshot 元数据补全 CLI / created_at
+      const byId = new Map();
+      for(const a of [...agents, ...snapAgents]){
+        if(!a.id) continue;
+        const prev = byId.get(a.id) || {};
+        byId.set(a.id, {
+          ...prev, ...a,
+          cli: a.cli || prev.cli || "",
+          task: a.task || prev.task || "",
+          created_at: a.created_at || prev.created_at || null,
+          status: a.status || prev.status || "idle",
+        });
+      }
+      byId.forEach(a => upsertLane(a));
       acts.forEach(x => {
-        if(lanes.has(x.agent_id)) pushActivity(x.agent_id, { type: x.type, ts: x.ts, text: x.text || eventText(x.type, { name: x.tool }) });
+        if(!lanes.has(x.agent_id)) upsertLane({ id: x.agent_id, cli: x.cli || "", status: "idle", task: "" });
+        if(x.cli) {
+          const lane = lanes.get(x.agent_id);
+          if(lane && !lane.cli) lane.cli = x.cli;
+        }
+        pushActivity(x.agent_id, {
+          type: x.type, ts: x.ts,
+          text: x.text || eventText(x.type, { name: x.tool }),
+          seq: x.seq,
+        });
       });
       render();
     })
     .catch(err => {
       if(disposed) return;
       const box = root.querySelector(".am-swimlanes");
-      if(box) box.innerHTML = `<div class="am-err">泳道数据加载失败：${esc(err.message)}</div>`;
+      if(box) box.innerHTML = errorState("泳道数据加载失败：" + (err.message || err));
+      toast("泳道数据加载失败：" + (err.message || err), "error");
     });
 
-  // SSE 订阅
   for(const t of AGENT_EVENTS) subscribe(sse, t, (d) => onAgentEvent(t, d));
   subscribe(sse, "review_requested", onReviewRequested);
 }

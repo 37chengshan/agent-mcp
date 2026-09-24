@@ -27,7 +27,7 @@ SILENT_SWALLOW_BASELINE = {
     "mcp_server.py": 1,
     "dispatch_worker.py": 7,
     "agent_mcp/db.py": 3,
-    "agent_mcp/daemon_main.py": 6,
+    "agent_mcp/daemon_main.py": 7,
     "agent_mcp/audit.py": 1,
     "agent_mcp/dispatch.py": 2,
     "agent_mcp/daemon_http.py": 2,

@@ -6,12 +6,8 @@
  * 接口：{ mount(container, sse), unmount() }，由 loader.js 组装。
  * ============================================================ */
 
-/* ---------- 小工具 ---------- */
-
-function esc(v){
-  return String(v ?? "").replace(/[&<>"']/g,
-    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-}
+/* import 版本必须与 loader.js PANEL_V 一致（components.js?v=v7） */
+import { esc, authHeaders, toast, emptyState, setBtnBusy } from "./components.js?v=v7";
 
 /* 状态徽章：clean/dirty/merged/discarded 配色与中文标签 */
 const STATUS_META = {
@@ -26,16 +22,9 @@ function statusMeta(s){
 /* 终态（merged/discarded）不再显示操作按钮 */
 function isTerminal(s){ return s === "merged" || s === "discarded"; }
 
-/* 鉴权 token：优先 daemon 注入的全局 token（index 页注入 window.__amToken），
- * 回退 URL hash #token=...（与 index.html 同约定） */
-function authToken(){
-  if(window.__amToken) return window.__amToken;
-  return new URLSearchParams(location.hash.slice(1)).get("token") || "";
-}
-
 async function apiFetch(path, opts){
   const r = await fetch(path, Object.assign({}, opts, {
-    headers: Object.assign({}, opts && opts.headers, { "X-Auth-Token": authToken() }),
+    headers: authHeaders(opts && opts.headers),
   }));
   const d = await r.json().catch(() => ({}));
   if(!r.ok) throw new Error(d.error || ("HTTP " + r.status));
@@ -84,7 +73,7 @@ function render(){
   renderPending = false;
   const list = [...rows.values()].map(r => r.ws);
   if(!list.length){
-    root.innerHTML = '<div class="am-empty">暂无工作区（worktree）</div>';
+    root.innerHTML = emptyState("暂无工作区（worktree）");
     return;
   }
   root.innerHTML = '<div class="am-ws"></div>';
@@ -142,6 +131,7 @@ async function onOpsClick(e){
   const id = row.dataset.id;
   const op = btn.dataset.op;
   setBusy(id, true);
+  setBtnBusy(btn, true);
   feedback(id, op === "merge" ? "正在合并…" : "正在丢弃…", false);
   try{
     const d = await apiFetch("/api/workspaces/" + op, {
@@ -151,10 +141,13 @@ async function onOpsClick(e){
     });
     if(disposed) return;
     setStatus(id, d.status || (op === "merge" ? "merged" : "discarded"), true);
+    toast(op === "merge" ? "工作区已合并" : "工作区已丢弃");
   }catch(err){
     if(disposed) return;
-    feedback(id, "失败：" + err.message, true);
+    feedback(id, "失败：" + (err.message || err), true);
+    toast("工作区操作失败：" + (err.message || err), "error");
     setBusy(id, false);
+    setBtnBusy(btn, false);
   }
 }
 
@@ -178,7 +171,8 @@ async function load(){
     render();
   }catch(err){
     if(disposed) return;
-    root.innerHTML = `<div class="am-err">工作区列表加载失败：${esc(err.message)}</div>`;
+    root.innerHTML = `<div class="am-err">工作区列表加载失败：${esc(err.message || err)}</div>`;
+    toast("工作区列表加载失败：" + (err.message || err), "error");
   }
 }
 

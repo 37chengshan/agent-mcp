@@ -166,7 +166,18 @@ def test_snapshot_returns_agents_events_usage(tmp_path):
         srv.db.upsert_usage(agent_id=aid, model="aggregate", input_tokens=10,
                             output_tokens=5, cache_creation=0, cache_read=2,
                             cost_usd=0.1)
-        status, body = _request_json(srv, "/api/snapshot?session_id=snap1&token=t")
+        status, body = _request_json(srv, "/api/snapshot?session_id=snap1")
+        assert status == 401  # SEC-H3: query token 不再认证非 SSE GET
+        status, body = _request_json(srv, "/api/snapshot?session_id=snap1")
+        # header 认证
+        import http.client as _hc
+        conn = _hc.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+        conn.request("GET", "/api/snapshot?session_id=snap1",
+                     headers={"X-Auth-Token": "t"})
+        resp = conn.getresponse()
+        body = resp.read()
+        status = resp.status
+        conn.close()
         assert status == 200
         body = json.loads(body)
         assert [a["id"] for a in body["agents"]] == [aid]
@@ -189,11 +200,25 @@ def test_snapshot_auth_and_session_filter(tmp_path):
                             cli="claude", model=None, cwd=str(tmp_path))
         status, _ = _request_json(srv, "/api/snapshot")
         assert status == 401
-        status, body = _request_json(srv, "/api/snapshot?token=t")
+        # SEC-H3: query token 不再放行非 SSE GET
+        status, _ = _request_json(srv, "/api/snapshot?token=t")
+        assert status == 401
+        import http.client as _hc
+
+        def _get(path):
+            conn = _hc.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            conn.request("GET", path, headers={"X-Auth-Token": "t"})
+            resp = conn.getresponse()
+            data = resp.read()
+            code = resp.status
+            conn.close()
+            return code, data
+
+        status, body = _get("/api/snapshot")
         assert status == 200
         body = json.loads(body)
         assert [a["task_name"] for a in body["agents"]] == ["a"]
-        status, _ = _request_json(srv, "/api/snapshot?token=t&session_id=nope")
+        status, _ = _get("/api/snapshot?session_id=nope")
         assert status == 400
     finally:
         srv.shutdown()

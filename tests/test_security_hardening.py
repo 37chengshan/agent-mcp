@@ -96,10 +96,15 @@ def test_token_priority_header_over_query(sec_srv):
     assert probe._supplied_token() == TOKEN
     assert probe._has_valid_token() is True
 
+    # SEC-H3: 非 SSE GET 不再接受 ?token=（只认 header）
     probe2, _ = make_probe(sec_srv, f"/api/snapshot?token={TOKEN}",
                            {"Host": "127.0.0.1"})
-    assert probe2._supplied_token() == TOKEN
-    assert probe2._has_valid_token() is True
+    assert probe2._supplied_token() == ""
+    assert probe2._has_valid_token() is False
+    probe3, _ = make_probe(sec_srv, f"/events?token={TOKEN}",
+                           {"Host": "127.0.0.1"})
+    assert probe3._supplied_token(allow_query=True) == TOKEN
+    assert probe3._has_valid_token(allow_query=True) is True
 
 
 def test_snapshot_requires_token(sec_srv):
@@ -112,11 +117,11 @@ def test_snapshot_requires_token(sec_srv):
                               {"X-Auth-Token": TOKEN, "Host": "127.0.0.1"})
     probe2.do_GET()
     assert cap2["error"] is None and cap2["json"] is not None
-    # query 令牌（SSE/EventSource 通道）→ 放行
+    # SEC-H3: 非 SSE 的 ?token= 不再放行
     probe3, cap3 = make_probe(sec_srv, f"/api/snapshot?token={TOKEN}",
                               {"Host": "127.0.0.1"})
     probe3.do_GET()
-    assert cap3["error"] is None
+    assert cap3["error"] is not None and cap3["error"][0] == 401
     # 错误令牌 → 401
     probe4, cap4 = make_probe(sec_srv, "/api/snapshot?token=wrong",
                               {"Host": "127.0.0.1"})
@@ -163,14 +168,23 @@ def test_index_stops_leaking_token_to_unauthenticated_requests(sec_srv):
     assert TOKEN not in html
     assert "window.__amToken=null" in html
 
-    # 携带有效令牌的请求仍能拿到注入（授权后的页面会话）
+    # SEC-H3: ?token= 不再注入；header 令牌（授权会话）仍注入
     probe2, _ = make_probe(sec_srv, f"/?token={TOKEN}", {"Host": "127.0.0.1"})
     probe2.send_response = types.MethodType(fake_send_response, probe2)  # type: ignore
     probe2.send_header = types.MethodType(fake_send_header, probe2)      # type: ignore
     probe2.end_headers = types.MethodType(fake_end, probe2)              # type: ignore
     probe2.do_GET()
     html2 = probe2.wfile.getvalue().decode("utf-8", "replace")
-    assert f"window.__amToken={json.dumps(TOKEN)}" in html2
+    assert TOKEN not in html2
+    assert "window.__amToken=null" in html2
+
+    probe3, _ = make_probe(sec_srv, "/", {"X-Auth-Token": TOKEN, "Host": "127.0.0.1"})
+    probe3.send_response = types.MethodType(fake_send_response, probe3)  # type: ignore
+    probe3.send_header = types.MethodType(fake_send_header, probe3)      # type: ignore
+    probe3.end_headers = types.MethodType(fake_end, probe3)              # type: ignore
+    probe3.do_GET()
+    html3 = probe3.wfile.getvalue().decode("utf-8", "replace")
+    assert f"window.__amToken={json.dumps(TOKEN)}" in html3
 
 
 # ---- mailbox 身份校验 ----
@@ -196,12 +210,19 @@ def test_mailbox_rejects_forged_identity(tmp_path, sec_srv):
 
 # ---- verify_command 收敛 ----
 
-def test_verify_no_longer_interprets_shell_metacharacters(tmp_path):
+def test_verify_no_longer_interprets_shell_metacharacters(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_MCP_VERIFY_ALLOW_PREFIXES", "echo")
     marker = tmp_path / "pwned.txt"
     ok, output = _run_verify(f"echo pwned > {marker}", cwd=str(tmp_path))
     # shell=False：重定向符被当作普通参数传给 echo，不会创建文件
     assert not marker.exists()
     assert "pwned" in output  # 参数被原样 echo 出来
+
+
+def test_verify_default_deny_when_allowlist_empty(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_MCP_VERIFY_ALLOW_PREFIXES", raising=False)
+    ok, out = _run_verify("echo hi", cwd=str(tmp_path))
+    assert not ok and "default-deny" in out
 
 
 def test_verify_rejects_unparseable_and_empty(tmp_path):
@@ -218,3 +239,30 @@ def test_verify_allowlist_prefix_enforced(tmp_path, monkeypatch):
     ok, out = _run_verify("pytest -q", cwd=str(tmp_path))
     # pytest 不在环境里也没关系：已通过白名单进入执行阶段（报的是执行错误而非拒绝）
     assert "allowlist" not in out
+
+
+# ---- SEC-H4/H8 空 session 拒绝 ----
+
+def test_empty_session_id_denies_mutating_ops(tmp_path, sec_srv):
+    db = sec_srv.db
+    aid = db.insert_agent(parent_id=None, session_id="sess-a", task_name="t",
+                          cli="claude")
+    disp = sec_srv.dispatcher
+    for fn, body in (
+        (disp.send_message, {"agent_id": aid, "message": "x"}),
+        (disp.followup, {"agent_id": aid, "prompt": "x"}),
+        (disp.interrupt, {"agent_id": aid}),
+    ):
+        with pytest.raises(ValueError, match="session_id is required"):
+            fn(body)
+        with pytest.raises(ValueError, match="session_id is required"):
+            fn({**body, "session_id": ""})
+    # mailbox/consensus 空 session 同样拒绝
+    with pytest.raises(ValueError, match="session_id is required"):
+        disp.mailbox_send({"team": "t", "from_agent_id": aid, "message": "x"})
+
+
+def test_verify_allowlist_required(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_MCP_VERIFY_ALLOW_PREFIXES", raising=False)
+    ok, out = _run_verify("/bin/echo hi", cwd=str(tmp_path))
+    assert not ok and "default-deny" in out

@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -78,12 +79,20 @@ CONTROL_CAPABILITIES = [
 
 # v4 信封的 method 可以是 Dispatcher 方法名（spawn/steer/...）或既有 v1 路径
 # （/api/agents/spawn），统一解析为 Dispatcher 方法。
+# SEC-M2: 只允许公开 API 方法名，拒绝 `_` 前缀与任意 hasattr 命中。
+_ALLOWED_V4_METHODS = frozenset(_API_METHODS.values()) | frozenset(_WORKSPACE_POST.values())
+
+
 def _resolve_v4_method(dispatcher: Any, method: str) -> str | None:
     if method in _API_METHODS:
         method = _API_METHODS[method]
-    if method in _WORKSPACE_POST:
+    elif method in _WORKSPACE_POST:
         method = _WORKSPACE_POST[method]
-    if method and hasattr(dispatcher, method):
+    if not method or method.startswith("_"):
+        return None
+    if method not in _ALLOWED_V4_METHODS:
+        return None
+    if hasattr(dispatcher, method):
         return method
     return None
 
@@ -149,7 +158,20 @@ def handle_v4_command(server: "DaemonHTTPServer", body: dict[str, Any]) -> tuple
     if store is None or dispatcher is None:
         return 503, {"error": "control plane not ready"}
 
+    # SEC-M1: 服务端重算 request_hash，客户端伪造 hash 一律拒绝
+    expected_hash = m.request_hash(str(method), params if isinstance(params, dict) else {})
+    if not hmac.compare_digest(str(request_hash), expected_hash):
+        return 400, {"error": "request_hash mismatch",
+                     "detail": "client-supplied request_hash does not match method+params"}
+
     existing = store.journal_get(client_id, command_id)
+    # J1: 长卡死的 recorded 视为 uncertain（只回收超龄行，不碰并发在途）
+    if existing is not None and existing.get("state") == "recorded":
+        try:
+            store.journal_recover_orphans(max_age_seconds=30.0)
+        except Exception:  # noqa: BLE001
+            pass
+        existing = store.journal_get(client_id, command_id)
     decision = m.journal_classify(existing, request_hash)
     if decision == m.JOURNAL_CONFLICT:
         return 409, {"error": "command_id_conflict",
@@ -165,10 +187,22 @@ def handle_v4_command(server: "DaemonHTTPServer", body: dict[str, Any]) -> tuple
             return 409, {"error": "command result uncertain", "state": "uncertain"}
         return 202, {"state": "in_progress"}
 
-    entry = store.journal_record(
+    entry, created = store.journal_record(
         client_id=client_id, command_id=command_id, request_hash=request_hash,
         method=method, params=params,
     )
+    if not created:
+        # J2 TOCTOU: 并发撞上既有行 → 本调用方走 replay，不执行
+        existing = entry or store.journal_get(client_id, command_id)
+        state = (existing or {}).get("state")
+        if state == "completed" and existing:
+            import json as _json
+            result = _json.loads(existing.get("result_json") or "{}") or {}
+            status = int(result.pop("_status", 200) or 200)
+            return status, dict(result, _idempotency="replay")
+        if state == "uncertain":
+            return 409, {"error": "command result uncertain", "state": "uncertain"}
+        return 202, {"state": "in_progress"}
     method_name = _resolve_v4_method(dispatcher, method)
     if method_name is None:
         store.journal_complete(client_id=client_id, command_id=command_id,
@@ -274,6 +308,10 @@ def _workspace_apply(server: "DaemonHTTPServer", body: dict[str, Any],
     path = target.get("path") or ""
     base_dir = target.get("base_dir") or ""
     branch = target.get("branch") or f"agent-{ws_id}"
+    # SEC-M5: 分支名白名单 + 禁止前导 '-'（防 git 选项注入）
+    if not re.fullmatch(r"[A-Za-z0-9._/-]+", str(branch)) or str(branch).startswith("-"):
+        raise ValueError("workspace branch name is invalid")
+    branch = str(branch)
     if not path:
         raise ValueError("workspace 缺少 path")
     # 路径归属校验（L5）：path 必须位于 base_dir 下，且 base_dir 存在
@@ -287,29 +325,40 @@ def _workspace_apply(server: "DaemonHTTPServer", body: dict[str, Any],
             if not base_dir or not Path(base_dir).is_dir():
                 raise ValueError("merge 需要有效的 base_dir（git 仓库根）")
             # 真合并：在 base 工作区 merge 分支（容忍空提交：--allow-unrelated-histories）
+            # SEC-M5: `--` 终止选项解析，防分支名被当 flag
             proc = subprocess.run(["git", "-C", base_dir, "merge", "--no-edit",
-                                   "--allow-unrelated-histories", branch],
+                                   "--allow-unrelated-histories", "--", branch],
                                   capture_output=True, text=True, timeout=120)
             if proc.returncode != 0:
                 raise RuntimeError(f"git merge 失败: {proc.stderr[:300] or proc.stdout[:300]}")
             # 合并成功 → 删除 worktree 与分支
             subprocess.run(["git", "-C", base_dir, "worktree", "remove", "--force", path],
                            capture_output=True, text=True, timeout=60)
-            subprocess.run(["git", "-C", base_dir, "branch", "-d", branch],
+            subprocess.run(["git", "-C", base_dir, "branch", "-d", "--", branch],
                            capture_output=True, text=True, timeout=60)
         else:  # discard
             subprocess.run(["git", "-C", base_dir, "worktree", "remove", "--force", path],
                            capture_output=True, text=True, timeout=60)
-            subprocess.run(["git", "-C", base_dir, "branch", "-D", branch],
+            subprocess.run(["git", "-C", base_dir, "branch", "-D", "--", branch],
                            capture_output=True, text=True, timeout=60)
     except FileNotFoundError:
         raise RuntimeError("git 不可用")
     target["status"] = action
     file_state["workspaces"] = workspaces
     tmp = ws_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(file_state, ensure_ascii=False,
-                              separators=(",", ":")), encoding="utf-8")
+    payload = json.dumps(file_state, ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+    if os.name == "nt":
+        tmp.write_bytes(payload)
+    else:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
     os.replace(tmp, ws_file)
+    if os.name != "nt":
+        os.chmod(ws_file, 0o600)
     # M2：发布 workspace_status SSE 事件（面板实时更新徽章）
     server.broadcaster.publish({"type": "workspace_status",
                                 "agent_id": ws_id,
@@ -408,25 +457,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(400, "bad host")
         return False
 
-    def _supplied_token(self) -> str:
-        """A6: 令牌提取——优先 X-Auth-Token 头；GET/SSE 无法自定义 header，
-        回退 URL ?token= 查询参数（与前端 #token= hash 通道同源的明文通道，
-        仅用于回环监控页）。"""
+    def _supplied_token(self, *, allow_query: bool = False) -> str:
+        """A6: 令牌提取——优先 X-Auth-Token 头。
+        SEC-H3: ?token= 查询通道仅保留给 EventSource SSE（/events、/api/events），
+        其余 GET/POST 一律要求 header，防 token 落进访问日志/Referer。"""
         supplied = self.headers.get("X-Auth-Token") or ""
         if supplied:
             return supplied
-        if "?" in self.path:
+        if allow_query and "?" in self.path:
             query = urllib.parse.parse_qs(self.path.split("?", 1)[1])
             values = query.get("token") or []
             if values:
                 return str(values[0])
         return ""
 
-    def _has_valid_token(self) -> bool:
-        return hmac.compare_digest(self._supplied_token(), self.server.token)
+    def _has_valid_token(self, *, allow_query: bool = False) -> bool:
+        return hmac.compare_digest(self._supplied_token(allow_query=allow_query),
+                                   self.server.token)
 
-    def _check_token(self) -> bool:
-        if self._has_valid_token():
+    def _check_token(self, *, allow_query: bool = False) -> bool:
+        if self._has_valid_token(allow_query=allow_query):
             return True
         self.send_error(401, "unauthorized")
         return False
@@ -469,15 +519,25 @@ class Handler(BaseHTTPRequestHandler):
             if self.server.dispatcher is None:
                 self._send_json(503, {"error": "dispatcher not ready"})
                 return
-            self._send_json(200, self.server.dispatcher.list_agents({}))
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            body: dict[str, Any] = {}
+            if query.get("session_id"):
+                body["session_id"] = query["session_id"][0]
+            if (query.get("include_other_sessions") or [""])[0] in ("1", "true", "yes"):
+                body["include_other_sessions"] = True
+            if query.get("fields"):
+                body["fields"] = query["fields"][0]
+            self._send_json(200, self.server.dispatcher.list_agents(body))
         elif path == "/api/agents/activity":
-            # 协作泳道活动流：无 agent_id → 按全部会话聚合（与 POST 同语义）
+            # 协作泳道活动流：无 agent_id → 按会话聚合（SEC-H8 默认非全会话）
             if not self._check_token():
                 return
             if self.server.dispatcher is None:
                 self._send_json(503, {"error": "dispatcher not ready"})
                 return
-            self._send_json(200, self.server.dispatcher.activity({}))
+            query = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            body = {k: (v[0] if len(v) == 1 else v) for k, v in query.items()}
+            self._send_json(200, self.server.dispatcher.activity(body))
         elif path == "/api/usage/series":
             # 趋势图数据源：按小时 token/成本聚合（token 保护）
             if not self._check_token():
@@ -505,13 +565,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._dispatch_get("schedule_list")
         elif path == "/events":
-            # A6：SSE 纳入鉴权（EventSource 走 ?token= 查询通道）
-            if not self._check_token():
+            # A6+SSE：EventSource 无法自定义 header，此处才接受 ?token=
+            if not self._check_token(allow_query=True):
                 return
             self._stream_events()
         elif path == "/api/events":
             # message 通道版：新面板消费（data 内嵌 type，无 event: 行）
-            if not self._check_token():
+            if not self._check_token(allow_query=True):
                 return
             self._stream_events(message_mode=True)
         elif path == "/" or path == "/index.html":
@@ -780,7 +840,10 @@ class Handler(BaseHTTPRequestHandler):
         return ("\n\n".join(keep) + "\n\n") if keep else ""
 
     def _security_headers(self) -> None:
-        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        # SEC-M9: 严格 CSP——只允许同源 script/style/connect，禁 frame
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; script-src 'self'; style-src 'self'; "
+                         "connect-src 'self'; frame-ancestors 'none'")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -872,10 +935,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _read_json(self) -> dict:
+        # SEC-M7: 统一 body 上限，所有调用方生效
         try:
             length = int(self.headers.get("Content-Length") or 0)
             if length <= 0:
                 return {}
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            if length > MAX_JSON_BYTES:
+                self.rfile.read(min(length, MAX_JSON_BYTES * 2))
+                return {}
+            raw = self.rfile.read(length)
+            if len(raw) > MAX_JSON_BYTES:
+                return {}
+            return json.loads(raw.decode("utf-8"))
         except Exception:
             return {}

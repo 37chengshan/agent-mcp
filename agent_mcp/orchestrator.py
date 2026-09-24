@@ -22,12 +22,18 @@ STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 
 # 跨厂商审查：writer 与 reviewer 不得同厂商（Polly 模式核心约束）
+# 未知 cli 的 vendor 即 cli 名本身（自定义 CLI 各自独立厂商，防误判同厂商）
 VENDOR_OF: dict[str, str] = {
     "claude": "anthropic", "grok": "xai", "opencode": "opencode",
     "omp": "pi", "atomcode": "atomcode", "codex": "openai",
     "kimi": "moonshot", "copilot": "github", "pi": "pi",
     "zcode": "zhipu", "cline": "cline",
 }
+
+
+def vendor_of(cli: str) -> str:
+    """vendor 判定：未知 cli → cli 名本身（非 None）。"""
+    return VENDOR_OF.get(cli, cli)
 
 
 @dataclass
@@ -108,7 +114,7 @@ class Orchestrator:
         for task in self.tasks.values():
             if not self._deps_ok(task):
                 errors.append(f"{task.task_id}: 依赖缺失 {set(task.deps) - set(self.tasks)}")
-            if task.review_by and VENDOR_OF.get(task.review_by) == VENDOR_OF.get(task.cli):
+            if task.review_by and vendor_of(task.review_by) == vendor_of(task.cli):
                 errors.append(f"{task.task_id}: 审查者 {task.review_by} 与写者 {task.cli} 同厂商")
         return errors
 
@@ -267,8 +273,8 @@ class Orchestrator:
 
 def pick_reviewer(writer_cli: str, available: list[str]) -> str | None:
     """为写者选一个不同厂商的审查 cli；无候选返回 None。"""
-    writer_vendor = VENDOR_OF.get(writer_cli)
+    writer_vendor = vendor_of(writer_cli)
     for cli in available:
-        if cli != writer_cli and VENDOR_OF.get(cli) != writer_vendor:
+        if cli != writer_cli and vendor_of(cli) != writer_vendor:
             return cli
     return None

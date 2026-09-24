@@ -40,7 +40,7 @@ def validate_proposal(ops: Any) -> list[dict[str, Any]]:
         if not target:
             raise ValueError("op %s missing target id" % kind)
         if kind == "create":
-            m.assert_refine_target_allowed(None, op="create")
+            m.assert_refine_target_allowed(None, op="create", target_id=str(target))
             m.assert_harness_kind(str(item.get("kind", "")))
         out.append({"op": kind, "target": str(target), "item": dict(item)})
     return out

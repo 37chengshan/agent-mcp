@@ -64,7 +64,8 @@ def test_run_to_agent_status_projection():
 def test_invariant_1_same_command_executes_once(store):
     client, cmd, params = "c1", "cmd-1", {"a": 1}
     h = m.request_hash("spawn", params)
-    first = store.journal_record(client_id=client, command_id=cmd, request_hash=h, method="spawn", params=params)
+    first, created = store.journal_record(client_id=client, command_id=cmd, request_hash=h, method="spawn", params=params)
+    assert created is True
     assert first["state"] == "recorded"
     store.journal_complete(client_id=client, command_id=cmd, result={"ok": True})
     existing = store.journal_get(client, cmd)
@@ -248,3 +249,52 @@ def test_interval_spec_simple_and_cron():
     assert m.IntervalSpec.parse("bogus") is None
     assert m.IntervalSpec.next_after("", base) is None
 
+
+
+# ---------- J1/J2：journal 崩溃恢复 / created 标志 ----------
+
+
+def test_journal_recover_orphans_marks_stale_recorded(store):
+    h = m.request_hash("spawn", {"a": 1})
+    _, created = store.journal_record(client_id="c", command_id="stuck",
+                                      request_hash=h, method="spawn", params={"a": 1})
+    assert created is True
+    n = store.journal_recover_orphans(all_stale=True)
+    assert n == 1
+    entry = store.journal_get("c", "stuck")
+    assert entry["state"] == "uncertain"
+
+
+def test_journal_record_created_flag_prevents_double_exec(store):
+    h = m.request_hash("spawn", {"a": 1})
+    first, created1 = store.journal_record(client_id="c", command_id="once",
+                                           request_hash=h, method="spawn", params={"a": 1})
+    second, created2 = store.journal_record(client_id="c", command_id="once",
+                                            request_hash=h, method="spawn", params={"a": 1})
+    assert created1 is True and created2 is False
+    assert first["id"] == second["id"]
+
+
+def test_refine_create_rejects_base_system_prompt():
+    from agent_mcp.refine import validate_proposal
+    with pytest.raises(ValueError, match="base system prompt"):
+        validate_proposal([{"op": "create", "target": "base-system-prompt",
+                            "item": {"id": "base-system-prompt", "kind": "prompt"}}])
+
+
+def test_goal_transition_rejects_completed_to_active():
+    with pytest.raises(ValueError, match="invalid goal transition"):
+        m.goal_transition(m.GOAL_COMPLETED, m.GOAL_ACTIVE)
+    assert m.goal_transition(m.GOAL_ACTIVE, m.GOAL_COMPLETED) == m.GOAL_COMPLETED
+    assert m.goal_transition(m.GOAL_PAUSED, m.GOAL_ACTIVE) == m.GOAL_ACTIVE
+
+
+def test_cron_dow_sunday_is_zero():
+    # 标准 cron：Sunday=0；datetime.weekday() Monday=0
+    base = datetime(2026, 8, 30, 8, 0, 0, tzinfo=timezone.utc)  # Sunday
+    # "0 9 * * 0" = Sunday 09:00
+    nxt = m.IntervalSpec.next_after("0 9 * * 0", base)
+    assert nxt is not None
+    hit = datetime.fromisoformat(nxt)
+    assert hit.weekday() == 6  # Sunday
+    assert hit.hour == 9

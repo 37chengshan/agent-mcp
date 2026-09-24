@@ -142,8 +142,19 @@ class ExecutionManager:
     def goal_pump(self, now: str | None = None) -> list[dict[str, Any]]:
         now = now or now_iso()
         try:
-            agents = {int(a["id"]): a for a in self.dispatcher.list_agents({})}
+            raw = self.dispatcher.list_agents({})
         except Exception:  # noqa: BLE001
+            return []
+        # G1: 兼容 {"agents": [...]} 与 list 两种返回形状；绝不 TypeError 吞掉
+        if isinstance(raw, dict):
+            agent_list = raw.get("agents") or []
+        elif isinstance(raw, list):
+            agent_list = raw
+        else:
+            return []
+        try:
+            agents = {int(a["id"]): a for a in agent_list if isinstance(a, dict) and a.get("id") is not None}
+        except (TypeError, ValueError, KeyError):
             return []
         created: list[dict[str, Any]] = []
         for goal in self.store.goals_active():

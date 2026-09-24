@@ -62,3 +62,41 @@ def test_goal_token_budget_stops_continuation(env):
     dispatcher.mark_terminal(agent_id)
     assert em.goal_pump(now_iso()) == []
 
+
+
+def test_goal_pump_accepts_real_list_agents_shape(tmp_path):
+    """G1: list_agents 返回 {"agents": [...]} 与 list 均可；绝不 TypeError 吞掉。"""
+    from agent_mcp.db import DB
+    from agent_mcp.execution import ExecutionManager
+    from agent_mcp.store_v4 import StoreV4
+    from agent_mcp import models as m
+
+    class ShapeDispatcher:
+        def __init__(self, shape):
+            self.shape = shape
+            self.followups = []
+
+        def list_agents(self, _body=None):
+            return self.shape
+
+        def followup(self, params):
+            self.followups.append(params)
+            return {"agent_id": params["agent_id"], "status": "running"}
+
+    db = DB(tmp_path / "g.db")
+    store = StoreV4(db)
+    # 真实形状 dict
+    disp = ShapeDispatcher({"agents": [{"id": 1, "status": "terminated"}]})
+    em = ExecutionManager(disp, store)
+    aid = db.insert_agent(parent_id=None, session_id="s1", task_name="t", cli="claude")
+    db.set_status(aid, "terminated", stop_reason="end_turn")
+    gid = store.goal_create(session_id="s1", objective="go", agent_id=aid)
+    created = em.goal_pump()
+    assert len(created) == 1
+    assert disp.followups and disp.followups[0]["agent_id"] == aid
+    # list 形状（兼容）
+    disp2 = ShapeDispatcher([{"id": aid, "status": "terminated"}])
+    em2 = ExecutionManager(disp2, store)
+    # 该 goal 已 bump round 仍 active，可继续
+    created2 = em2.goal_pump()
+    assert isinstance(created2, list)

@@ -24,6 +24,9 @@ class BaseAdapter:
     #   同样禁止在 daemon 层二次累加（会双计）。
     # 仅允许这两个值，见 tests/test_b2_usage_contract.py。
     usage_semantics: str = "authoritative"
+    # permission_mode → CLI flag 映射（子类覆盖）。缺失 = 该模式 flag 被丢弃
+    PERMISSION_FLAGS: dict[str, list[str]] | None = None
+
     def build_command(self, *, prompt: str, cwd: str, model: str | None,
                       permission_mode: str, max_turns: int, resume: str | None) -> list[str]:
         raise NotImplementedError
@@ -33,6 +36,20 @@ class BaseAdapter:
     def extract_session_id(self, raw: dict) -> str | None:
         return None
     def binary(self) -> str | None:
+        return None
+
+    def permission_mode_warning(self, permission_mode: str) -> str | None:
+        """D9d: permission_mode 被丢弃/无法映射时返回警告（spawn result 透出）。
+        绝不静默把 fullAccess 升权；无法映射只告警。"""
+        if permission_mode in (None, "", "plan"):
+            return None
+        flags = self.PERMISSION_FLAGS
+        if flags is None:
+            return (f"adapter {self.cli_name} has no permission_mode mapping; "
+                    f"requested {permission_mode!r} is dropped (not silently escalated)")
+        if permission_mode not in flags or not flags.get(permission_mode):
+            return (f"adapter {self.cli_name} drops permission_mode={permission_mode!r} "
+                    f"(no CLI flag); running with adapter default permissions")
         return None
 
 
@@ -338,7 +355,7 @@ class AtomCodeAdapter(BaseAdapter):
     _BIN = ["atomcode", str(HOME / ".local/bin/atomcode")]
     # AtomCode 5.0.3 bundled docs advertise --disable-tools, but the installed
     # binary rejects it. Keep plan/acceptEdits at native approval defaults;
-    # only fullAccess elevates with the verified -y flag.
+    # fullAccess elevates with --dangerously-skip-permissions（实测 flag）。
 
     def binary(self) -> str | None:
         for candidate in self._BIN:
@@ -908,12 +925,13 @@ class PrimeAgentRPCAdapter(BaseAdapter):
     _RPC_ARGS_DEFAULT = ["--rpc"]
 
     def __init__(self, capability_states: dict[str, str] | None = None):
+        # Invariant 6: 未协商即 DEGRADED（不是 SUPPORTED）；冒烟通过后再升
         states = dict(capability_states or {
-            "spawn": m.CAP_SUPPORTED,
-            "resume": m.CAP_SUPPORTED,
-            "steer": m.CAP_SUPPORTED,
-            "follow_up": m.CAP_SUPPORTED,
-            "observe": m.CAP_SUPPORTED,
+            "spawn": m.CAP_DEGRADED,
+            "resume": m.CAP_DEGRADED,
+            "steer": m.CAP_DEGRADED,
+            "follow_up": m.CAP_DEGRADED,
+            "observe": m.CAP_DEGRADED,
             "schedule": m.CAP_UNSUPPORTED,
             "heartbeat": m.CAP_UNSUPPORTED,
             "goal": m.CAP_UNSUPPORTED,
@@ -1218,18 +1236,53 @@ class GenericAdapter(BaseAdapter):
 def load_custom_adapters(state_dir: Path | str) -> list[str]:
     """扫描 <state_dir>/custom-clis/*.json 注册 GenericAdapter，返回注册的 cli 名列表。
 
+    SEC-H7 加载加固：
+    - 目录必须属主为当前 uid 且不可 world-writable；
+    - cli_name 不得覆盖内置名（除非配置显式 trust_override: true）；
+    - bins 含绝对路径/路径分隔符时须 trust_absolute: true。
     单文件失败仅 stderr 告警不中断（坏配置不该拖垮整个 daemon 启动）。
     """
     custom_dir = Path(state_dir) / "custom-clis"
     loaded: list[str] = []
     if not custom_dir.is_dir():
         return loaded
+    if os.name != "nt":
+        try:
+            st = custom_dir.stat()
+            if st.st_mode & 0o002:
+                print(f"[cli_adapters] refuse load: {custom_dir} is world-writable",
+                      file=sys.stderr)
+                return loaded
+            if hasattr(os, "getuid") and st.st_uid != os.getuid() and os.getuid() != 0:
+                print(f"[cli_adapters] refuse load: {custom_dir} not owned by current uid",
+                      file=sys.stderr)
+                return loaded
+        except OSError as exc:
+            print(f"[cli_adapters] refuse load: cannot stat {custom_dir}: {exc}",
+                  file=sys.stderr)
+            return loaded
+    builtin_names = set(_ADAPTERS)
     for path in sorted(custom_dir.glob("*.json")):
         try:
             cfg = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(cfg, dict):
+                raise ValueError("config must be a JSON object")
+            name = str(cfg.get("cli_name") or "")
+            if not name:
+                raise ValueError("missing cli_name")
+            if name in builtin_names and not cfg.get("trust_override"):
+                raise ValueError(
+                    f"cli_name {name!r} overrides a builtin adapter; "
+                    f"set trust_override: true to allow")
+            for bin_cand in cfg.get("bins") or [name]:
+                s = str(bin_cand)
+                if (os.path.isabs(s) or "/" in s or "\\" in s) and not cfg.get("trust_absolute"):
+                    raise ValueError(
+                        f"bins entry {s!r} is an absolute/pathed binary; "
+                        f"set trust_absolute: true to allow")
             register_adapter(GenericAdapter(cfg))
-            loaded.append(str(cfg.get("cli_name")))
-            print(f"[cli_adapters] registered custom CLI adapter: {cfg.get('cli_name')} <- {path}",
+            loaded.append(name)
+            print(f"[cli_adapters] registered custom CLI adapter: {name} <- {path}",
                   file=sys.stderr)
         except Exception as exc:
             print(f"[cli_adapters] failed to load custom CLI {path}: {exc}",

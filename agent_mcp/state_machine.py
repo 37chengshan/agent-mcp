@@ -8,8 +8,11 @@ STATUS_CANCELLED = "cancelled"
 STATUS_INCOMPLETE = "incomplete"
 STATUS_NEEDS_ADVISOR = "needs_advisor"
 
+# 终态：needs_advisor 非终态（wait 唤醒/可 followup 恢复），与 daemon_main._TERMINAL 同源
 TERMINAL = frozenset({STATUS_TERMINATED, STATUS_ERROR, STATUS_CANCELLED,
-                      STATUS_INCOMPLETE, STATUS_NEEDS_ADVISOR})
+                      STATUS_INCOMPLETE})
+# wait 唤醒集合：终态 + needs_advisor（主 agent 介入点）
+WAIT_WAKEUP = TERMINAL | {STATUS_NEEDS_ADVISOR}
 
 _TRANSITIONS = {
     STATUS_QUEUED: {STATUS_RUNNING, STATUS_ERROR, STATUS_CANCELLED},

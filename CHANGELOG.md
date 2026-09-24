@@ -6,6 +6,35 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+主题：深度缺陷清偿 + 控制台交互/动效 + 安全加固（多子代理并行修复）。
+
+### Security
+- 密钥文件 `O_CREAT|0600` 创建（消除 umask 0644 窗口）；`state_dir` 0700；日志/策略 0600。
+- token 不再进入浏览器 argv：`--open` 经 0600 `bootstrap.html` 交付；`?token=` 仅 SSE。
+- 变更类操作强制非空 `session_id`；mailbox/consensus 所有权校验；list 默认会话隔离。
+- worker `env` 走 0600 文件并剥离 `LD_PRELOAD`/`PYTHON*`/`NODE_OPTIONS` 等危险键。
+- `verify_command` **默认拒绝**（须 `AGENT_MCP_VERIFY_ALLOW_PREFIXES`）。
+- custom-cli 拒绝世界可写目录 / 绝对路径 bins / 覆盖内置名（需显式 trust 标志）。
+- v4 `request_hash` 服务端重算；`_resolve_v4_method` 白名单；CSP `script-src 'self'`；`_read_json` 全路径限长。
+- Docker 挂载改 `--mount type=bind` 并拒绝路径含 `:`；network 谓词与文档对齐；git 参数补 `--`。
+
+### Fixed
+- journal：`created` 标志防并发双执行；孤儿 `recorded` → `uncertain` 可恢复（P7）。
+- MCP 变更类工具 5s 内容哈希去重（防客户端重试双 spawn）。
+- Goal `goal_pump` 兼容真实 `{"agents":[...]}` 形状（此前生产续播静默失效）。
+- refine/harness **create** 拒绝 `base-system-prompt`（Invariant 7）。
+- Goal 状态转移表：拒绝 `completed→active`；`needs_advisor` 不再误标 TERMINAL。
+- cron DOW 改为标准 Sunday=0。
+- Schema 补齐生产消费字段并剥离未知键；`context_mode` 支持 `tail`/`none`。
+- 适配器丢弃 `permission_mode` 时返回 `permission_mode_warning`；PrimeAgentRPC 默认 DEGRADED。
+- Web：usage 趋势字段映射、预算环真实值、mailbox 路由、沙箱卡诚实「未接线」、`PANEL_V` 统一。
+
+### Changed
+- 控制台动效：面板/行/状态/图表/Toast，并尊重 `prefers-reduced-motion`。
+- README 重排 + 品牌动图；安全加固摘要；测试徽章 601。
+
 ## [4.0.0a1] - 2026-09-16
 
 v4.0 第一个里程碑（路线图见

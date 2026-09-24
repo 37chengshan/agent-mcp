@@ -92,10 +92,22 @@ class PolicyEngine:
         if not self.state_path:
             return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            os.chmod(self.state_path.parent, 0o700)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False,
-                                  separators=(",", ":")), encoding="utf-8")
+        payload = json.dumps(self.state, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+        if os.name == "nt":
+            tmp.write_bytes(payload)
+        else:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
         os.replace(tmp, self.state_path)
+        if os.name != "nt":
+            os.chmod(self.state_path, 0o600)  # policies.json 0600
         with self._lock:
             self._dirty = False
 

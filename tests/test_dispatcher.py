@@ -96,8 +96,8 @@ def test_spawn_queued_when_slots_full_then_promoted(tmp_path):
     d, db, bc = _make(tmp_path, max_concurrent=1, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "A", "cwd": str(tmp_path)})
-        b = d.spawn({"target_cli": "claude", "prompt": "B", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "A", "cwd": str(tmp_path), "session_id": "s1"})
+        b = d.spawn({"target_cli": "claude", "prompt": "B", "cwd": str(tmp_path), "session_id": "s1"})
         assert a["status"] == "running" and b["status"] == "queued"
         assert len(calls) == 1
         # A 完成后，B 应被补位 spawn（watcher 异步触发需宽限）
@@ -118,7 +118,7 @@ def test_wait_returns_terminated_with_summary(tmp_path):
     d, db, bc = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         _finish(tmp_path / "claude-0.json", rc=0)
         res = d.wait({"agent_id": a["agent_id"], "timeout": 10})
         assert res["status"] == "terminated" and res["stop_reason"] == "end_turn"
@@ -137,7 +137,7 @@ def test_wait_nonzero_rc_marks_error(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         _finish(tmp_path / "claude-0.json", rc=2)
         res = d.wait({"agent_id": a["agent_id"], "timeout": 10})
         assert res["status"] == "error" and res["stop_reason"] == "cli_exit_nonzero"
@@ -150,7 +150,7 @@ def test_wait_timeout_returns_running(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         res = d.wait({"agent_id": a["agent_id"], "timeout": 0.5})
         assert res["status"] == "running"
     finally:
@@ -163,7 +163,7 @@ def test_wait_accepts_custom_timeout_above_30(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         _finish(tmp_path / "claude-0.json", rc=0)
         # timeout=120 超出旧上限 30s；agent 已终止应立即返回，不会被拒绝
         res = d.wait({"agent_id": a["agent_id"], "timeout": 120})
@@ -178,9 +178,9 @@ def test_interrupt_cancels_and_releases_slot(tmp_path):
     listener = _listen(bc)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "A", "cwd": str(tmp_path)})
-        b = d.spawn({"target_cli": "claude", "prompt": "B", "cwd": str(tmp_path)})
-        res = d.interrupt({"agent_id": a["agent_id"]})
+        a = d.spawn({"target_cli": "claude", "prompt": "A", "cwd": str(tmp_path), "session_id": "s1"})
+        b = d.spawn({"target_cli": "claude", "prompt": "B", "cwd": str(tmp_path), "session_id": "s1"})
+        res = d.interrupt({"agent_id": a["agent_id"], "session_id": "s1"})
         assert res["status"] == "cancelled" and res["stop_reason"] == "interrupted"
         assert res["usage_incomplete"] is True
         assert db.get_agent(a["agent_id"])["status"] == "cancelled"
@@ -201,12 +201,12 @@ def test_send_message_delivered_then_undelivered(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
-        res = d.send_message({"agent_id": a["agent_id"], "message": "ping"})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
+        res = d.send_message({"agent_id": a["agent_id"], "session_id": "s1", "message": "ping"})
         assert res["status"] == "delivered"
         _finish(tmp_path / "claude-0.json", rc=0)
         d.wait({"agent_id": a["agent_id"], "timeout": 10})
-        res = d.send_message({"agent_id": a["agent_id"], "message": "after"})
+        res = d.send_message({"agent_id": a["agent_id"], "session_id": "s1", "message": "after"})
         assert res["status"] == "undelivered"
         msgs = db.messages_for(a["agent_id"])
         assert [m["role"] for m in msgs] == ["user", "user"]
@@ -219,12 +219,12 @@ def test_followup_merges_pending_messages_and_respawns(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         _finish(tmp_path / "claude-0.json", rc=0)
         d.wait({"agent_id": a["agent_id"], "timeout": 10})
-        d.send_message({"agent_id": a["agent_id"], "message": "note one"})
-        d.send_message({"agent_id": a["agent_id"], "message": "note two"})
-        res = d.followup({"agent_id": a["agent_id"], "prompt": "continue"})
+        d.send_message({"agent_id": a["agent_id"], "session_id": "s1", "message": "note one"})
+        d.send_message({"agent_id": a["agent_id"], "session_id": "s1", "message": "note two"})
+        res = d.followup({"agent_id": a["agent_id"], "session_id": "s1", "prompt": "continue"})
         assert res["status"] == "running" and res["merged_messages"] == 2
         assert "continue" in calls[1]["prompt"]
         assert "note one" in calls[1]["prompt"] and "note two" in calls[1]["prompt"]
@@ -240,8 +240,8 @@ def test_followup_while_running_queues_then_chains(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "A", "cwd": str(tmp_path)})
-        res = d.followup({"agent_id": a["agent_id"], "prompt": "more"})
+        a = d.spawn({"target_cli": "claude", "prompt": "A", "cwd": str(tmp_path), "session_id": "s1"})
+        res = d.followup({"agent_id": a["agent_id"], "session_id": "s1", "prompt": "more"})
         # 终态续跑先 release 旧槽再 acquire：若旧槽已清则可能立即 running 而非 queued
         assert res["status"] in ("queued", "running")
         _finish(tmp_path / "claude-0.json", rc=0)
@@ -260,11 +260,11 @@ def test_followup_automatically_resumes_saved_cli_session(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "first", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "first", "cwd": str(tmp_path), "session_id": "s1"})
         db.set_status(a["agent_id"], "running", cli_session_id="session-42")
         _finish(tmp_path / "claude-0.json", rc=0)
         d.wait({"agent_id": a["agent_id"], "timeout": 10})
-        result = d.followup({"agent_id": a["agent_id"], "prompt": "continue"})
+        result = d.followup({"agent_id": a["agent_id"], "session_id": "s1", "prompt": "continue"})
         assert result["resumed_session_id"] == "session-42"
         assert calls[1]["resume"] == "session-42"
     finally:
@@ -304,11 +304,12 @@ def test_steer_running_agent_interrupts_and_starts_followup(tmp_path, monkeypatc
             "target_cli": "claude",
             "prompt": "first",
             "cwd": str(tmp_path),
+            "session_id": "s1",
             "model": "deepseek-v4-flash",
             "permission_mode": "fullAccess",
         })
         db.set_status(a["agent_id"], "running", cli_session_id="session-42")
-        result = d.steer({"agent_id": a["agent_id"], "message": "先停一下，改做 B"})
+        result = d.steer({"agent_id": a["agent_id"], "session_id": "s1", "message": "先停一下，改做 B"})
         assert result["status"] == "running"
         assert result["interrupted"] is True
         assert result["resumed_session_id"] == "session-42"
@@ -349,15 +350,15 @@ def test_agent_operations_reject_cross_session_access(tmp_path):
         a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path),
                      "session_id": "owner"})
         operations = [
-            lambda: d.send_message({"agent_id": a["agent_id"], "message": "x",
+            lambda: d.send_message({"agent_id": a["agent_id"], "session_id": "s1", "message": "x",
                                     "session_id": "other"}),
-            lambda: d.followup({"agent_id": a["agent_id"], "prompt": "x",
+            lambda: d.followup({"agent_id": a["agent_id"], "session_id": "s1", "prompt": "x",
                                 "session_id": "other"}),
-            lambda: d.steer({"agent_id": a["agent_id"], "message": "x",
+            lambda: d.steer({"agent_id": a["agent_id"], "session_id": "s1", "message": "x",
                              "session_id": "other"}),
             lambda: d.wait({"agent_id": a["agent_id"], "timeout": 0.1,
                             "session_id": "other"}),
-            lambda: d.interrupt({"agent_id": a["agent_id"], "session_id": "other"}),
+            lambda: d.interrupt({"agent_id": a["agent_id"], "session_id": "s1", "session_id": "other"}),
             lambda: d.activity({"agent_id": a["agent_id"], "session_id": "other"}),
             lambda: d.usage({"agent_id": a["agent_id"], "session_id": "other"}),
         ]
@@ -403,7 +404,7 @@ def test_worker_timeout_maps_to_incomplete(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         state_path = d._workers[aid]["state_path"]
         st = json.loads(Path(state_path).read_text())
@@ -425,7 +426,7 @@ def test_set_status_enforces_state_machine(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         with pytest.raises(ValueError):
             d._set_status(aid, "queued")  # running → queued 非法
@@ -465,9 +466,9 @@ def test_send_message_rejects_oversized_message(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         with pytest.raises(ValueError):
-            d.send_message({"agent_id": a["agent_id"],
+            d.send_message({"agent_id": a["agent_id"], "session_id": "s1",
                             "message": "m" * (MAX_MESSAGE_CHARS + 1)})
     finally:
         d.stop()
@@ -501,14 +502,14 @@ def test_followup_rejects_invalid_timeout_seconds(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         _finish(d._workers[aid]["state_path"], rc=0)
         d.wait({"agent_id": aid, "timeout": 10})
         assert db.get_agent(aid)["status"] == "terminated"
         before = len(calls)
         with pytest.raises(ValueError):
-            d.followup({"agent_id": aid, "prompt": "again", "timeout_seconds": "abc"})
+            d.followup({"agent_id": aid, "session_id": "s1", "prompt": "again", "timeout_seconds": "abc"})
         assert len(calls) == before  # 未启动新 worker
         assert db.get_agent(aid)["status"] == "terminated"  # 状态未被污染
     finally:
@@ -523,15 +524,15 @@ def test_followup_rejects_merged_prompt_over_limit(tmp_path):
     d, db, _ = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         _finish(d._workers[aid]["state_path"], rc=0)
         d.wait({"agent_id": aid, "timeout": 10})
         for _ in range(11):  # 11 × MAX_MESSAGE_CHARS > MAX_PROMPT_CHARS
-            d.send_message({"agent_id": aid, "message": "m" * MAX_MESSAGE_CHARS})
+            d.send_message({"agent_id": aid, "session_id": "s1", "message": "m" * MAX_MESSAGE_CHARS})
         before = len(calls)
         with pytest.raises(ValueError):
-            d.followup({"agent_id": aid, "prompt": "y" * 20})  # 单 prompt 合法，合并后超限
+            d.followup({"agent_id": aid, "session_id": "s1", "prompt": "y" * 20})  # 单 prompt 合法，合并后超限
         assert len(calls) == before  # 未 spawn
         assert aid not in d._pending  # 未写 pending
         assert db.get_agent(aid)["status"] == "terminated"  # 未滞留
@@ -567,12 +568,12 @@ def test_followup_restart_failure_keeps_cli_missing_error(tmp_path):
     listener = _listen(bc)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         _finish(d._workers[aid]["state_path"], rc=0)
         d.wait({"agent_id": aid, "timeout": 10})
         assert db.get_agent(aid)["status"] == "terminated"
-        res = d.followup({"agent_id": aid, "prompt": "again"})
+        res = d.followup({"agent_id": aid, "session_id": "s1", "prompt": "again"})
         assert res["status"] == "error" and res["error"]
         agent = db.get_agent(aid)
         assert agent["status"] == "error" and agent["stop_reason"] == "cli_missing"
@@ -582,7 +583,7 @@ def test_followup_restart_failure_keeps_cli_missing_error(tmp_path):
         d.stop()
 
 
-def test_followup_restart_failure_keeps_resume_unsupported_error(tmp_path):
+def test_followup_restart_failure_keeps_resume_unsupported_error(tmp_path):  # noqa: E501
     """终态 agent 的 followup 重启 resume 不支持：保留 resume_unsupported error 事件与状态。"""
     fake = _flaky_spawn(tmp_path,
                         ResumeUnsupportedError("AtomCode does not support stable session-id resume"))
@@ -591,11 +592,11 @@ def test_followup_restart_failure_keeps_resume_unsupported_error(tmp_path):
     d.start()
     try:
         a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path),
-                     "resume": "session-1"})
+                     "session_id": "s1", "resume": "session-1"})
         aid = a["agent_id"]
         _finish(d._workers[aid]["state_path"], rc=0)
         d.wait({"agent_id": aid, "timeout": 10})
-        res = d.followup({"agent_id": aid, "prompt": "again", "resume": "session-1"})
+        res = d.followup({"agent_id": aid, "session_id": "s1", "prompt": "again", "resume": "session-1"})
         assert res["status"] == "error" and res["error"]
         agent = db.get_agent(aid)
         assert agent["status"] == "error" and agent["stop_reason"] == "resume_unsupported"
@@ -612,7 +613,7 @@ def test_orphan_worker_detected_when_running_pid_dead(tmp_path):
     listener = _listen(bc)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         info = d._workers[aid]
         # 模拟 worker 崩溃：state 写 running，但 worker_pid 指向已死进程
@@ -638,7 +639,7 @@ def test_orphan_not_detected_while_state_starting(tmp_path):
     d, db, bc = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         info = d._workers[aid]
         info["worker_pid"] = 99999998  # 死 pid，但 state 仍是 starting
@@ -654,7 +655,7 @@ def test_wait_timeout_hint_includes_liveness_evidence(tmp_path):
     d, db, bc = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         res = d.wait({"agent_id": aid, "timeout": 0.3})
         assert res["status"] == "running"
@@ -672,10 +673,10 @@ def test_orphan_with_queued_followup_still_chains(tmp_path):
     listener = _listen(bc)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         # 排队一个 followup（复用同一 agent 节点）
-        d.followup({"agent_id": aid, "prompt": "again"})
+        d.followup({"agent_id": aid, "session_id": "s1", "prompt": "again"})
         # monitor 孤儿兜底可能在 followup 前已触发补位链，calls>=1 即可
         assert len(calls) >= 1
         # 模拟 worker 崩溃：state 写 running，pid 已死
@@ -744,7 +745,7 @@ def test_last_event_payload_finds_latest_beyond_events_since_limit(tmp_path):
     d, db, bc = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         sid = a["session_id"]
         # 塞入 1050 条历史事件（覆盖 events_since 默认 limit）
@@ -766,7 +767,7 @@ def test_last_event_payload_without_session_still_works(tmp_path):
     d, db, bc = _make(tmp_path, spawn_fn=fake)
     d.start()
     try:
-        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path)})
+        a = d.spawn({"target_cli": "claude", "prompt": "X", "cwd": str(tmp_path), "session_id": "s1"})
         aid = a["agent_id"]
         db.insert_event(agent_id=aid, type="agent.terminated",
                         payload={"summary": "s"}, session_id=a["session_id"])

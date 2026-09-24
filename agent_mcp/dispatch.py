@@ -14,6 +14,26 @@ import psutil
 from agent_mcp.cli_adapters import get_adapter
 from agent_mcp.sandbox import build_container_sandbox_command, requires_process_fallback
 
+# SEC-H5: 危险环境变量前缀/精确名——caller env 注入时一律剥离
+_DANGEROUS_ENV_EXACT = frozenset({
+    "LD_PRELOAD", "NODE_OPTIONS", "BASH_ENV", "ENV", "IFS",
+})
+_DANGEROUS_ENV_PREFIXES = ("DYLD_", "PYTHON")
+
+
+def sanitize_env(env: dict[str, str] | None) -> dict[str, str]:
+    """SEC-H5: 剥离危险键；仅返回安全的 caller 覆盖项。"""
+    if not env:
+        return {}
+    out: dict[str, str] = {}
+    for key, value in env.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if key in _DANGEROUS_ENV_EXACT or key.startswith(_DANGEROUS_ENV_PREFIXES):
+            continue
+        out[key] = value
+    return out
+
 
 class SlotScheduler:
     """分池并槽位：read_pool（读密集，默认上限 6）/write_pool（写密集，默认上限 2）。
@@ -150,14 +170,27 @@ def build_worker_command(*, state_path: Path, out_path: Path, err_path: Path,
                          env: dict[str, str] | None = None) -> list[str]:
     """分离 worker：本脚本 --dispatch-worker 模式（与现有 grok MCP 同构）。
 
-    timeout_seconds 置于 command json 之前；非空 env 追加为最后一个 JSON
-    参数，未传 env 时保持旧命令格式兼容。"""
+    timeout_seconds 置于 command json 之前。SEC-H5: env 不进 argv——
+    写入 0600 临时文件，argv 只传路径。"""
     worker = Path(__file__).resolve().parent.parent / "dispatch_worker.py"
     command = [sys.executable, str(worker), str(state_path), str(out_path),
                str(err_path), cwd, str(timeout_seconds or 0),
                json.dumps(cli_command, ensure_ascii=False)]
     if env:
-        command.append(json.dumps(env, ensure_ascii=False))
+        safe_env = sanitize_env(env)
+        if safe_env:
+            env_path = state_path.with_suffix(".env.json")
+            payload = json.dumps(safe_env, ensure_ascii=False).encode("utf-8")
+            if os.name == "nt":
+                env_path.write_bytes(payload)
+            else:
+                fd = os.open(str(env_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    os.write(fd, payload)
+                finally:
+                    os.close(fd)
+                os.chmod(env_path, 0o600)
+            command.append(f"@{env_path}")  # @ 前缀 = env 文件路径，不含密钥
     return command
 
 
@@ -202,8 +235,9 @@ def spawn_cli_worker(target_cli: str, *, prompt: str, cwd: str,
             cli_cmd,
             image=sandbox_container,
             mount_cwd=cwd,
+            # SEC-M4: 与注释对齐——空/none/false/0/off 均视为禁网
             network_disabled=str(sandbox_network).strip().lower()
-            not in ("", "false", "0", "off"),
+            in ("", "none", "false", "0", "off"),
             read_only=(permission_mode == "plan"),
         )
     state_dir = Path(state_dir)

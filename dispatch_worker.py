@@ -3,9 +3,11 @@
 
 用法: python dispatch_worker.py <state.json> <stdout> <stderr> <cwd> <json_command>
       python dispatch_worker.py <state.json> <stdout> <stderr> <cwd> <timeout_seconds> <json_command>
+      python dispatch_worker.py <state.json> <stdout> <stderr> <cwd> <timeout_seconds> <json_command> <@env.json>
 
 与 grok_cli_mcp.py 的 --dispatch-worker 分支同构；自包含，不依赖 agent_mcp 包
 （worker 由 daemon 以任意 cwd 分离启动）。state 文件仅含元数据，不携带密钥。
+SEC-H5: env 经 @path 0600 文件传递（不进 argv）。
 超时（timeout_seconds>0）时终止 CLI 进程树并在 state 写 timed_out=true。
 """
 from __future__ import annotations
@@ -29,9 +31,16 @@ def read_json(path: Path) -> dict:
 
 
 def write_json(path: Path, data: dict) -> None:
-    Path(path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    if os.name != "nt":
-        os.chmod(path, 0o600)
+    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    if os.name == "nt":
+        Path(path).write_bytes(payload)
+        return
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
 
 
 def terminate_tree(pid: int) -> None:
@@ -77,13 +86,26 @@ def terminate_tree(pid: int) -> None:
             pass
 
 
+def load_env_arg(arg: str) -> dict[str, str] | None:
+    """SEC-H5: env 从 @path 0600 文件读取（不再经 argv JSON）；兼容旧内联 JSON。"""
+    if arg.startswith("@"):
+        raw = json.loads(Path(arg[1:]).read_text(encoding="utf-8"))
+    else:
+        raw = json.loads(arg)
+    if not isinstance(raw, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in raw.items()):
+        return None
+    return raw
+
+
 def dispatch_worker(state_path: Path, stdout_path: Path, stderr_path: Path,
                     command: list[str], cwd: Path, timeout: float = 0.0,
                     env: dict[str, str] | None = None) -> int:
     """读 state → 标 running（worker_pid）→ 运行 CLI → 标 finished（process_status）。
 
     timeout>0 时超限则终止 CLI 进程树，state 写 timed_out=true（daemon 映射 incomplete）。
-    env 非空时 merge 到 worker 继承的环境中。"""
+    env 非空时 merge 到 worker 继承的环境中（SEC-H5: 危险键已在 daemon 侧剥离）。"""
     state = read_json(state_path)
     state.update({"worker_pid": os.getpid(), "status": "running", "updated_at": utc_now()})
     write_json(state_path, state)
@@ -105,7 +127,10 @@ def dispatch_worker(state_path: Path, stdout_path: Path, stderr_path: Path,
             # 只会拿到空串而不会误读继承输入；prompt 必须走 flag/位置参数。
             popen_kwargs = dict(cwd=cwd, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
             if env:
-                popen_kwargs["env"] = {**os.environ, **env}
+                # 合并策略：继承环境为底 + 安全 caller env 覆盖（禁止盲目全量 overlay）
+                merged = dict(os.environ)
+                merged.update(env)
+                popen_kwargs["env"] = merged
             proc = subprocess.Popen(command, **popen_kwargs, **spawn_kwargs)
             try:
                 rc = proc.wait(timeout=timeout if timeout > 0 else None)
@@ -146,14 +171,11 @@ def main() -> int:
     env: dict[str, str] | None = None
     if len(sys.argv) == 8:
         try:
-            env_value = json.loads(sys.argv[7])
-        except json.JSONDecodeError:
+            env = load_env_arg(sys.argv[7])
+        except (json.JSONDecodeError, OSError):
             return 2
-        if not isinstance(env_value, dict) or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in env_value.items()):
+        if env is None:
             return 2
-        env = env_value
     if len(sys.argv) in (7, 8):
         try:
             timeout = float(sys.argv[5])

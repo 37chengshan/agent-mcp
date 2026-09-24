@@ -135,8 +135,14 @@ def build_container_sandbox_command(
     """
     container_cmd = [engine, "run", "--rm", "-i"]
     if mount_cwd:
-        mode = "ro" if read_only else "rw"
-        container_cmd.extend(["-v", f"{os.path.abspath(mount_cwd)}:{cwd}:{mode}"])
+        mount_src = os.path.abspath(mount_cwd)
+        # SEC-M4: 拒绝路径中的 ":"（-v 会把它当第二段挂载）；用 --mount type=bind
+        if ":" in mount_src or ":" in cwd:
+            raise ValueError("sandbox mount path must not contain ':'")
+        bind = f"type=bind,src={mount_src},dst={cwd}"
+        if read_only:
+            bind += ",readonly"
+        container_cmd.extend(["--mount", bind])
     container_cmd.extend(["-w", cwd])
 
     if read_only:

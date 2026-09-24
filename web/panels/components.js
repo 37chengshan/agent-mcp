@@ -1,8 +1,11 @@
 /* ============================================================
  * Agent MCP · 仪表盘组件库（零依赖 SVG 自绘）
  * StatCard / Sparkline / BarStack / DonutChart / DataTable /
- * Timeline / 三态（empty/loading/error）。
+ * Timeline / 三态（empty/loading/error）/ Toast / Skeleton。
  * 纯函数渲染字符串，调用方负责注入 DOM。
+ *
+ * CACHE-BUST：本文件的 import URL 必须统一为 `./components.js?v=v7`，
+ * 与 loader.js 的 PANEL_V 保持一致，避免双实例。
  * ============================================================ */
 
 /* ---------- 工具 ---------- */
@@ -18,19 +21,124 @@ export function fmtTime(ts){
   const p = x => String(x).padStart(2,"0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
+export function num(v){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+export function prefersReducedMotion(){
+  try{ return matchMedia("(prefers-reduced-motion: reduce)").matches; }
+  catch{ return false; }
+}
+
+/* ---------- 认证 / 请求（所有面板统一走这里） ---------- */
+
 export function authToken(){
   if(window.__amToken) return window.__amToken;
   const m = (location.hash || "").match(/token=([^&]+)/);
   return m ? decodeURIComponent(m[1]) : "";
 }
-export async function apiFetch(path){
-  const headers = {};
+
+export function authHeaders(extra){
+  const headers = Object.assign({}, extra || {});
   const t = authToken();
   if(t) headers["X-Auth-Token"] = t;
-  const r = await fetch(path, { headers });
-  if(!r.ok) throw new Error(`${path} HTTP ${r.status}`);
-  return r.json().catch(() => ({}));
+  return headers;
 }
+
+export async function apiFetch(path, opts){
+  const o = Object.assign({}, opts || {});
+  o.headers = authHeaders(o.headers);
+  const r = await fetch(path, o);
+  const d = await r.json().catch(() => ({}));
+  if(!r.ok) throw new Error(d.error || `${path} HTTP ${r.status}`);
+  return d;
+}
+
+export async function apiPost(path, body){
+  return apiFetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+/** 按钮 loading/禁用，防双击双提交。label 可选恢复文案。 */
+export function setBtnBusy(btn, busy, label){
+  if(!btn) return;
+  if(busy){
+    if(btn.dataset.amIdle == null) btn.dataset.amIdle = btn.textContent;
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+    btn.textContent = label || "处理中…";
+  }else{
+    btn.disabled = false;
+    btn.removeAttribute("aria-busy");
+    btn.textContent = btn.dataset.amIdle || label || btn.textContent;
+  }
+}
+
+/* ---------- Toast（滑入提示，绝不静默失败） ---------- */
+
+let toastHost = null;
+export function toast(msg, kind = "info"){
+  try{
+    if(!toastHost){
+      toastHost = document.createElement("div");
+      toastHost.id = "am-toasts";
+      toastHost.setAttribute("aria-live", "polite");
+      document.body.appendChild(toastHost);
+    }
+    const el = document.createElement("div");
+    el.className = "am-toast " + (kind || "info");
+    el.textContent = String(msg ?? "");
+    toastHost.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("in"));
+    const ttl = kind === "error" ? 4800 : 3000;
+    setTimeout(() => {
+      el.classList.remove("in");
+      setTimeout(() => el.remove(), 240);
+    }, ttl);
+  }catch{ /* toast 失败不影响主流程 */ }
+}
+
+/* ---------- 字段归一化（兼容当前 / 修复后 API 形状） ---------- */
+
+/** 趋势点：{ts, input, output, cache_read, cost} 或 {in, out, cache} */
+export function normalizeSeriesPoint(b){
+  if(!b || typeof b !== "object") return { ts: null, in: 0, out: 0, cache: 0, cost: 0 };
+  return {
+    ts: b.ts ?? b.time ?? b.created_at ?? null,
+    in: num(b.in ?? b.input ?? b.input_tokens),
+    out: num(b.out ?? b.output ?? b.output_tokens),
+    cache: num(b.cache ?? b.cache_read ?? b.cache_creation ?? b.cacheRead),
+    cost: num(b.cost ?? b.cost_usd),
+  };
+}
+export function mapSeries(list){
+  return (Array.isArray(list) ? list : (list && list.series) || []).map(normalizeSeriesPoint);
+}
+
+/** 预算：policy_configs.budget_limit_usd / budget_usd / spent_usd 多形状 */
+export function pickBudget(d){
+  d = d || {};
+  const cfg = d.policy_configs || d.config || {};
+  const limit = num(cfg.budget_limit_usd ?? cfg.limit_usd ?? d.limit_usd ?? d.budget_limit_usd);
+  const spent = num(cfg.spent_usd ?? d.spent_usd ?? d.budget_usd ?? cfg.budget_usd);
+  const alt = num(d.budget_usd ?? cfg.budget_usd);
+  return {
+    limit_usd: limit,
+    spent_usd: spent || alt,
+    budget_usd: alt || spent,
+  };
+}
+
+/** 无生产者 / 死事件：UI 不依赖，过滤展示。 */
+export const DEAD_EVENTS = new Set([
+  "agent.thread_message_sent",
+  "agent.thread_message_received",
+  "agent.idle",
+]);
+export function isDeadEvent(type){ return DEAD_EVENTS.has(String(type || "")); }
 
 export const CLI_COLORS = {
   grok:"var(--grok,#C9A34F)", opencode:"var(--opencode,#6FA587)",
@@ -58,7 +166,17 @@ export function statCard({ k, v, sub, cls="", live=false, spark=null }){
   </div>`;
 }
 
-/* ---------- Sparkline（迷你折线，SVG path） ---------- */
+/** 首屏骨架（dashboard tiles） */
+export function skeletonCards(n = 6){
+  return Array.from({ length: n }, (_, i) => `
+    <div class="am-dash-card am-skel" style="animation-delay:${i * 40}ms" aria-hidden="true">
+      <div class="am-skel-bar w50"></div>
+      <div class="am-skel-bar w30"></div>
+      <div class="am-skel-bar w70"></div>
+    </div>`).join("");
+}
+
+/* ---------- Sparkline（迷你折线，SVG path，首次描边动画） ---------- */
 
 export function sparkline(points, w=96, h=26, color="var(--accent,#D96B4F)"){
   const vals = points.map(Number);
@@ -74,24 +192,30 @@ export function sparkline(points, w=96, h=26, color="var(--accent,#D96B4F)"){
   const area = `${path} L${w},${h} L0,${h} Z`;
   return `<svg class="am-spark-svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
     <path d="${area}" fill="${color}" opacity=".12"/>
-    <path d="${path}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path class="am-spark-line" pathLength="1" d="${path}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
     <circle cx="${coords[coords.length-1][0]}" cy="${coords[coords.length-1][1]}" r="2" fill="${color}"/>
   </svg>`;
 }
 
-/* ---------- 堆叠柱（输入/输出/缓存 三段） ---------- */
+/* ---------- 堆叠柱（输入/输出/缓存 三段） ----------
+ * buckets 兼容 {in,out,cache} 与 API {input,output,cache_read}。
+ * 颜色语义：in=绿 / out=accent / cache=琥珀（与 legend class 一致）。
+ */
 
 export function barStack({ buckets, w=100, h=40 }){
-  // buckets: [{in, out, cache}]
-  const max = Math.max(1, ...buckets.map(b => (b.in||0)+(b.out||0)+(b.cache||0)));
-  const bw = Math.max(3, Math.floor(w / buckets.length) - 2);
-  const bars = buckets.map((b, i) => {
-    const hIn = Math.round((b.in||0)/max*h), hOut = Math.round((b.out||0)/max*h), hC = Math.round((b.cache||0)/max*h);
+  const rows = (buckets || []).map(normalizeSeriesPoint);
+  const max = Math.max(1, ...rows.map(b => b.in + b.out + b.cache));
+  const bw = Math.max(3, Math.floor(w / Math.max(rows.length, 1)) - 2);
+  const bars = rows.map((b, i) => {
+    const hIn = Math.round(b.in / max * h);
+    const hOut = Math.round(b.out / max * h);
+    const hC = Math.round(b.cache / max * h);
     const x = i * (bw + 2);
-    return `<g class="am-bar-col" transform="translate(${x},${h - hIn - hOut - hC})">
-      <rect class="am-bar-in"  x="0" y="${hIn+hOut}" width="${bw}" height="${hC}" rx="1"/>
-      <rect class="am-bar-out" x="0" y="${hIn}"     width="${bw}" height="${hOut}" rx="1"/>
-      <rect class="am-bar-cache" x="0" y="0"        width="${bw}" height="${hIn}" rx="1"/>
+    /* 自下而上：cache → out → in，grow-from-0 动画 */
+    return `<g class="am-bar-col" transform="translate(${x},${h - hIn - hOut - hC})" style="animation-delay:${Math.min(i * 12, 280)}ms">
+      <rect class="am-bar-cache" x="0" y="${hIn+hOut}" width="${bw}" height="${hC}" rx="1"/>
+      <rect class="am-bar-out"  x="0" y="${hIn}"     width="${bw}" height="${hOut}" rx="1"/>
+      <rect class="am-bar-in"   x="0" y="0"          width="${bw}" height="${hIn}" rx="1"/>
     </g>`;
   }).join("");
   return `<svg class="am-barstack" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true">${bars}</svg>`;
@@ -100,7 +224,6 @@ export function barStack({ buckets, w=100, h=40 }){
 /* ---------- Donut 环形图（多段） ---------- */
 
 export function donut({ slices, size=120, stroke=14 }){
-  // slices: [{value, color, label}]
   const total = Math.max(1, ...slices.map(s => s.value || 0)) ;
   const r = (size - stroke) / 2, c = 2 * Math.PI * r, cx = size/2, cy = size/2;
   let acc = 0;
@@ -135,9 +258,8 @@ export function sortableTable({ headers, rows, onSort, sortKey, sortDir }){
 /* ---------- 时间线 ---------- */
 
 export function timeline(items){
-  // items: [{ts, type, text, agent, color}]
-  return `<div class="am-timeline">${items.map(it => `
-    <div class="am-tl-item">
+  return `<div class="am-timeline">${items.map((it, i) => `
+    <div class="am-tl-item am-row-in" style="animation-delay:${Math.min(i * 28, 220)}ms">
       <span class="am-tl-dot" style="background:${it.color || "var(--accent,#D96B4F)"}"></span>
       <span class="am-tl-time">${fmtTime(it.ts)}</span>
       <span class="am-tl-type">${esc(it.type)}</span>

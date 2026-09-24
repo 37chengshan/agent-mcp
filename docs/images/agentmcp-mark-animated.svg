@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="agent-mcp">
+  <defs>
+    <style>
+      .c1 { fill:#D4674A; }
+      .c2 { fill:#F2EDE4; }
+      .c3 { fill:#CDBBA0; }
+      .spin { transform-origin:64px 64px; animation:sp 12s linear infinite; }
+      @keyframes sp { to { transform:rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce) { .spin { animation:none; } }
+    </style>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#111"/>
+  <g class="spin">
+    <path class="c1" d="M64 18c22 0 34 28 34 48 0 12-6 22-16 22-8 0-12-6-12-14 0-12 4-28-6-40-4-6-8-8-12-8z"/>
+    <path class="c2" d="M30 52c0-18 16-32 32-32 8 0 14 4 14 12 0 10-8 16-18 20-14 6-22 14-22 26 0 8 6 14 14 14 6 0 12-4 14-10"/>
+    <path class="c3" d="M78 88c12 2 22-4 26-14 4-12-2-24-14-28-6-2-12 0-14 6-2 8 2 14 10 18 4 2 6 6 4 10-2 4-6 6-12 8z"/>
+    <circle class="c1" cx="64" cy="64" r="12"/>
+  </g>
+</svg>

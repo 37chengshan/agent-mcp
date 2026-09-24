@@ -125,6 +125,7 @@ def test_main_opens_browser_only_after_health(monkeypatch, tmp_path, capsys):
     order = []
     monkeypatch.setattr(start_agent_mcp, "start_daemon", lambda *_a: order.append("start") or True)
     monkeypatch.setattr(start_agent_mcp, "is_healthy", lambda _url, _token="": order.append("health") or True)
+    monkeypatch.setattr(start_agent_mcp, "read_token", lambda _sd: "tok-secret")
     monkeypatch.setattr(
         start_agent_mcp.subprocess,
         "Popen",
@@ -132,9 +133,10 @@ def test_main_opens_browser_only_after_health(monkeypatch, tmp_path, capsys):
     )
     assert main(["--state-dir", str(tmp_path), "--port", "9876", "--open"]) == 0
     assert order[:2] == ["start", "health"]
-    # 浏览器仍拿带 token 的 fragment；stdout 不打印 token
+    # SEC-H3: 浏览器打开 bootstrap.html（argv 无 token）；stdout 不打印 token
     assert order[2][0] == start_agent_mcp.browser_command("unused")[0]
-    assert order[2][1].startswith("http://127.0.0.1:9876/#token=")
+    assert "bootstrap.html" in order[2][1]
+    assert "tok-secret" not in order[2][1]
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "started"
     assert out["url"] == "http://127.0.0.1:9876/"

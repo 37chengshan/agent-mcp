@@ -5,26 +5,12 @@
  * 接口：{ mount(container, sse), unmount() }，由 loader.js 组装。
  * ============================================================ */
 
+import { esc, fmtTime, authHeaders, pickBudget, toast, emptyState } from "./components.js?v=v7";
+
 const POLL_MS = 5000;   // 轮询周期
 const MAX_ROWS = 100;   // 策略日志保留上限
 const RING_R = 52;      // 环形半径（与 viewBox 对应）
 const RING_C = 2 * Math.PI * RING_R;
-
-/* ---------- 小工具 ---------- */
-
-function esc(v){
-  return String(v ?? "").replace(/[&<>"']/g,
-    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-}
-
-function fmtTime(ts){
-  if(ts == null) return "—";
-  const n = (typeof ts === "number" || /^\d+$/.test(String(ts))) ? Number(ts) : Date.parse(ts);
-  if(!Number.isFinite(n)) return String(ts);
-  const d = new Date(n);
-  const p = x => String(x).padStart(2,"0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-}
 
 const fmtUsd = v => "$" + (Number(v) || 0).toFixed(2);
 
@@ -72,7 +58,7 @@ function render(){
   if(fingerprint === lastShown) return;
   lastShown = fingerprint;
   if(!rows.length){
-    log.innerHTML = '<div class="am-empty">暂无策略决策记录</div>';
+    log.innerHTML = emptyState("暂无策略决策记录");
     return;
   }
   log.innerHTML = rows.map((p, i) => `
@@ -96,37 +82,31 @@ function trunc(s, n){ return String(s || "").length > n ? String(s).slice(0, n) 
 async function poll(){
   if(disposed) return;
   try{
-    const headers = {};
-    const t = authToken();
-    if(t) headers["X-Auth-Token"] = t;
-    const r = await fetch("/api/policies/state", {headers});
+    const r = await fetch("/api/policies/state", { headers: authHeaders() });
     if(!r.ok) throw new Error("policies/state HTTP " + r.status);
     const d = await r.json().catch(() => ({}));
-    const cfg = d.policy_configs || {};
-    const limit = Number(cfg.budget_limit_usd) || Number(d.limit_usd) || 0;
+    const b = pickBudget(d);
+    // 与 dashboard 共享预算（兼容旧 window.__amBudget 消费方）
+    window.__amBudget = {
+      limit_usd: b.limit_usd,
+      spent_usd: b.spent_usd,
+      budget_usd: b.budget_usd || b.spent_usd,
+    };
     state = {
-      limit_usd: limit,
-      spent_usd: Number(d.budget_usd) || Number(d.spent_usd) || 0,
+      limit_usd: b.limit_usd,
+      spent_usd: b.spent_usd || b.budget_usd,
       spawns: Number(d.spawns) || 0,
-      // 审计日志在 log 数组；policies 是策略链（{name, enabled}）
       policies: (d.log || []).map(p => ({ name: p.name, result: p.result, ts: p.ts, reason: p.reason, _fresh: false })),
     };
     render();
   }catch(err){
     if(disposed) return;
     const box = root.querySelector(".am-err");
-    if(box) box.textContent = "策略状态拉取失败：" + err.message;
-    else root.insertAdjacentHTML("afterbegin", `<div class="am-err">策略状态拉取失败：${esc(err.message)}</div>`);
+    const msg = "策略状态拉取失败：" + (err.message || err);
+    if(box) box.textContent = msg;
+    else root.insertAdjacentHTML("afterbegin", `<div class="am-err">${esc(msg)}</div>`);
+    toast(msg, "error");
   }
-}
-
-/* ---------- 认证（与 index.html 同约定：URL hash #token=） ---------- */
-
-function authToken(){
-  // 优先 daemon 注入的全局 token（index 页注入 window.__amToken），回退 URL hash
-  if(window.__amToken) return window.__amToken;
-  const m = (location.hash || "").match(/token=([^&]+)/);
-  return m ? decodeURIComponent(m[1]) : "";
 }
 
 /* SSE：policy_decision（data 内嵌 type 字段，payload 含 name/result/reason） */
@@ -172,7 +152,7 @@ export function mount(container, sse, opts){
       <div class="am-budget-ring-wrap">
         <svg class="am-budget-ring" viewBox="0 0 120 120" aria-hidden="true">
           <circle class="am-ring-bg" cx="60" cy="60" r="${RING_R}"></circle>
-          <circle class="am-ring-fg" cx="60" cy="60" r="${RING_R}"></circle>
+          <circle class="am-ring-fg" cx="60" cy="60" r="${RING_R}" stroke-dasharray="0 ${Math.ceil(RING_C)}"></circle>
         </svg>
         <div class="am-budget-num"><b>0%</b><span>已用 / 上限</span></div>
       </div>

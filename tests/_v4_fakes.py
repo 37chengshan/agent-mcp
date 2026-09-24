@@ -32,9 +32,9 @@ class FakeDispatcher:
         self.followups.append(p)
         return {"agent_id": aid, "status": "running"}
 
-    def list_agents(self, _body: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        return [{"id": aid, "status": st} for aid, st in sorted(self._agents.items())]
+    def list_agents(self, _body: dict[str, Any] | None = None) -> dict[str, Any]:
+        # 与真实 Dispatcher.list_agents 同形状：{"agents": [...]}
+        return {"agents": [{"id": aid, "status": st} for aid, st in sorted(self._agents.items())]}
 
     def mark_terminal(self, agent_id: int, status: str = "terminated") -> None:
         self._agents[agent_id] = status
-

@@ -2,17 +2,20 @@
  * Agent MCP · 仪表盘加载器（loader）v4
  * 完整仪表盘骨架：
  *   - 顶部 Header：品牌 + 全局胶囊（运行中/异常/成本）+ token 迷你条
- *   - 左侧导航：图标 + 文字（总览/Token/协作/策略/工作区）
+ *   - 左侧导航：图标 + 文字
  *   - 主内容：分页 pane（常驻 + 可见性通知）
- *   - 底部状态条：SSE 状态 · 最近事件 · 版本
- * 面板常驻不重建（切页零闪烁）、隐藏面板暂停渲染、SSE 共享连接。
- * 接口：面板导出 { mount(container, sse, {setVisible}), unmount(), setVisible() }。
+ *   - 底部状态条：SSE 状态 · 最近事件 · 产品/协议版本（分离展示）
+ * 面板常驻不重建、隐藏面板暂停渲染、SSE 共享连接。
+ *
+ * CACHE-BUST：PANEL_V 是唯一缓存版本常量。各面板对 components.js 的
+ * 静态 import 必须写成 `./components.js?v=v7`（与 PANEL_V 同值），
+ * 避免双实例。grep 校验：仅允许一处 PANEL_V 定义。
  * ============================================================ */
 
 const SSE_URL = "/api/events";
 const CSS_URL = "/css/panels.css";
 const CSS_ID = "am-panels-css";
-const PANEL_V = "v6";
+const PANEL_V = "v7";
 
 const NAV = [
   { key: "dashboard",     label: "总览",       icon: "◧", module: `./dashboard.js?v=${PANEL_V}` },
@@ -24,12 +27,18 @@ const NAV = [
   { key: "mailbox",       label: "信箱与治理", icon: "✉", module: `./mailbox.js?v=${PANEL_V}` },
 ];
 
+/* 死事件：无生产者 / UI 不依赖。底部状态条不把它们当作「最近事件」。 */
+const DEAD_EVENTS = new Set([
+  "agent.thread_message_sent",
+  "agent.thread_message_received",
+  "agent.idle",
+]);
+
 let inited = false;
 let sse = null;
 let stage = null, nav = null, headerEl = null, statusBar = null;
-let panes = new Map();      // key -> { paneEl, module, setVisible }
+let panes = new Map();
 let currentKey = null;
-let lastEventText = "";
 
 /* ---------- 样式注入 ---------- */
 
@@ -42,8 +51,6 @@ function injectCss(){
 
 /* ---------- SSE ---------- */
 
-/* A6：令牌读取——daemon 注入的全局变量优先，回退 URL hash（#token=...）。
-   SSE EventSource 无法带 header，统一走 ?token= 查询通道。 */
 function amToken(){
   if(window.__amToken) return window.__amToken;
   const m = location.hash.match(/token=([^&]+)/);
@@ -64,7 +71,7 @@ function getSse(){
   sse.onmessage = ev => {
     let d; try { d = JSON.parse(ev.data); } catch { return; }
     if(!d || !d.type) return;
-    // 底部状态条最近事件
+    if(DEAD_EVENTS.has(d.type)) return;
     const p = d.payload || {};
     let text = "";
     if(d.type === "agent.message") text = String(p.text||"").slice(0, 48);
@@ -72,7 +79,6 @@ function getSse(){
     else if(d.type === "agent.error") text = "agent 失败 · " + String(p.error||"").slice(0, 40);
     else if(d.type === "agent.tool_use") text = "工具调用 · " + (p.name || "");
     if(text && statusBar){ statusBar.querySelector(".am-sb-last").textContent = text; }
-    // Header 胶囊实时刷新
     if(["agent.spawned","agent.terminated","agent.error","agent.cancelled","agent.running"].includes(d.type)){
       refreshHeaderCapsules();
     }
@@ -85,10 +91,9 @@ function setSseDot(on){
   dots.forEach(d => { d.className = "am-dot " + (on ? "on" : "off"); d.title = on ? "SSE 已连接" : "SSE 连接异常（自动重连中）"; });
 }
 
-/* ---------- Header 胶囊（实时全局统计） ---------- */
+/* ---------- Header 胶囊 ---------- */
 
 function applyTheme(theme){
-  // theme: "dark" | "light" | null（跟随系统）
   const root = document.documentElement;
   if(theme === "dark"){ root.dataset.theme = "dark"; }
   else if(theme === "light"){ root.dataset.theme = "light"; }
@@ -111,7 +116,6 @@ function bindThemeToggle(){
     localStorage.setItem("am-theme", next);
     applyTheme(next);
   });
-  // 初始化：localStorage 优先，其次跟随系统
   const saved = localStorage.getItem("am-theme");
   applyTheme(saved || null);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
@@ -135,7 +139,7 @@ async function refreshHeaderCapsules(){
       <span class="am-cap ${nBad ? "err" : ""}">异常 ${nBad}</span>
       <span class="am-cap">成本 ${fmtUsdSafe(cost)}</span>
       <span class="am-cap mono">${fmtIntSafe(tot)} tok</span>`;
-  }catch(e){ /* header 静默 */ }
+  }catch(e){ /* header 静默（状态条/toast 承担错误可见性） */ }
 }
 
 function apiFetchSafe(path){
@@ -147,6 +151,35 @@ function apiFetchSafe(path){
 function fmtUsdSafe(v){ return "$" + (Number(v)||0).toFixed(2); }
 function fmtIntSafe(n){ return Number(n||0).toLocaleString("zh-CN"); }
 
+/* ---------- 版本：产品版 与 协议版 分离 ---------- */
+
+async function loadVersions(){
+  const el = document.getElementById("am-sb-ver");
+  if(!el) return;
+  let product = "";
+  let proto = "";
+  // /health：service / 可能的 app_version、product_version、version(健康协议)
+  try{
+    const h = await apiFetchSafe("/health");
+    product = h.app_version || h.product_version || h.package_version || h.build_version || "";
+    if(!product && h.service) product = h.service;
+  }catch{ /* ignore */ }
+  // /api/protocol：protocol 字面量 + version（协议号）+ 可能的产品版
+  try{
+    const t = amToken();
+    const d = await fetch("/api/protocol", { headers: t ? { "X-Auth-Token": t } : {} })
+      .then(r => r.json()).catch(() => ({}));
+    proto = d.protocol || (d.version != null ? `v${d.version}` : "");
+    product = d.app_version || d.product_version || product;
+  }catch{ /* ignore */ }
+
+  const parts = [];
+  parts.push(product && product !== "agent-mcp-daemon" ? `agent-mcp ${product}` : "agent-mcp");
+  if(proto) parts.push(`protocol ${proto.startsWith("v") ? proto : "v" + proto}`);
+  el.textContent = parts.join(" · ");
+  el.title = "产品版本与协议版本分列展示";
+}
+
 /* ---------- DOM 骨架 ---------- */
 
 function buildDom(){
@@ -157,15 +190,15 @@ function buildDom(){
       <span class="am-hdr-brand">Agent MCP <span class="am-hdr-brand-sub">仪表盘</span></span>
       <span class="am-hdr-caps"></span>
       <span class="am-hdr-right">
-        <button class="am-theme-btn" id="am-theme-btn" type="button" title="切换明暗主题">☾</button>
+        <button class="am-theme-btn" id="am-theme-btn" type="button" title="切换明暗主题" aria-label="切换明暗主题">☾</button>
         <span class="am-dot" title="SSE 未连接"></span>
-        <button class="am-stage-close" id="am-stage-close" title="关闭仪表盘（Esc）">✕</button>
+        <button class="am-stage-close" id="am-stage-close" title="关闭仪表盘（Esc）" aria-label="关闭仪表盘">✕</button>
       </span>
     </header>
     <div class="am-body">
       <nav class="am-nav" aria-label="仪表盘导航">
-        ${NAV.map((n, i) => `<button class="am-nav-item" data-key="${n.key}" role="tab" aria-selected="false" title="${n.label}">
-          <span class="am-nav-ico">${n.icon}</span><span class="am-nav-txt">${n.label}</span>
+        ${NAV.map((n) => `<button class="am-nav-item" data-key="${n.key}" role="tab" aria-selected="false" title="${n.label}" aria-label="${n.label}">
+          <span class="am-nav-ico" aria-hidden="true">${n.icon}</span><span class="am-nav-txt">${n.label}</span>
         </button>`).join("")}
       </nav>
       <main class="am-panes">
@@ -174,7 +207,7 @@ function buildDom(){
     </div>
     <footer class="am-sb">
       <span class="am-sb-item"><span class="am-dot" title="SSE"></span><span class="am-sb-last">就绪</span></span>
-      <span class="am-sb-item am-sb-right mono" id="am-sb-ver">agent-mcp daemon</span>
+      <span class="am-sb-item am-sb-right mono" id="am-sb-ver">agent-mcp</span>
     </footer>`;
   document.body.appendChild(stage);
   headerEl = stage.querySelector(".am-hdr");
@@ -187,6 +220,7 @@ function buildDom(){
     if(e.key === "Escape" && stage.classList.contains("open")) closeStage();
   });
   refreshHeaderCapsules();
+  loadVersions();
 }
 
 /* ---------- 分页切换 ---------- */
@@ -226,11 +260,15 @@ async function openPane(key){
       if(rec.setVisible) rec.setVisible(true);
     }catch(err){
       if(currentKey !== key) return;
-      rec.paneEl.innerHTML = `<div class="am-panel"><div class="am-state error"><span class="am-state-ico">⚠</span>面板模块加载失败：${String(err.message || err)}</div></div>`;
+      rec.paneEl.innerHTML = `<div class="am-panel"><div class="am-state error"><span class="am-state-ico">⚠</span>面板模块加载失败：${escHtml(String(err.message || err))}</div></div>`;
     }
   }else{
     if(rec.setVisible) rec.setVisible(true);
   }
+}
+
+function escHtml(s){
+  return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
 function closeStage(){
@@ -272,17 +310,6 @@ export function init(){
   getSse();
   bindThemeToggle();
   window.__amOpenDashboard = (key) => { openPane(key || currentKey || NAV[0].key); };
-  // 版本：从 /api/protocol 拉取（页脚不再写死 v0.3）
-  try{
-    const t = amToken();
-    fetch("/api/protocol", { headers: t ? { "X-Auth-Token": t } : {} })
-      .then(r => r.json())
-      .then(d => {
-        const el = document.getElementById("am-sb-ver");
-        if(el && d && d.version) el.textContent = `protocol v${d.version} · agent-mcp daemon`;
-      })
-      .catch(() => {});
-  }catch(e){ /* ignore */ }
 }
 
 if(document.readyState === "loading"){

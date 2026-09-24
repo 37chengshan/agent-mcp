@@ -82,8 +82,8 @@ def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[
     A6 安全收敛：shell=False + shlex 切词执行——不再经 shell 解释 ;|&$ 等
     元字符（verify_command 来自 LLM/用户输入，此前等价于以 daemon 权限执行
     任意 shell）。无法安全切词时判失败并说明，不静默降级。
-    可选白名单：AGENT_MCP_VERIFY_ALLOW_PREFIXES（逗号分隔）非空时，
-    首个 token 必须命中前缀之一。"""
+    SEC-H6 default-deny：AGENT_MCP_VERIFY_ALLOW_PREFIXES 为空时拒绝执行；
+    非空时首个 token 必须命中前缀之一。"""
     try:
         cmd = shlex.split(verify_command)
     except ValueError as exc:
@@ -91,7 +91,10 @@ def _run_verify(verify_command: str, cwd: str, timeout: float = 300.0) -> tuple[
     if not cmd:
         return False, "[verify command rejected: empty command]"
     allow = [p for p in os.environ.get("AGENT_MCP_VERIFY_ALLOW_PREFIXES", "").split(",") if p]
-    if allow and not any(cmd[0] == p or cmd[0].startswith(p) for p in allow):
+    if not allow:
+        return False, ("[verify command rejected: AGENT_MCP_VERIFY_ALLOW_PREFIXES "
+                       "is empty (default-deny)]")
+    if not any(cmd[0] == p or cmd[0].startswith(p) for p in allow):
         return False, (f"[verify command rejected: '{cmd[0]}' not in "
                        f"AGENT_MCP_VERIFY_ALLOW_PREFIXES allowlist]")
     try:
@@ -118,7 +121,8 @@ def default_state_dir() -> Path:
 DEFAULT_STATE_DIR = default_state_dir()
 DEFAULT_WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 
-_TERMINAL = ("terminated", "error", "cancelled", "incomplete")
+# 终态判定唯一入口（state_machine.TERMINAL）：needs_advisor 非终态（wait 可唤醒）
+from agent_mcp.state_machine import TERMINAL as _TERMINAL, WAIT_WAKEUP  # noqa: E402
 
 # L2 wait 超时竞态守卫：worker 已退出但完成处理（_ingest_output/_set_status）
 # 尚未落库时，wait 在 GRACE 窗口内轮询 DB 等终态，避免误报 running。
@@ -127,9 +131,25 @@ _WAIT_GRACE_POLL = 0.1
 
 
 def _write_private(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data), encoding="utf-8")
+    """SEC-H1/H2: 先以 0600 创建再写，绝不 write_text 后 chmod（存在窗口）。"""
+    payload = json.dumps(data).encode("utf-8")
+    if os.name == "nt":
+        path.write_bytes(payload)
+        return
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)  # 已存在文件补收紧
+
+
+def _mkdir_private(path: Path) -> Path:
+    """SEC-H1/H2: state_dir 一律 0700。"""
+    path.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
-        os.chmod(path, 0o600)
+        os.chmod(path, 0o700)
+    return path
 
 
 def _load_or_create_token(state_dir: Path) -> str:
@@ -197,8 +217,11 @@ def _coerce_timeout_seconds(value: Any) -> float | None:
 def _compact_context(context: str, mode: str) -> str:
     """按 context_mode 压缩 context，裁子代理 prompt 体积。
 
-    full=不压；compact=超阈值 head+tail 截中间放 marker；tail=只保留末尾。
+    full=不压；compact=超阈值 head+tail 截中间放 marker；tail=只保留末尾；
+    none=跳过 context 注入（返回空）。
     """
+    if mode == "none":
+        return ""
     if not context or mode == "full":
         return context
     if mode == "tail":
@@ -653,6 +676,16 @@ class Dispatcher:
         res["prompt_chars"] = len(prompt)
         res["estimated_tokens"] = _estimate_tokens(prompt)
         res["min_expected_seconds"] = _CLI_FIRST_START_SECONDS.get(target_cli, 10)
+        # D9d: permission_mode 被适配器丢弃时透出警告（不静默升权）
+        try:
+            warn = get_adapter(target_cli).permission_mode_warning(
+                body.get("permission_mode") or "plan")
+            if warn:
+                res["warnings"] = list(res.get("warnings") or []) + [warn]
+                self._broadcast("agent.permission_warning",
+                                {"agent_id": agent_id, "warning": warn}, agent_id)
+        except Exception:
+            pass
         if run_id:
             res["run_id"] = run_id
         # 完成态结果存缓存（terminated 才存，error/incomplete 不存）
@@ -803,8 +836,8 @@ class Dispatcher:
         agent = self.db.get_agent(agent_id)
         if agent is None:
             raise ValueError(f"agent {agent_id} not found")
-        self._require_session(body, agent)
-        if agent["status"] in _TERMINAL or agent["status"] == "needs_advisor":
+        self._check_session_if_given(body, agent)
+        if agent["status"] in WAIT_WAKEUP:
             return self._wait_result(agent, "", summary_chars=summary_chars,
                                      return_ref=return_ref)
         while True:
@@ -819,7 +852,7 @@ class Dispatcher:
                 agent = self.db.get_agent(agent_id)
                 if agent is None:
                     raise ValueError(f"agent {agent_id} not found")
-                self._require_session(body, agent)
+                self._check_session_if_given(body, agent)
                 if agent["status"] in _TERMINAL:
                     return self._wait_result(agent, "", summary_chars=summary_chars,
                                              return_ref=return_ref)
@@ -860,14 +893,14 @@ class Dispatcher:
                 agent = self.db.get_agent(agent_id)
                 if agent is None:
                     raise ValueError(f"agent {agent_id} not found")
-                self._require_session(body, agent)
+                self._check_session_if_given(body, agent)
                 return self._wait_result(agent, summary, summary_chars=summary_chars,
                                          return_ref=return_ref)
             agent = self.db.get_agent(agent_id)
             if agent is None:
                 raise ValueError(f"agent {agent_id} not found")
-            self._require_session(body, agent)
-            if agent["status"] in _TERMINAL or agent["status"] == "needs_advisor":
+            self._check_session_if_given(body, agent)
+            if agent["status"] in WAIT_WAKEUP:
                 return self._wait_result(agent, "", summary_chars=summary_chars,
                                          return_ref=return_ref)
             # 非终态唤醒（spurious/中间态）→ 继续阻塞至 deadline
@@ -905,8 +938,12 @@ class Dispatcher:
                                   stop_reason="interrupted", usage_incomplete=True)
 
     def list_agents(self, body: dict) -> dict:
-        # F3: agents_by_session 已 LEFT JOIN 返 last_message，无需逐行 messages_for
-        agents = self.db.agents_by_session(body.get("session_id"))
+        # SEC-H8: 默认不得跨会话倾倒；无 session 且未显式 include_other_sessions
+        # 时只看 server 默认会话（"default"），跨会话需显式开关 + token。
+        session_id = body.get("session_id")
+        if not session_id and not body.get("include_other_sessions"):
+            session_id = "default"
+        agents = self.db.agents_by_session(session_id or None)
         # P3: fields 裁剪——默认只返轻量字段，fields=all 返全量
         if body.get("fields") != "all":
             _KEEP = {"id", "task_name", "status", "stop_reason"}
@@ -921,8 +958,11 @@ class Dispatcher:
             agent = self.db.get_agent(int(agent_id))
             if agent is None:
                 raise ValueError(f"agent {agent_id} not found")
-            self._require_session(body, agent)
+            self._check_session_if_given(body, agent)
             session_id = agent["session_id"]
+        elif not session_id and not body.get("include_other_sessions"):
+            # SEC-H8: 无 agent_id 时也不得默认全会话聚合
+            session_id = "default"
         # P4: 默认压缩已消费 tool_use/result payload，include=verbose 才返全量
         compress = body.get("include") != "verbose"
         events = self.db.events_since(
@@ -938,7 +978,7 @@ class Dispatcher:
             agent = self.db.get_agent(int(body["agent_id"]))
             if agent is None:
                 raise ValueError(f"agent {body['agent_id']} not found")
-            self._require_session(body, agent)
+            self._check_session_if_given(body, agent)
             if body.get("include_children") and self.store_v4 is not None:
                 from agent_mcp.execution import usage_with_children
                 totals = usage_with_children(self.db, self.store_v4, int(body["agent_id"]))
@@ -987,7 +1027,8 @@ class Dispatcher:
 
     def _require_mailbox_member(self, body: dict) -> int:
         """A6: mailbox/consensus 身份校验——from_agent_id 必须是真实存在的 agent；
-        调用方提供 session_id 时还须同会话，防跨会话/伪造身份投票与广播。
+        session_id 必填且须同会话（SEC-H4：空 session 一律 DENY），
+        防跨会话/伪造身份投票与广播。
         会话不符的报错文案复用 SESSION_MISMATCH_MARK 短语供 MCP 层分流。"""
         raw = body.get("from_agent_id")
         try:
@@ -998,7 +1039,9 @@ class Dispatcher:
         if agent is None:
             raise ValueError(f"from_agent_id {agent_id} 不存在（拒绝伪造身份）")
         session_id = body.get("session_id")
-        if session_id and agent.get("session_id") != session_id:
+        if not session_id:
+            raise ValueError("session_id is required for mailbox/consensus operations")
+        if agent.get("session_id") != session_id:
             raise ValueError(f"agent {agent_id} does not belong to session {session_id}")
         return agent_id
 
@@ -1022,6 +1065,11 @@ class Dispatcher:
         if agent_id is None:
             raise ValueError("agent_id 必填（收件箱归属的 agent）")
         aid = int(agent_id)
+        # SEC-H8: 必须校验 agent 归属会话，防跨会话读信
+        agent = self.db.get_agent(aid)
+        if agent is None:
+            raise ValueError(f"agent {aid} 不存在")
+        self._check_session_if_given(body, agent)
         unread_only = bool(body.get("unread_only", True))
         limit = min(max(int(body.get("limit") or 20), 1), 100)
         msgs = mgr.fetch_inbox(team_id=team, agent_id=aid, unread_only=unread_only, limit=limit)
@@ -1126,6 +1174,8 @@ class Dispatcher:
         item_id = body.get("item_id") or body.get("id")
         if not item_id:
             raise ValueError("item_id is required")
+        if str(item_id) == "base-system-prompt":
+            raise ValueError("base system prompt is immutable")
         scope = body.get("scope", "local")
         if scope == "global" and not body.get("authorized_global"):
             raise ValueError("global harness modification requires explicit authorization")
@@ -1364,6 +1414,12 @@ class Dispatcher:
         status = body.get("status")
         if goal_id is None or not status:
             raise ValueError("goal_id and status are required")
+        from agent_mcp import models as _m
+        current = store.goal_get(int(goal_id))
+        if current is None:
+            raise ValueError("goal not found: %s" % goal_id)
+        # 非法状态迁移（如 completed→active）一律拒绝
+        _m.goal_transition(str(current.get("status")), str(status))
         goal = store.goal_update_status(int(goal_id), str(status))
         if goal is None:
             raise ValueError("goal not found: %s" % goal_id)
@@ -1581,13 +1637,13 @@ class Dispatcher:
         # v4：agent 状态 → open Run 推进（唯一执行单位的兼容投影）
         if status == "running":
             self._resume_waiting_runs(agent_id)
-        if status in _TERMINAL or status == "needs_advisor":
+        if status in WAIT_WAKEUP:
             self._settle_run_for_agent(agent_id, status, stop_reason)
         # F1: 进入终态（或 needs_advisor）时 set 唤醒阻塞的 wait；followup 重启时重置 Event
         with self._lock:
             ev = self._events.get(agent_id)
             if ev is not None:
-                if status in _TERMINAL or status == "needs_advisor":
+                if status in WAIT_WAKEUP:
                     ev.set()
                 else:
                     ev.clear()  # running/queued：新 run 进行中，重置供下次 wait 阻塞
@@ -2076,15 +2132,15 @@ class Dispatcher:
             # D2 per-call usage jsonl：每 worker run 一行落盘，Daily Auditor 数据基础
             try:
                 usage_dir = self.state_dir / "usage"
-                usage_dir.mkdir(parents=True, exist_ok=True)
-                if os.name != "nt":
-                    os.chmod(usage_dir, 0o700)
+                _mkdir_private(usage_dir)
                 record = {"agent_id": agent_id, "session_id": session_id,
                           "cli": cli, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                            time.gmtime()),
                           **usage}
                 with (usage_dir / f"{agent_id}.jsonl").open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    if os.name != "nt":
+                        os.chmod(usage_dir / f"{agent_id}.jsonl", 0o600)
             except Exception as exc:
                 print(f"[dispatcher] usage jsonl write failed for agent {agent_id}: {exc}",
                       file=sys.stderr)
@@ -2100,6 +2156,22 @@ class Dispatcher:
 
     @staticmethod
     def _require_session(body: dict, agent: dict) -> None:
+        """SEC-H4/H8: 变更类操作 session_id 必填，缺失/空一律 DENY。"""
+        requested = body.get("session_id")
+        if not requested:
+            raise ValueError(
+                f"agent {agent['id']} session_id is required for this operation; "
+                f"empty session_id cannot bypass session isolation")
+        if requested != agent.get("session_id"):
+            raise ValueError(
+                f"agent {agent['id']} {SESSION_MISMATCH_MARK} {requested} "
+                f"(belongs to session {agent.get('session_id')}); cross-session "
+                f"operations are not allowed — respawn the agent in the current "
+                f"session instead of reusing its agent_id")
+
+    @staticmethod
+    def _check_session_if_given(body: dict, agent: dict) -> None:
+        """只读操作：提供 session_id 时必须匹配（跨会话拒绝）；未提供不拦。"""
         requested = body.get("session_id")
         if requested and requested != agent.get("session_id"):
             raise ValueError(
@@ -2125,16 +2197,16 @@ def main() -> int:
     args = parser.parse_args()
 
     state_dir = args.state_dir
-    state_dir.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        os.chmod(state_dir, 0o700)
+    _mkdir_private(state_dir)
 
     lock_path = state_dir / "daemon.lock"
     lock_handle = None
     if os.name != "nt":
         # POSIX：flock 排他锁跨进程互斥（进程退出自动释放，无残留问题）
+        # 不 O_TRUNC：flock 失败时不得抹掉既有锁内容
         import fcntl
-        lock_handle = open(lock_path, "a+")
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        lock_handle = os.fdopen(lock_fd, "r+")
         os.chmod(lock_path, 0o600)
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2177,6 +2249,11 @@ def main() -> int:
 
     from agent_mcp.store_v4 import StoreV4
     store_v4 = StoreV4(db)
+    # J1: daemon 启动回收孤儿 journal（上次崩溃遗留的 recorded → uncertain）
+    try:
+        store_v4.journal_recover_orphans(all_stale=True)
+    except Exception as exc:
+        print(f"[daemon] journal recover failed: {exc}", file=sys.stderr)
     gen_epoch, gen_nonce = store_v4.next_generation()
     broadcaster = EventBroadcaster(generation=gen_epoch)
     dispatcher = Dispatcher(db=db, broadcaster=broadcaster, state_dir=state_dir,

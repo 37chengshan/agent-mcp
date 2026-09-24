@@ -2,18 +2,23 @@
  * Agent MCP · Token 用量面板（v4）
  * 全局汇总卡 + 按小时堆叠趋势柱 + 成本占比 Donut + 可排序明细表。
  * 数据源：/api/snapshot + /api/usage/series?hours=24。
+ * series 形状：{ts, input, output, cache_read, cost}（兼容 in/out/cache）。
+ * import 版本必须与 loader.js PANEL_V 一致（components.js?v=v7）。
  * ============================================================ */
 
 import { esc, fmtInt, fmtUsd, apiFetch, cliColor, donut, barStack,
-         emptyState, errorState } from "./components.js?v=v4";
+         emptyState, toast, mapSeries, normalizeSeriesPoint,
+         skeletonCards } from "./components.js?v=v7";
 
 const POLL_MS = 5000;
 
 let root = null, pollTimer = null;
 let disposed = true, visible = true, renderPending = false;
 let lastFp = "";
+let firstPaint = true;
 let data = { agents:[], usage:{}, series:[] };
 let sortKey = "cost", sortDir = "desc";
+let errBox = null;
 
 /* ---------- 渲染 ---------- */
 
@@ -22,13 +27,16 @@ function render(){
   if(!visible){ renderPending = true; return; }
   renderPending = false;
   const agents = data.agents || [], usage = data.usage || {}, totals = usage.totals || {};
-  const per = usage.per_agent || [], series = data.series || [];
+  const per = usage.per_agent || [], series = (data.series || []).map(normalizeSeriesPoint);
 
   const totalTok = (totals.input_tokens||0) + (totals.output_tokens||0);
   const et = (totals.input_tokens||0) - (totals.cache_read||0)*0.9 + (totals.output_tokens||0)*4;
-  const fp = `${totals.input_tokens}|${totals.output_tokens}|${totals.cost_usd}|${per.length}|${series.length}|${(series[series.length-1]||{}).input}`;
+  const last = series[series.length-1] || {};
+  const fp = `${totals.input_tokens}|${totals.output_tokens}|${totals.cost_usd}|${per.length}|${series.length}|${last.in}|${last.out}|${last.cache}`;
   if(fp === lastFp) return;
   lastFp = fp;
+  firstPaint = false;
+  clearError();
 
   // 全局卡
   const stats = [
@@ -43,14 +51,14 @@ function render(){
   root.querySelector(".am-tok-stats").innerHTML = stats.map(s => `
     <div class="am-tok-stat ${s.cls}"><b>${esc(s.v)}</b><span>${esc(s.k)}</span></div>`).join("");
 
-  // 堆叠趋势柱（24h）
+  // 堆叠趋势柱（24h）— barStack 已归一化 input/output/cache_read
   const buckets = series.slice(-24);
   root.querySelector(".am-tok-chart").innerHTML = buckets.length
     ? barStack({ buckets, w: Math.max(300, Math.min(720, buckets.length*14)), h: 64 }) + `
       <div class="am-chart-legend">
-        <span><i class="am-bar-cache"></i>输入</span>
+        <span><i class="am-bar-in"></i>输入</span>
         <span><i class="am-bar-out"></i>输出</span>
-        <span><i class="am-bar-in"></i>缓存</span>
+        <span><i class="am-bar-cache"></i>缓存</span>
       </div>`
     : emptyState("暂无趋势数据");
 
@@ -68,7 +76,7 @@ function render(){
   // 明细表（排序）
   const rows = per.map(u => {
     const a = agents.find(x => x.id === u.agent_id) || {};
-    return { id: u.agent_id, task: a.task_name || "", cli: a.cli || "?",
+    return { id: u.agent_id, task: a.task_name || "", cli: a.cli || "—",
              status: a.status || "", ...u };
   });
   const col = { input: r => r.input_tokens||0, output: r => r.output_tokens||0,
@@ -81,8 +89,8 @@ function render(){
   });
   const maxCost = Math.max(1, ...rows.map(r => r.cost_usd||0));
   const tbody = root.querySelector(".am-tok-table tbody");
-  tbody.innerHTML = rows.length ? rows.map(r => `
-    <tr>
+  tbody.innerHTML = rows.length ? rows.map((r, i) => `
+    <tr class="am-row-in" style="animation-delay:${Math.min(i * 18, 220)}ms">
       <td class="am-tok-id">#${r.id}</td>
       <td class="am-tok-task"><span class="am-cli" style="background:${cliColor(r.cli)}">${esc(r.cli)}</span>${esc(r.task)||"—"}</td>
       <td class="am-tok-num">${fmtInt(r.input_tokens||0)}</td>
@@ -90,8 +98,7 @@ function render(){
       <td class="am-tok-num">${fmtInt(r.cache_read||0)}</td>
       <td class="am-tok-num">${fmtUsd(r.cost_usd||0)}</td>
       <td class="am-tok-bar-cell"><div class="am-tok-bar"><i style="width:${Math.round((r.cost_usd||0)/maxCost*100)}%"></i></div></td>
-    </tr>`).join("") : '<tr><td colspan="7" class="am-empty">暂无用量数据</td></tr>';
-  // 排序状态标注
+    </tr>`).join("") : `<tr><td colspan="7">${emptyState("暂无用量数据")}</td></tr>`;
   root.querySelectorAll(".am-tok-table th").forEach(th => {
     const on = th.dataset.key === sortKey;
     th.classList.toggle("sorted", on);
@@ -100,10 +107,22 @@ function render(){
   root.querySelector(".am-tok-count").textContent = `共 ${rows.length} 个 agent`;
 }
 
+function showError(msg){
+  if(!root) return;
+  clearError();
+  errBox = document.createElement("div");
+  errBox.className = "am-err";
+  errBox.textContent = msg;
+  root.insertBefore(errBox, root.firstChild.nextSibling);
+  toast(msg, "error");
+}
+function clearError(){
+  if(errBox){ errBox.remove(); errBox = null; }
+}
+
 /* ---------- 排序 ---------- */
 
 function bindSort(){
-  // 事件委托到 table 元素（thead/tbody 会随 render 重写，委托不丢绑定）
   const table = root.querySelector(".am-tok-table");
   if(!table || table.dataset.bound) return;
   table.dataset.bound = "1";
@@ -122,16 +141,18 @@ function bindSort(){
 async function poll(){
   if(disposed) return;
   try{
-    const [d, s] = await Promise.all([
+    const [d, sRaw] = await Promise.all([
       apiFetch("/api/snapshot"),
-      apiFetch("/api/usage/series?hours=24").then(r => (r.series||[])).catch(() => []),
+      apiFetch("/api/usage/series?hours=24").catch(() => ({ series: [] })),
     ]);
     if(disposed) return;
-    data = { ...d, series: s };
+    // 兼容 r.series | r 直接数组 | r.points
+    const list = Array.isArray(sRaw) ? sRaw : (sRaw.series || sRaw.points || []);
+    data = { ...d, series: mapSeries(list) };
     render();
   }catch(err){
     if(disposed) return;
-    root.insertAdjacentHTML("afterbegin", errorState("用量数据拉取失败：" + err.message));
+    showError("用量数据拉取失败：" + (err.message || err));
   }
 }
 
@@ -139,20 +160,20 @@ async function poll(){
 
 export function mount(container, sse, opts){
   unmount();
-  disposed = false; visible = true; renderPending = false; lastFp = "";
+  disposed = false; visible = true; renderPending = false; lastFp = ""; firstPaint = true;
   root = document.createElement("div");
   root.className = "am-panel";
   root.innerHTML = `
     <div class="am-panel-hd"><span class="am-ph-title">Token 用量</span><span class="am-ph-sub">Usage</span></div>
-    <div class="am-tok-stats"></div>
+    <div class="am-tok-stats">${skeletonCards(7)}</div>
     <div class="am-grid2">
       <div class="am-col">
         <div class="am-dk">24h 趋势（输入/输出/缓存）</div>
-        <div class="am-tok-chart"></div>
+        <div class="am-tok-chart">${emptyState("加载趋势…")}</div>
       </div>
       <div class="am-col">
         <div class="am-dk">成本占比</div>
-        <div class="am-tok-donut"></div>
+        <div class="am-tok-donut">${emptyState("加载成本…")}</div>
       </div>
     </div>
     <div class="am-dk">按 Agent 明细 <span class="am-tok-count"></span></div>
@@ -163,7 +184,7 @@ export function mount(container, sse, opts){
         <th data-key="cache" class="num">缓存读</th><th data-key="cost" class="num">成本</th>
         <th class="num">占比</th>
       </tr></thead>
-      <tbody></tbody>
+      <tbody><tr><td colspan="7">${emptyState("加载明细…")}</td></tr></tbody>
     </table>`;
   container.appendChild(root);
   bindSort();
@@ -175,6 +196,7 @@ export function unmount(){
   disposed = true; visible = true; renderPending = false;
   if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
   if(root){ root.remove(); root = null; }
+  errBox = null;
 }
 
 export function setVisible(v){

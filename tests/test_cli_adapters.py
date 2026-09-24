@@ -1,3 +1,4 @@
+import os
 import json
 import subprocess
 import pytest
@@ -88,3 +89,44 @@ def test_claude_parse_tolerates_malformed_lines():
 def test_unknown_cli_rejected():
     with pytest.raises(ValueError):
         get_adapter("nonexistent")
+
+
+def test_custom_cli_refuses_absolute_bins_without_trust(tmp_path):
+    from agent_mcp.cli_adapters import load_custom_adapters, get_adapter
+    custom = tmp_path / "custom-clis"
+    custom.mkdir(parents=True)
+    if os.name != "nt":
+        os.chmod(custom, 0o700)
+    (custom / "evil.json").write_text(json.dumps({
+        "cli_name": "evilcli",
+        "bins": ["/usr/bin/evil"],
+        "command": {"prefix": []},
+    }), encoding="utf-8")
+    loaded = load_custom_adapters(tmp_path)
+    assert "evilcli" not in loaded
+    with pytest.raises(ValueError, match="unknown target_cli"):
+        get_adapter("evilcli")
+
+    (custom / "evil.json").write_text(json.dumps({
+        "cli_name": "evilcli",
+        "bins": ["/usr/bin/evil"],
+        "trust_absolute": True,
+        "command": {"prefix": []},
+    }), encoding="utf-8")
+    loaded = load_custom_adapters(tmp_path)
+    assert "evilcli" in loaded
+
+
+def test_custom_cli_refuses_builtin_override_without_trust(tmp_path):
+    from agent_mcp.cli_adapters import load_custom_adapters
+    custom = tmp_path / "custom-clis"
+    custom.mkdir(parents=True)
+    if os.name != "nt":
+        os.chmod(custom, 0o700)
+    (custom / "claude.json").write_text(json.dumps({
+        "cli_name": "claude",
+        "bins": ["myclaude"],
+        "command": {"prefix": []},
+    }), encoding="utf-8")
+    loaded = load_custom_adapters(tmp_path)
+    assert "claude" not in loaded  # 内置名被拒（且原有 claude 仍在，但未“新注册”）

@@ -1,19 +1,26 @@
 /* ============================================================
  * Agent MCP · 总览面板（v4 Hero 仪表盘）
  * Hero 统计卡（带 sparkline）+ 双栏：左=运行泳道+活动时间线；
- * 右=预算环 + Token 构成 Donut + 每小时事件密度。
- * 数据源：/api/snapshot + /api/usage/series?hours=24。
+ * 右=预算环 + Token 构成 Donut。
+ * 数据源：/api/snapshot + /api/usage/series?hours=24 + /api/policies/state。
+ * 预算环从 policies/state 的 policy_configs.budget_limit_usd /
+ * budget_usd / spent_usd 计算真实百分比（不再依赖 window.__amBudget 单向注入）。
+ * import 版本必须与 loader.js PANEL_V 一致（components.js?v=v7）。
  * ============================================================ */
 
 import { esc, fmtInt, fmtUsd, fmtTime, apiFetch, cliColor, ST_LABEL, ST_CLS,
-         statCard, sparkline, donut, timeline, emptyState, loadingState, errorState } from "./components.js?v=v4";
+         statCard, sparkline, donut, timeline, emptyState,
+         toast, mapSeries, pickBudget, isDeadEvent, skeletonCards } from "./components.js?v=v7";
 
 const POLL_MS = 5000;
 
 let root = null, pollTimer = null;
 let disposed = true, visible = true, renderPending = false;
 let lastFp = "";
+let firstPaint = true;
 let dash = {}, series = [];
+let budget = { limit_usd: 0, spent_usd: 0, budget_usd: 0 };
+let errBox = null;
 
 const EV_LABEL = {
   "agent.spawned":"创建","agent.user_turn":"用户回合","agent.running":"开始运行",
@@ -30,7 +37,8 @@ function render(){
   if(disposed || !root) return;
   if(!visible){ renderPending = true; return; }
   renderPending = false;
-  const agents = dash.agents || [], usage = dash.usage || {}, events = dash.events || [];
+  const agents = dash.agents || [], usage = dash.usage || {};
+  const events = (dash.events || []).filter(e => !isDeadEvent(e.type));
   const totals = usage.totals || {};
 
   const nRun = agents.filter(a => a.status === "running").length;
@@ -38,14 +46,16 @@ function render(){
   const nBad = agents.filter(a => ["error","cancelled","incomplete","needs_advisor"].includes(a.status)).length;
   const totalTok = (totals.input_tokens||0) + (totals.output_tokens||0);
   const cost = totals.cost_usd || 0;
-  const inS = series.map(s => s.input || 0);
+  const inS = series.map(s => s.in || 0);
   const costS = series.map(s => s.cost || 0);
 
-  const fp = `${agents.length}|${nRun}|${cost}|${totalTok}|${events.length}|${inS[inS.length-1]}`;
+  const limit = budget.limit_usd, spent = budget.spent_usd || budget.budget_usd;
+  const fp = `${agents.length}|${nRun}|${cost}|${totalTok}|${events.length}|${inS[inS.length-1]}|${limit}|${spent}`;
   if(fp === lastFp) return;
   lastFp = fp;
+  firstPaint = false;
+  clearError();
 
-  // Hero 卡片（带 sparkline）
   const cards = [
     statCard({ k:"总 Agent", v:fmtInt(agents.length), sub:"本会话" }),
     statCard({ k:"运行中", v:fmtInt(nRun), cls:"run", live:nRun>0,
@@ -59,17 +69,15 @@ function render(){
   ];
   root.querySelector(".am-dash-cards").innerHTML = cards.join("");
 
-  // 左栏：运行中
   const running = agents.filter(a => a.status === "running" || a.status === "queued");
-  root.querySelector(".am-run-list").innerHTML = running.length ? running.map(a => `
-    <div class="am-run-card" data-id="${a.id}">
+  root.querySelector(".am-run-list").innerHTML = running.length ? running.map((a, i) => `
+    <div class="am-run-card am-row-in" data-id="${a.id}" style="animation-delay:${Math.min(i * 40, 200)}ms">
       <span class="am-run-bar" style="background:${cliColor(a.cli)}"></span>
-      <span class="am-cli" style="background:${cliColor(a.cli)}">${esc(a.cli)}</span>
-      <span class="am-run-task" title="${esc(a.task_name)}">${esc(a.task_name) || `#${a.id}`}</span>
+      <span class="am-cli" style="background:${cliColor(a.cli)}">${esc(a.cli || "—")}</span>
+      <span class="am-run-task" title="${esc(a.task_name||"")}">${esc(a.task_name) || `#${a.id}`}</span>
       <span class="am-badge ${ST_CLS[a.status]||"soft"}">${esc(ST_LABEL[a.status]||a.status)}</span>
     </div>`).join("") : emptyState("当前无运行中 agent");
 
-  // 左栏：活动时间线（最近 10 条）
   const evs = [...events].slice(-10).reverse();
   root.querySelector(".am-ev-tl").innerHTML = evs.length ? timeline(evs.map(e => {
     const p = e.payload || {};
@@ -84,19 +92,23 @@ function render(){
              color:cliColor(agent?.cli) };
   })) : emptyState("暂无活动");
 
-  // 右栏：预算环（大）
-  const budget = window.__amBudget || { limit_usd:10, budget_usd:0 };
-  const limit = Number(budget.limit_usd)||10, spent = Number(budget.budget_usd)||0;
-  const pct = limit>0 ? Math.min(spent/limit*100,100) : 0;
-  const over = limit>0 && spent>limit;
-  const RING_R = 56, RING_C = 2*Math.PI*RING_R;
-  root.querySelector(".am-budget-big .am-ring-fg").setAttribute("stroke-dasharray",
+  // 预算环：真实百分比
+  const pct = limit > 0 ? Math.min(spent / limit * 100, 100) : 0;
+  const over = limit > 0 && spent > limit;
+  const warn = !over && limit > 0 && pct >= 80;
+  const RING_R = 56, RING_C = 2 * Math.PI * RING_R;
+  const fg = root.querySelector(".am-budget-big .am-ring-fg");
+  fg.setAttribute("stroke-dasharray",
     `${(pct/100*RING_C).toFixed(1)} ${RING_C.toFixed(1)}`);
-  root.querySelector(".am-budget-big .am-ring-fg").classList.toggle("over", over);
-  root.querySelector(".am-budget-big .am-budget-num b").textContent = Math.round(pct)+"%";
-  root.querySelector(".am-budget-big .am-budget-num span").textContent = `${fmtUsd(spent)} / ${fmtUsd(limit)}`;
+  fg.classList.toggle("over", over);
+  fg.classList.toggle("warn", warn);
+  const pctB = root.querySelector(".am-budget-big .am-budget-num b");
+  pctB.textContent = limit > 0 ? Math.round(pct)+"%" : "—";
+  pctB.classList.toggle("over", over);
+  root.querySelector(".am-budget-big .am-budget-num span").textContent =
+    limit > 0 ? `${fmtUsd(spent)} / ${fmtUsd(limit)}` : "未设置预算上限";
 
-  // 右栏：Token 构成 Donut
+  // Token 构成 Donut
   const don = donut({ size:110, stroke:13, slices: [
     { value:totals.input_tokens||0, color:"var(--green,#6FA587)", label:"输入" },
     { value:totals.output_tokens||0, color:"var(--accent,#D96B4F)", label:"输出" },
@@ -110,23 +122,40 @@ function render(){
     </div>` : emptyState("暂无 Token 数据");
 }
 
+function showError(msg){
+  if(!root) return;
+  clearError();
+  errBox = document.createElement("div");
+  errBox.className = "am-err";
+  errBox.textContent = msg;
+  root.insertBefore(errBox, root.querySelector(".am-dash-cards"));
+  toast(msg, "error");
+}
+function clearError(){
+  if(errBox){ errBox.remove(); errBox = null; }
+}
+
 /* ---------- 数据 ---------- */
 
 async function poll(){
   if(disposed) return;
   try{
-    const [d, s] = await Promise.all([
+    const [d, sRaw, pol] = await Promise.all([
       apiFetch("/api/snapshot"),
-      apiFetch("/api/usage/series?hours=24").then(r => (r.series||[])).catch(() => []),
+      apiFetch("/api/usage/series?hours=24").catch(() => ({ series: [] })),
+      apiFetch("/api/policies/state").catch(() => ({})),
     ]);
     if(disposed) return;
-    dash = d; series = s;
+    const list = Array.isArray(sRaw) ? sRaw : (sRaw.series || sRaw.points || []);
+    series = mapSeries(list);
+    dash = d;
+    budget = pickBudget(pol);
+    // 供其他面板 / 旧代码读取
+    window.__amBudget = budget;
     render();
   }catch(err){
     if(disposed) return;
-    const box = root.querySelector(".am-err");
-    if(box) box.textContent = "总览数据拉取失败：" + err.message;
-    else root.insertAdjacentHTML("afterbegin", errorState("总览数据拉取失败：" + err.message));
+    showError("总览数据拉取失败：" + (err.message || err));
   }
 }
 
@@ -134,18 +163,18 @@ async function poll(){
 
 export function mount(container, sse, opts){
   unmount();
-  disposed = false; visible = true; renderPending = false; lastFp = "";
+  disposed = false; visible = true; renderPending = false; lastFp = ""; firstPaint = true;
   root = document.createElement("div");
   root.className = "am-panel";
   root.innerHTML = `
     <div class="am-panel-hd"><span class="am-ph-title">总览</span><span class="am-ph-sub">Overview</span></div>
-    <div class="am-dash-cards"></div>
+    <div class="am-dash-cards">${skeletonCards(6)}</div>
     <div class="am-grid2">
       <div class="am-col">
         <div class="am-dk">运行中</div>
-        <div class="am-run-list"></div>
+        <div class="am-run-list">${emptyState("加载中…")}</div>
         <div class="am-dk">最近活动</div>
-        <div class="am-ev-tl"></div>
+        <div class="am-ev-tl">${emptyState("加载中…")}</div>
       </div>
       <div class="am-col">
         <div class="am-dk">预算</div>
@@ -153,13 +182,13 @@ export function mount(container, sse, opts){
           <div class="am-budget-ring-wrap" style="width:132px;height:132px">
             <svg class="am-budget-ring" viewBox="0 0 132 132" aria-hidden="true">
               <circle class="am-ring-bg" cx="66" cy="66" r="56"></circle>
-              <circle class="am-ring-fg" cx="66" cy="66" r="56"></circle>
+              <circle class="am-ring-fg" cx="66" cy="66" r="56" stroke-dasharray="0 400"></circle>
             </svg>
-            <div class="am-budget-num"><b>0%</b><span></span></div>
+            <div class="am-budget-num"><b>—</b><span>加载预算…</span></div>
           </div>
         </div>
         <div class="am-dk">Token 构成</div>
-        <div class="am-donut-box"></div>
+        <div class="am-donut-box">${emptyState("加载中…")}</div>
       </div>
     </div>`;
   container.appendChild(root);
@@ -171,6 +200,7 @@ export function unmount(){
   disposed = true; visible = true; renderPending = false;
   if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
   if(root){ root.remove(); root = null; }
+  errBox = null;
 }
 
 export function setVisible(v){

@@ -105,12 +105,21 @@ def test_v4_command_new_then_replay_then_conflict(env):
     assert result["_idempotency"] == "replay"
     assert len(env["worker"].spawned) == 1  # 不重复执行（Invariant 1）
 
-    # 同 command_id 不同 hash：command_id_conflict，绝不执行（Invariant 2）
-    other = m.request_hash("spawn", {"target_cli": "omp", "prompt": "bye", "cwd": "/tmp"})
-    status, result = _cmd(env, request_hash=other)
+    # 同 command_id 不同 (method,params)：合法 hash 但与既有条目不同 → conflict
+    other_params = {"target_cli": "omp", "prompt": "bye", "cwd": "/tmp", "session_id": "s1"}
+    other = m.request_hash("spawn", other_params)
+    status, result = _cmd(env, request_hash=other, params=other_params)
     assert status == 409
     assert result["error"] == "command_id_conflict"
     assert len(env["worker"].spawned) == 1
+
+
+def test_v4_command_rejects_request_hash_mismatch(env):
+    """SEC-M1: 服务端重算 request_hash，伪造 hash 一律 400。"""
+    status, result = _cmd(env, request_hash="deadbeef")
+    assert status == 400
+    assert result["error"] == "request_hash mismatch"
+    assert len(env["worker"].spawned) == 0
 
 
 def test_v4_command_validation(env):

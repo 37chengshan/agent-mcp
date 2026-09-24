@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -108,8 +109,21 @@ def test_build_worker_command_appends_env_without_changing_legacy_shape(tmp_path
                                     err_path=tmp_path / "e.log",
                                     cwd=str(tmp_path), cli_command=command,
                                     timeout_seconds=60, env={"A": "1"})
+    # SEC-H5: env 不进 argv——@path 引用 0600 文件
     assert json.loads(with_env[-2]) == command
-    assert json.loads(with_env[-1]) == {"A": "1"}
+    assert with_env[-1].startswith("@")
+    env_path = Path(with_env[-1][1:])
+    assert env_path.is_file()
+    assert json.loads(env_path.read_text()) == {"A": "1"}
+    with_env2 = build_worker_command(state_path=tmp_path / "s.json",
+                                     out_path=tmp_path / "o.log",
+                                     err_path=tmp_path / "e.log",
+                                     cwd=str(tmp_path), cli_command=command,
+                                     timeout_seconds=60,
+                                     env={"A": "1", "LD_PRELOAD": "/evil.so",
+                                          "DYLD_INSERT_LIBRARIES": "/evil.so"})
+    env_path2 = Path(with_env2[-1][1:])
+    assert json.loads(env_path2.read_text()) == {"A": "1"}
 
 
 def test_dispatch_worker_passes_env_to_cli(tmp_path):
